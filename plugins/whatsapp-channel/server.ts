@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node --import tsx
 /**
  * WhatsApp channel for Claude Code.
  *
@@ -17,7 +17,8 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import makeWASocket, {
+import {
+  makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   downloadMediaMessage,
@@ -881,7 +882,7 @@ async function connectWhatsApp(): Promise<void> {
     auth: state,
     printQRInTerminal: !PHONE_NUMBER, // QR only if no phone number set
     logger: silentLogger,
-    browser: ['Mac OS', 'Chrome', '14.4.1'],
+    browser: ['Mac OS', 'Chrome', '145.0.0'],
     defaultQueryTimeoutMs: undefined,
     generateHighQualityLinkPreview: false,
     syncFullHistory: false,
@@ -899,7 +900,7 @@ async function connectWhatsApp(): Promise<void> {
     const localSock = sock
     ;(async () => {
       // Small delay to let the WebSocket handshake begin
-      await new Promise(r => setTimeout(r, 1500))
+      await new Promise(r => setTimeout(r, 5000))
       if (pairingCodeRequested) return
       pairingCodeRequested = true
       try {
