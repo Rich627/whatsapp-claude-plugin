@@ -4,7 +4,7 @@ WhatsApp has no bot API — this channel connects as a **linked device** (like W
 
 By default, a DM from an unknown sender triggers **pairing**: the server replies with a 6-character code and drops the message. You run `/whatsapp:access pair <code>` from your Claude Code session to approve them. Once approved, their messages pass through.
 
-All state lives in `~/.claude/channels/whatsapp/access.json`. The `/whatsapp:access` skill commands edit this file; the server re-reads it on every inbound message, so changes take effect without a restart. Set `WHATSAPP_ACCESS_MODE=static` to pin config to what was on disk at boot (pairing is unavailable in static mode since it requires runtime writes).
+All state lives in `~/.whatsapp-channel/access.json`. The `/whatsapp:access` skill commands edit this file; the server re-reads it on every inbound message, so changes take effect without a restart. Set `WHATSAPP_ACCESS_MODE=static` to pin config to what was on disk at boot (pairing is unavailable in static mode since it requires runtime writes).
 
 ## At a glance
 
@@ -14,7 +14,7 @@ All state lives in `~/.claude/channels/whatsapp/access.json`. The `/whatsapp:acc
 | Sender ID | WhatsApp JID (e.g. `886912345678@s.whatsapp.net`) |
 | Group key | Group JID (e.g. `120363424405607157@g.us`) |
 | `ackReaction` quirk | Any emoji — WhatsApp has no fixed whitelist |
-| Config file | `~/.claude/channels/whatsapp/access.json` |
+| Config file | `~/.whatsapp-channel/access.json` |
 
 ## DM policies
 
@@ -62,7 +62,7 @@ With the default `requireMention: false`, the server responds to every message. 
 
 ### Per-group personality & memory
 
-Each enabled group gets a config directory at `~/.claude/channels/whatsapp/groups/<groupJid>/`:
+Each enabled group gets a config directory at `~/.whatsapp-channel/groups/<groupJid>/`:
 
 | File | Purpose |
 | --- | --- |
@@ -73,7 +73,7 @@ Created automatically when a group is added. Edit `config.md` to customize Claud
 
 ### LID identifiers
 
-Baileys 7 uses LID (Local Identifier) format alongside phone JIDs. The same person may appear as both `16024101202@s.whatsapp.net` and `21737517412478@lid`. The server maintains a mapping at `~/.claude/channels/whatsapp/lid-map.json` and resolves both formats automatically. Both work in allowlists.
+Baileys 7 uses LID (Local Identifier) format alongside phone JIDs. The same person may appear as both `16024101202@s.whatsapp.net` and `21737517412478@lid`. The server maintains a mapping at `~/.whatsapp-channel/lid-map.json` and resolves both formats automatically. Both work in allowlists.
 
 ## Mention detection
 
@@ -119,7 +119,7 @@ Configure outbound behavior with `/whatsapp:access set <key> <value>`.
 
 ## Config file
 
-`~/.claude/channels/whatsapp/access.json`. Absent file is equivalent to `pairing` policy with empty lists, so the first DM triggers pairing.
+`~/.whatsapp-channel/access.json`. Absent file is equivalent to `pairing` policy with empty lists, so the first DM triggers pairing.
 
 ```jsonc
 {

@@ -4,7 +4,7 @@
  *
  * Self-contained MCP server using Baileys (linked-device protocol) with full
  * access control: pairing, allowlists, group support with mention-triggering.
- * State lives in ~/.claude/channels/whatsapp/ — managed by /whatsapp:access.
+ * State lives in ~/.whatsapp-channel/ — managed by /whatsapp:access.
  *
  * WhatsApp has no bot API — this connects as a linked device (like WhatsApp Web).
  * First-time setup requires entering a pairing code on your phone (Linked Devices).
@@ -39,7 +39,7 @@ import {
 import { homedir } from 'os'
 import { join, extname, sep, basename } from 'path'
 
-const STATE_DIR = process.env.WHATSAPP_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'whatsapp')
+const STATE_DIR = process.env.WHATSAPP_STATE_DIR ?? join(homedir(), '.whatsapp-channel')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const AUTH_DIR = join(STATE_DIR, '.baileys_auth')
@@ -48,7 +48,7 @@ const ENV_FILE = join(STATE_DIR, '.env')
 const GROUPS_DIR = join(STATE_DIR, 'groups')
 const LID_MAP_FILE = join(STATE_DIR, 'lid-map.json')
 
-// Load ~/.claude/channels/whatsapp/.env into process.env. Real env wins.
+// Load ~/.whatsapp-channel/.env into process.env. Real env wins.
 try {
   chmodSync(ENV_FILE, 0o600)
   for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
@@ -1256,7 +1256,7 @@ async function connectWhatsApp(): Promise<void> {
     process.stderr.write(
       `${LOG_PREFIX}: no phone number configured for pairing code fallback.\n` +
       '  QR code pairing may not work in all runtimes (e.g. Bun).\n' +
-      '  Set WHATSAPP_PHONE_NUMBER in ~/.claude/channels/whatsapp/.env\n' +
+      '  Set WHATSAPP_PHONE_NUMBER in ~/.whatsapp-channel/.env\n' +
       '  or run /whatsapp:configure <phone> for reliable pairing.\n',
     )
   }
@@ -1333,7 +1333,7 @@ async function connectWhatsApp(): Promise<void> {
             ``,
             `To add a group:`,
             `  /whatsapp:access group add <groupJid>`,
-            `  → edit personality at ~/.claude/channels/whatsapp/groups/<groupJid>/config.md`,
+            `  → edit personality at ~/.whatsapp-channel/groups/<groupJid>/config.md`,
             ``,
             `Ready to receive messages.`,
           ].join('\n'),

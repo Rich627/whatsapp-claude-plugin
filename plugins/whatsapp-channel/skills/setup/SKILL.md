@@ -37,7 +37,7 @@ Ask the user:
 
 If yes:
 - Ask for their phone number with country code (e.g., `886912345678`, no `+` or spaces)
-- Save it to `~/.claude/channels/whatsapp/.env`:
+- Save it to `~/.whatsapp-channel/.env`:
   ```
   WHATSAPP_PHONE_NUMBER=<their number>
   ```
@@ -57,7 +57,7 @@ Ask:
 > 3. **Add a specific contact now** — if you already know their WhatsApp user ID
 
 For option 1: No action needed, just confirm.
-For option 2: Write `{"dmPolicy": "allowlist", "allowFrom": [], "groups": {}, "pending": {}}` to `~/.claude/channels/whatsapp/access.json`.
+For option 2: Write `{"dmPolicy": "allowlist", "allowFrom": [], "groups": {}, "pending": {}}` to `~/.whatsapp-channel/access.json`.
 For option 3: Ask for the numeric user ID (e.g., `886912345678`). They can find it by having the contact message @userinfobot on Telegram, or by checking WhatsApp linked device logs. Add it to `allowFrom` in access.json.
 
 ## Phase 5: Done

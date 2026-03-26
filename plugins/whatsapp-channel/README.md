@@ -74,7 +74,7 @@ After pairing, the policy auto-locks back to `allowlist`.
 /whatsapp:access group add <groupJid>
 ```
 
-Each group gets its own personality config at `~/.claude/channels/whatsapp/groups/<groupJid>/config.md`. Edit that file to customize how Claude behaves in each group. Conversation memory is auto-saved to `memory.md` in the same directory.
+Each group gets its own personality config at `~/.whatsapp-channel/groups/<groupJid>/config.md`. Edit that file to customize how Claude behaves in each group. Conversation memory is auto-saved to `memory.md` in the same directory.
 
 See [ACCESS.md](./ACCESS.md) for group options (`--mention`, `--allow`).
 
@@ -89,7 +89,7 @@ claude --dangerously-skip-permissions --dangerously-load-development-channels pl
 - `--dangerously-skip-permissions` — auto-approve all tool calls (no permission prompts)
 - `--dangerously-load-development-channels` — load third-party channel plugin
 
-Auth is saved in `~/.claude/channels/whatsapp/.baileys_auth/`. The session must stay open to receive messages — closing the session disconnects WhatsApp.
+Auth is saved in `~/.whatsapp-channel/.baileys_auth/`. The session must stay open to receive messages — closing the session disconnects WhatsApp.
 
 ### Fine-grained permissions
 
@@ -129,7 +129,7 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 
 ## Photos & Media
 
-Inbound **photos** are downloaded eagerly to `~/.claude/channels/whatsapp/inbox/` and the local path is included in the notification so the assistant can read it.
+Inbound **photos** are downloaded eagerly to `~/.whatsapp-channel/inbox/` and the local path is included in the notification so the assistant can read it.
 
 Other media types (**voice notes, audio, video, documents, stickers**) are lazy — the notification includes an `attachment_file_id`. The assistant calls `download_attachment` to fetch the file on demand.
 
@@ -142,10 +142,10 @@ You can run two WhatsApp accounts simultaneously — for example, your personal 
 Create separate `.env` files:
 
 ```sh
-# ~/.claude/channels/whatsapp/personal/.env
+# ~/.whatsapp-channel/personal/.env
 WHATSAPP_PHONE_NUMBER=886912345678
 
-# ~/.claude/channels/whatsapp/business/.env
+# ~/.whatsapp-channel/business/.env
 WHATSAPP_PHONE_NUMBER=886987654321
 ```
 
@@ -160,7 +160,7 @@ In your project or user `.mcp.json`:
       "command": "bun",
       "args": ["run", "--cwd", "<plugin-path>", "--shell=bun", "--silent", "start"],
       "env": {
-        "WHATSAPP_STATE_DIR": "~/.claude/channels/whatsapp/personal",
+        "WHATSAPP_STATE_DIR": "~/.whatsapp-channel/personal",
         "WHATSAPP_ACCOUNT_NAME": "personal"
       }
     },
@@ -168,7 +168,7 @@ In your project or user `.mcp.json`:
       "command": "bun",
       "args": ["run", "--cwd", "<plugin-path>", "--shell=bun", "--silent", "start"],
       "env": {
-        "WHATSAPP_STATE_DIR": "~/.claude/channels/whatsapp/business",
+        "WHATSAPP_STATE_DIR": "~/.whatsapp-channel/business",
         "WHATSAPP_ACCOUNT_NAME": "bot"
       }
     }

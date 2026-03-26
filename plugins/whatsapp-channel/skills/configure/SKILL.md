@@ -10,14 +10,14 @@ allowed-tools:
   - Bash(mkdir *)
   - Bash(rm -rf *)
   - Bash(chmod *)
-  - Read(~/.claude/channels/whatsapp/*)
-  - Write(~/.claude/channels/whatsapp/*)
-  - Edit(~/.claude/channels/whatsapp/*)
+  - Read(~/.whatsapp-channel/*)
+  - Write(~/.whatsapp-channel/*)
+  - Edit(~/.whatsapp-channel/*)
 ---
 
 # /whatsapp:configure — WhatsApp Channel Setup
 
-Writes configuration to `~/.claude/channels/whatsapp/.env` and orients the
+Writes configuration to `~/.whatsapp-channel/.env` and orients the
 user on access policy. The server reads both files at boot.
 
 Arguments passed: `$ARGUMENTS`
@@ -30,13 +30,13 @@ Arguments passed: `$ARGUMENTS`
 
 Read both state files and give the user a complete picture:
 
-1. **Phone number** — check `~/.claude/channels/whatsapp/.env` for
+1. **Phone number** — check `~/.whatsapp-channel/.env` for
    `WHATSAPP_PHONE_NUMBER`. Show set/not-set; if set, show the number.
 
-2. **Auth state** — check whether `~/.claude/channels/whatsapp/.baileys_auth/creds.json`
+2. **Auth state** — check whether `~/.whatsapp-channel/.baileys_auth/creds.json`
    exists and has `registered: true`. Show paired/not-paired.
 
-3. **Access** — read `~/.claude/channels/whatsapp/access.json` (missing file
+3. **Access** — read `~/.whatsapp-channel/access.json` (missing file
    = defaults: `dmPolicy: "pairing"`, empty allowlist). Show:
    - DM policy and what it means in one line
    - Allowed senders: count, and list JIDs
@@ -84,10 +84,10 @@ offer.
 
 1. Treat `$ARGUMENTS` as the phone number (trim whitespace, strip leading `+`).
    WhatsApp phone numbers are digits only, no spaces or dashes.
-2. `mkdir -p ~/.claude/channels/whatsapp`
+2. `mkdir -p ~/.whatsapp-channel`
 3. Read existing `.env` if present; update/add the `WHATSAPP_PHONE_NUMBER=` line,
    preserve other keys. Write back, no quotes around the value.
-4. `chmod 600 ~/.claude/channels/whatsapp/.env` — the file may contain credentials.
+4. `chmod 600 ~/.whatsapp-channel/.env` — the file may contain credentials.
 5. Confirm, then show the no-args status so the user sees where they stand.
 
 ### `reset-auth`
@@ -96,7 +96,7 @@ Clear the Baileys auth state so the user can re-pair with a new device or
 phone number.
 
 1. Confirm the user wants to do this — re-pairing will be required.
-2. `rm -rf ~/.claude/channels/whatsapp/.baileys_auth`
+2. `rm -rf ~/.whatsapp-channel/.baileys_auth`
 3. Inform: *"Auth cleared. Restart your session with `--channels` to re-pair."*
 
 ### `clear` — remove the phone number

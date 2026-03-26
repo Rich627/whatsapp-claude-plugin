@@ -2,7 +2,7 @@
 
 # WhatsApp channel onboarding — checks setup state and guides user through next steps.
 
-STATE_DIR="${HOME}/.claude/channels/whatsapp"
+STATE_DIR="${HOME}/.whatsapp-channel"
 ENV_FILE="${STATE_DIR}/.env"
 AUTH_CREDS="${STATE_DIR}/.baileys_auth/creds.json"
 ACCESS_FILE="${STATE_DIR}/access.json"
