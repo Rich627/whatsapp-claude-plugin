@@ -59,15 +59,18 @@ try {
 
 const PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER
 const STATIC = process.env.WHATSAPP_ACCESS_MODE === 'static'
+const ACCOUNT_NAME = process.env.WHATSAPP_ACCOUNT_NAME || ''
+const SERVER_NAME = ACCOUNT_NAME ? `whatsapp-${ACCOUNT_NAME}` : 'whatsapp'
+const LOG_PREFIX = ACCOUNT_NAME ? `whatsapp[${ACCOUNT_NAME}]` : 'whatsapp channel'
 
 mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 })
 mkdirSync(INBOX_DIR, { recursive: true })
 
 process.on('unhandledRejection', err => {
-  process.stderr.write(`whatsapp channel: unhandled rejection: ${err}\n`)
+  process.stderr.write(`${LOG_PREFIX}: unhandled rejection: ${err}\n`)
 })
 process.on('uncaughtException', err => {
-  process.stderr.write(`whatsapp channel: uncaught exception: ${err}\n`)
+  process.stderr.write(`${LOG_PREFIX}: uncaught exception: ${err}\n`)
 })
 
 // Permission-reply spec — 5 lowercase letters a-z minus 'l'. Case-insensitive.
@@ -139,7 +142,7 @@ function readAccessFile(): Access {
     try {
       renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`)
     } catch {}
-    process.stderr.write(`whatsapp channel: access.json is corrupt, moved aside. Starting fresh.\n`)
+    process.stderr.write(`${LOG_PREFIX}: access.json is corrupt, moved aside. Starting fresh.\n`)
     return defaultAccess()
   }
 }
@@ -149,7 +152,7 @@ const BOOT_ACCESS: Access | null = STATIC
       const a = readAccessFile()
       if (a.dmPolicy === 'pairing') {
         process.stderr.write(
-          'whatsapp channel: static mode — dmPolicy "pairing" downgraded to "allowlist"\n',
+          `${LOG_PREFIX}: static mode — dmPolicy "pairing" downgraded to "allowlist"\n`,
         )
         a.dmPolicy = 'allowlist'
       }
@@ -361,7 +364,7 @@ function checkApprovals(): void {
     void sock.sendMessage(senderId, { text: "Paired! Say hi to Claude." }).then(
       () => rmSync(file, { force: true }),
       err => {
-        process.stderr.write(`whatsapp channel: failed to send approval confirm: ${err}\n`)
+        process.stderr.write(`${LOG_PREFIX}: failed to send approval confirm: ${err}\n`)
         rmSync(file, { force: true })
       },
     )
@@ -457,7 +460,7 @@ let serverCrons: CronJob[] = []
 function initServerCrons(): void {
   serverCrons = loadGroupCrons()
   if (serverCrons.length > 0) {
-    process.stderr.write(`whatsapp channel: loaded ${serverCrons.length} cron jobs from group configs\n`)
+    process.stderr.write(`${LOG_PREFIX}: loaded ${serverCrons.length} cron jobs from group configs\n`)
   }
 }
 
@@ -472,7 +475,7 @@ setInterval(() => {
     if (job.lastFired === minuteKey) continue
     job.lastFired = minuteKey
 
-    process.stderr.write(`whatsapp channel: cron firing for ${job.groupJid}: ${job.prompt.slice(0, 50)}...\n`)
+    process.stderr.write(`${LOG_PREFIX}: cron firing for ${job.groupJid}: ${job.prompt.slice(0, 50)}...\n`)
     mcp.notification({
       method: 'notifications/claude/channel',
       params: {
@@ -489,7 +492,7 @@ setInterval(() => {
         },
       },
     }).catch(err => {
-      process.stderr.write(`whatsapp channel: cron notification failed: ${err}\n`)
+      process.stderr.write(`${LOG_PREFIX}: cron notification failed: ${err}\n`)
     })
   }
 }, 60_000).unref()
@@ -578,7 +581,7 @@ let sock: WASocket | null = null
 let ownJid = ''
 
 const mcp = new Server(
-  { name: 'whatsapp', version: '1.0.0' },
+  { name: SERVER_NAME, version: '1.0.0' },
   {
     capabilities: {
       tools: {},
@@ -588,6 +591,9 @@ const mcp = new Server(
       },
     },
     instructions: [
+      ...(ACCOUNT_NAME
+        ? [`This is the "${ACCOUNT_NAME}" WhatsApp account. Messages from this account include account="${ACCOUNT_NAME}" in the meta. When multiple WhatsApp accounts are connected, use the correct account\'s tools to reply — check the channel source or account field to determine which account received the message.`]
+        : []),
       'The sender reads WhatsApp, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
       'Messages from WhatsApp arrive as <channel source="whatsapp" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
@@ -893,7 +899,7 @@ let shuttingDown = false
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
-  process.stderr.write('whatsapp channel: shutting down\n')
+  process.stderr.write(`${LOG_PREFIX}: shutting down\n`)
   setTimeout(() => process.exit(0), 2000)
   try { sock?.end(undefined as any) } catch {}
   process.exit(0)
@@ -962,14 +968,14 @@ const WHISPER_SCRIPT = join(homedir(), 'whisper-transcribe.sh')
 
 function transcribeAudio(filePath: string): string | null {
   if (!existsSync(WHISPER_SCRIPT)) {
-    process.stderr.write('whatsapp channel: whisper-transcribe.sh not found, skipping transcription\n')
+    process.stderr.write(`${LOG_PREFIX}: whisper-transcribe.sh not found, skipping transcription\n`)
     return null
   }
   try {
     const result = execFileSync(WHISPER_SCRIPT, [filePath], { timeout: 60_000, encoding: 'utf8' })
     return result.trim() || null
   } catch (err) {
-    process.stderr.write(`whatsapp channel: transcription failed: ${err}\n`)
+    process.stderr.write(`${LOG_PREFIX}: transcription failed: ${err}\n`)
     return null
   }
 }
@@ -1095,7 +1101,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
         writeFileSync(path, buffer)
         imagePath = path
       } catch (err) {
-        process.stderr.write(`whatsapp channel: image download failed: ${err}\n`)
+        process.stderr.write(`${LOG_PREFIX}: image download failed: ${err}\n`)
       }
     } else if (media.kind === 'voice' || media.kind === 'audio') {
       // Eager download + transcribe voice/audio messages
@@ -1115,7 +1121,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
           attachment = { kind: media.kind, file_id: messageId, ...(media.mime ? { mime: media.mime } : {}) }
         }
       } catch (err) {
-        process.stderr.write(`whatsapp channel: voice download/transcribe failed: ${err}\n`)
+        process.stderr.write(`${LOG_PREFIX}: voice download/transcribe failed: ${err}\n`)
         attachment = { kind: media.kind, file_id: messageId, ...(media.mime ? { mime: media.mime } : {}) }
       }
     } else {
@@ -1154,6 +1160,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
         user_id: senderJid,
         user_phone: senderPhone,
         ts: new Date(timestamp * 1000).toISOString(),
+        ...(ACCOUNT_NAME ? { account: ACCOUNT_NAME } : {}),
         ...(isGroup ? {
           chat_type: 'group',
           group_config_path: groupConfigPath(remoteJid),
@@ -1171,7 +1178,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
       },
     },
   }).catch(err => {
-    process.stderr.write(`whatsapp channel: failed to deliver inbound to Claude: ${err}\n`)
+    process.stderr.write(`${LOG_PREFIX}: failed to deliver inbound to Claude: ${err}\n`)
   })
 }
 
@@ -1224,7 +1231,7 @@ async function connectWhatsApp(): Promise<void> {
           `Open WhatsApp > Linked Devices > Link a Device\n` +
           `Tap "Link with phone number instead"\n` +
           `Enter the code above`
-        process.stderr.write(`whatsapp channel: ${pairingMsg}\n`)
+        process.stderr.write(`${LOG_PREFIX}: ${pairingMsg}\n`)
         // Surface pairing code to Claude session via MCP notification
         mcp.notification({
           method: 'notifications/claude/channel',
@@ -1242,12 +1249,12 @@ async function connectWhatsApp(): Promise<void> {
       } catch (err) {
         // Will retry on next connectWhatsApp call
         pairingCodeRequested = false
-        process.stderr.write(`whatsapp channel: pairing code request failed: ${err}\n`)
+        process.stderr.write(`${LOG_PREFIX}: pairing code request failed: ${err}\n`)
       }
     })()
   } else if (needsPairing && !PHONE_NUMBER) {
     process.stderr.write(
-      'whatsapp channel: no phone number configured for pairing code fallback.\n' +
+      `${LOG_PREFIX}: no phone number configured for pairing code fallback.\n` +
       '  QR code pairing may not work in all runtimes (e.g. Bun).\n' +
       '  Set WHATSAPP_PHONE_NUMBER in ~/.claude/channels/whatsapp/.env\n' +
       '  or run /whatsapp:configure <phone> for reliable pairing.\n',
@@ -1268,7 +1275,7 @@ async function connectWhatsApp(): Promise<void> {
           `Open WhatsApp > Linked Devices > Link a Device\n` +
           `Tap "Link with phone number instead"\n` +
           `Enter the code above`
-        process.stderr.write(`whatsapp channel: ${pairingMsg}\n`)
+        process.stderr.write(`${LOG_PREFIX}: ${pairingMsg}\n`)
         mcp.notification({
           method: 'notifications/claude/channel',
           params: {
@@ -1283,7 +1290,7 @@ async function connectWhatsApp(): Promise<void> {
           },
         }).catch(() => {})
       } catch (err) {
-        process.stderr.write(`whatsapp channel: pairing code request failed: ${err}\n`)
+        process.stderr.write(`${LOG_PREFIX}: pairing code request failed: ${err}\n`)
       }
     }
 
@@ -1291,7 +1298,7 @@ async function connectWhatsApp(): Promise<void> {
       reconnectAttempt = 0
       pairingCodeRequested = false
       ownJid = jidNormalizedUser(sock!.user?.id ?? '')
-      process.stderr.write(`whatsapp channel: connected as ${ownJid}\n`)
+      process.stderr.write(`${LOG_PREFIX}: connected as ${ownJid}\n`)
 
       // Auto-add owner to allowlist on first connection
       if (ownJid && !STATIC) {
@@ -1301,10 +1308,10 @@ async function connectWhatsApp(): Promise<void> {
           access.allowFrom.push(resolvedOwn)
           if (access.dmPolicy === 'pairing' && access.allowFrom.length > 0) {
             access.dmPolicy = 'allowlist'
-            process.stderr.write(`whatsapp channel: auto-locked to allowlist mode\n`)
+            process.stderr.write(`${LOG_PREFIX}: auto-locked to allowlist mode\n`)
           }
           saveAccess(access)
-          process.stderr.write(`whatsapp channel: auto-added owner ${resolvedOwn} to allowlist\n`)
+          process.stderr.write(`${LOG_PREFIX}: auto-added owner ${resolvedOwn} to allowlist\n`)
         }
       }
 
@@ -1345,12 +1352,12 @@ async function connectWhatsApp(): Promise<void> {
       sock = null
       const statusCode = (lastDisconnect?.error as any)?.output?.statusCode
       const reason = statusCode ?? 'unknown'
-      process.stderr.write(`whatsapp channel: disconnected (reason: ${reason})\n`)
+      process.stderr.write(`${LOG_PREFIX}: disconnected (reason: ${reason})\n`)
 
       if (statusCode === DisconnectReason.loggedOut) {
         // Device was unlinked — auth is invalid
         process.stderr.write(
-          `whatsapp channel: logged out — auth invalid.\n` +
+          `${LOG_PREFIX}: logged out — auth invalid.\n` +
           `  Run /whatsapp:configure reset-auth to clear and re-pair.\n`,
         )
         // Don't auto-delete auth — let user decide
@@ -1361,7 +1368,7 @@ async function connectWhatsApp(): Promise<void> {
       if (statusCode === 428) {
         reconnectAttempt++
         const delay = Math.min(2000 * reconnectAttempt, 15000)
-        process.stderr.write(`whatsapp channel: pairing in progress, retrying in ${delay / 1000}s\n`)
+        process.stderr.write(`${LOG_PREFIX}: pairing in progress, retrying in ${delay / 1000}s\n`)
         setTimeout(connectWhatsApp, delay)
         return
       }
@@ -1372,7 +1379,7 @@ async function connectWhatsApp(): Promise<void> {
       const detail = statusCode === 440
         ? ' (session conflict — another instance may be using this auth)'
         : ''
-      process.stderr.write(`whatsapp channel: reconnecting in ${delay / 1000}s${detail}\n`)
+      process.stderr.write(`${LOG_PREFIX}: reconnecting in ${delay / 1000}s${detail}\n`)
       setTimeout(connectWhatsApp, delay)
     }
   })
@@ -1383,11 +1390,11 @@ async function connectWhatsApp(): Promise<void> {
       try {
         await handleMessage(msg)
       } catch (err) {
-        process.stderr.write(`whatsapp channel: message handler error: ${err}\n`)
+        process.stderr.write(`${LOG_PREFIX}: message handler error: ${err}\n`)
       }
     }
   })
 }
 
-process.stderr.write('whatsapp channel: starting\n')
+process.stderr.write(`${LOG_PREFIX}: starting\n`)
 await connectWhatsApp()

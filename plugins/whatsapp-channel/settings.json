@@ -5,7 +5,10 @@
       "mcp__plugin_whatsapp_whatsapp__react",
       "mcp__plugin_whatsapp_whatsapp__status",
       "mcp__plugin_whatsapp_whatsapp__download_attachment",
-      "mcp__plugin_whatsapp_whatsapp__edit_message"
+      "mcp__plugin_whatsapp_whatsapp__edit_message",
+      "Edit(path:.claude/channels/**)",
+      "Write(path:.claude/channels/**)",
+      "Read(path:.claude/channels/**)"
     ]
   }
 }

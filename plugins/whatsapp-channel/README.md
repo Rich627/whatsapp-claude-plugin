@@ -4,6 +4,8 @@ Connect WhatsApp to your Claude Code session via linked-device protocol.
 
 The MCP server connects to WhatsApp as a linked device (like WhatsApp Web) and provides tools to Claude to reply, react, edit messages, and handle media. When someone messages the linked number, the server forwards the message to your Claude Code session.
 
+> **Identity notice:** This plugin connects as a linked device to your existing WhatsApp account. Messages sent by Claude will appear as coming from your phone number — recipients cannot distinguish them from messages you send personally. If you need a separate bot identity, use a dedicated number (e.g. a second SIM or WhatsApp Business account) with the [dual-account setup](#dual-account-setup).
+
 ## Prerequisites
 
 - [Bun](https://bun.sh) — the MCP server runs on Bun. Install with `curl -fsSL https://bun.sh/install | bash`.
@@ -131,6 +133,53 @@ Inbound **photos** are downloaded eagerly to `~/.claude/channels/whatsapp/inbox/
 
 Other media types (**voice notes, audio, video, documents, stickers**) are lazy — the notification includes an `attachment_file_id`. The assistant calls `download_attachment` to fetch the file on demand.
 
+## Dual-account setup
+
+You can run two WhatsApp accounts simultaneously — for example, your personal number and a dedicated bot number (WhatsApp Business or a second SIM). Each account runs as a separate MCP server with its own auth, allowlist, and state directory.
+
+**1. Set environment variables for each account.**
+
+Create separate `.env` files:
+
+```sh
+# ~/.claude/channels/whatsapp/personal/.env
+WHATSAPP_PHONE_NUMBER=886912345678
+
+# ~/.claude/channels/whatsapp/business/.env
+WHATSAPP_PHONE_NUMBER=886987654321
+```
+
+**2. Add both servers to your MCP config.**
+
+In your project or user `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "whatsapp-personal": {
+      "command": "bun",
+      "args": ["run", "--cwd", "<plugin-path>", "--shell=bun", "--silent", "start"],
+      "env": {
+        "WHATSAPP_STATE_DIR": "~/.claude/channels/whatsapp/personal",
+        "WHATSAPP_ACCOUNT_NAME": "personal"
+      }
+    },
+    "whatsapp-bot": {
+      "command": "bun",
+      "args": ["run", "--cwd", "<plugin-path>", "--shell=bun", "--silent", "start"],
+      "env": {
+        "WHATSAPP_STATE_DIR": "~/.claude/channels/whatsapp/business",
+        "WHATSAPP_ACCOUNT_NAME": "bot"
+      }
+    }
+  }
+}
+```
+
+Each account gets fully isolated state (auth, allowlist, groups, inbox). Claude sees tools from both accounts with different namespaces (e.g. `mcp__whatsapp-personal__reply` vs `mcp__whatsapp-bot__reply`) and inbound messages include an `account` field in the meta so Claude knows which account received the message.
+
+**3. Pair each account separately.** Launch and follow the normal pairing flow for each.
+
 ## Session conflicts
 
 WhatsApp allows only **one connection per auth state**. Running two instances causes a 440 disconnect. Check for stale processes:
@@ -138,6 +187,10 @@ WhatsApp allows only **one connection per auth state**. Running two instances ca
 ```sh
 pkill -f "whatsapp.*server"
 ```
+
+## Known limitations
+
+**Inbound message delivery may not work.** Claude Code's channel notification system (`notifications/claude/channel`) has a confirmed client-side bug where inbound messages sent by the MCP server are silently dropped and never appear in the conversation. This affects all channel plugins (WhatsApp, Telegram, etc.) and is tracked across multiple issues ([#37933](https://github.com/anthropics/claude-code/issues/37933), [#36477](https://github.com/anthropics/claude-code/issues/36477), [#37633](https://github.com/anthropics/claude-code/issues/37633)). The server-side implementation is correct — the fix must come from the Claude Code client. No reliable workaround exists as of v2.1.83.
 
 ## Resetting auth
 
