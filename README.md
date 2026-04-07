@@ -22,17 +22,20 @@ Connect WhatsApp as a native channel to your Claude Code session using this MCP 
 ## Quick Start
 
 ```sh
-# 1. Add this marketplace
-/plugin marketplace add Rich627/whatsapp-claude-plugin
+# 1. Add this marketplace (one-time)
+claude plugin marketplace add Rich627/whatsapp-claude-plugin
 
 # 2. Install the plugin
-/plugin install whatsapp@whatsapp-claude-plugin
+claude plugin install whatsapp@whatsapp-claude-plugin
 
-# 3. Configure your phone number (country code + number, no +)
-/whatsapp:configure <phone>
+# 3. Launch Claude Code — the plugin loads automatically
+claude
+```
 
-# 4. Launch with channel
-claude --dangerously-load-development-channels plugin:whatsapp@whatsapp-claude-plugin
+Inside the session, configure your phone number and pair:
+
+```
+/whatsapp:configure <phone>   # country code + number, no +
 ```
 
 On first launch, a pairing code is printed to your terminal. On your phone: WhatsApp > Settings > Linked Devices > Link a Device > **Link with phone number instead** > enter the code.
