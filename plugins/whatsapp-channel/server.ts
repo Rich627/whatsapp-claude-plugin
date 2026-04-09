@@ -33,7 +33,7 @@ import makeWASocket, {
 import { randomBytes } from 'crypto'
 import { execFileSync } from 'child_process'
 import {
-  readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
+  readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync,
   statSync, renameSync, realpathSync, chmodSync, existsSync,
 } from 'fs'
 import { homedir } from 'os'
@@ -47,6 +47,7 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 const ENV_FILE = join(STATE_DIR, '.env')
 const GROUPS_DIR = join(STATE_DIR, 'groups')
 const LID_MAP_FILE = join(STATE_DIR, 'lid-map.json')
+const MESSAGE_LOG = join(STATE_DIR, 'messages.jsonl')
 
 // Load ~/.whatsapp-channel/.env into process.env. Real env wins.
 try {
@@ -579,6 +580,84 @@ function lookupKey(chat_id: string, message_id: string, fromMe = false): WAMessa
   return { remoteJid: chat_id, fromMe, id: message_id }
 }
 
+// ─── Message persistence (survives restart) ─────────────────────────────
+
+interface MessageLogEntry {
+  id: string
+  chat_id: string
+  user: string
+  user_id: string
+  text: string
+  ts: string
+  replied: boolean
+  image_path?: string
+  attachment_kind?: string
+  group_name?: string
+}
+
+function persistMessage(entry: MessageLogEntry): void {
+  try {
+    appendFileSync(MESSAGE_LOG, JSON.stringify(entry) + '\n')
+  } catch (err) {
+    process.stderr.write(`${LOG_PREFIX}: failed to persist message: ${err}\n`)
+  }
+}
+
+function markReplied(chat_id: string): void {
+  // Rewrite the log, marking all unreplied messages for this chat as replied
+  try {
+    if (!existsSync(MESSAGE_LOG)) return
+    const lines = readFileSync(MESSAGE_LOG, 'utf8').split('\n').filter(Boolean)
+    const updated = lines.map(line => {
+      try {
+        const entry = JSON.parse(line) as MessageLogEntry
+        if (entry.chat_id === chat_id && !entry.replied) {
+          entry.replied = true
+          return JSON.stringify(entry)
+        }
+        return line
+      } catch { return line }
+    })
+    writeFileSync(MESSAGE_LOG, updated.join('\n') + '\n')
+  } catch (err) {
+    process.stderr.write(`${LOG_PREFIX}: failed to mark replied: ${err}\n`)
+  }
+}
+
+function getUnreplied(): MessageLogEntry[] {
+  try {
+    if (!existsSync(MESSAGE_LOG)) return []
+    const lines = readFileSync(MESSAGE_LOG, 'utf8').split('\n').filter(Boolean)
+    const unreplied: MessageLogEntry[] = []
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line) as MessageLogEntry
+        if (!entry.replied) unreplied.push(entry)
+      } catch {}
+    }
+    return unreplied
+  } catch { return [] }
+}
+
+/** Prune entries older than 24h to keep the log small */
+function pruneMessageLog(): void {
+  try {
+    if (!existsSync(MESSAGE_LOG)) return
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000
+    const lines = readFileSync(MESSAGE_LOG, 'utf8').split('\n').filter(Boolean)
+    const kept = lines.filter(line => {
+      try {
+        const entry = JSON.parse(line) as MessageLogEntry
+        return new Date(entry.ts).getTime() > cutoff
+      } catch { return false }
+    })
+    writeFileSync(MESSAGE_LOG, kept.length ? kept.join('\n') + '\n' : '')
+  } catch {}
+}
+
+// Prune every hour
+setInterval(pruneMessageLog, 60 * 60 * 1000).unref()
+
 // ─── Photo extensions ──────────────────────────────────────────────────
 
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
@@ -619,7 +698,7 @@ const mcp = new Server(
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions. WhatsApp supports any emoji for reactions (no whitelist restriction).',
       '',
-      'On session start, call the status tool immediately to check connection state and show the pairing code if the device is not yet paired.',
+      'On session start, call the status tool immediately to check connection state and show the pairing code if the device is not yet paired. Then call the unreplied tool to catch up on any messages that arrived before this session or were missed due to a restart.',
       '',
       "WhatsApp exposes no history or search API — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -741,6 +820,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {},
       },
     },
+    {
+      name: 'unreplied',
+      description: 'Get messages received but not yet replied to. Call this on session start (after status) to catch up on messages that arrived before this session or were missed due to a restart. Each entry includes chat_id, message_id, user, text, and timestamp.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: {
+            type: 'string',
+            description: 'Optional: filter to a specific chat. Omit to get all unreplied messages.',
+          },
+        },
+      },
+    },
   ],
 }))
 
@@ -808,6 +900,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             if (sent.key.id) sentIds.push(sent.key.id)
           }
         }
+
+        markReplied(chat_id)
 
         const result =
           sentIds.length === 1
@@ -895,6 +989,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           lines.push('Not connected. Server is starting up or reconnecting.')
         }
         return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      case 'unreplied': {
+        const filterChat = args.chat_id as string | undefined
+        let unreplied = getUnreplied()
+        if (filterChat) unreplied = unreplied.filter(m => m.chat_id === filterChat)
+        if (unreplied.length === 0) {
+          return { content: [{ type: 'text', text: 'No unreplied messages.' }] }
+        }
+        const summary = unreplied.map(m => {
+          const parts = [`[${m.ts}] ${m.user} in ${m.group_name ?? m.chat_id}:`]
+          if (m.text) parts.push(m.text)
+          if (m.image_path) parts.push(`(image: ${m.image_path})`)
+          if (m.attachment_kind) parts.push(`(${m.attachment_kind} attachment)`)
+          parts.push(`  chat_id=${m.chat_id} message_id=${m.id}`)
+          return parts.join('\n')
+        }).join('\n\n')
+        return { content: [{ type: 'text', text: `${unreplied.length} unreplied message(s):\n\n${summary}` }] }
       }
 
       default:
@@ -1173,6 +1285,20 @@ async function handleMessage(msg: WAMessage): Promise<void> {
 
   // Resolve group name for context isolation
   const groupName = isGroup ? await resolveGroupName(remoteJid) : undefined
+
+  // Persist message to disk for crash recovery
+  persistMessage({
+    id: messageId,
+    chat_id: remoteJid,
+    user: msg.pushName ?? senderJid.split('@')[0],
+    user_id: senderJid,
+    text: contentText,
+    ts: new Date(timestamp * 1000).toISOString(),
+    replied: false,
+    ...(imagePath ? { image_path: imagePath } : {}),
+    ...(attachment ? { attachment_kind: attachment.kind } : {}),
+    ...(groupName ? { group_name: groupName } : {}),
+  })
 
   // Emit channel notification
   mcp.notification({
