@@ -1100,17 +1100,58 @@ function classifyMedia(msg: proto.IMessage | null | undefined): MediaInfo | null
 // ─── Voice transcription ────────────────────────────────────────────
 
 const WHISPER_SCRIPT = join(homedir(), 'whisper-transcribe.sh')
+const WHISPER_TIMEOUT_MS = Number(process.env.WHISPER_TIMEOUT_MS) || 180_000
+
+// Warn once per process when the script is missing — avoids spamming logs on
+// every voice message, but still makes the root cause visible on first use.
+let whisperMissingWarned = false
 
 function transcribeAudio(filePath: string): string | null {
   if (!existsSync(WHISPER_SCRIPT)) {
-    process.stderr.write(`${LOG_PREFIX}: whisper-transcribe.sh not found, skipping transcription\n`)
+    if (!whisperMissingWarned) {
+      whisperMissingWarned = true
+      process.stderr.write(
+        `${LOG_PREFIX}: whisper script missing at ${WHISPER_SCRIPT} — voice messages will be delivered untranscribed. ` +
+        `See plugins/whatsapp-channel/scripts/whisper-transcribe.sh for a reference.\n`
+      )
+    }
     return null
   }
   try {
-    const result = execFileSync(WHISPER_SCRIPT, [filePath], { timeout: 60_000, encoding: 'utf8' })
-    return result.trim() || null
-  } catch (err) {
-    process.stderr.write(`${LOG_PREFIX}: transcription failed: ${err}\n`)
+    const result = execFileSync(WHISPER_SCRIPT, [filePath], {
+      timeout: WHISPER_TIMEOUT_MS,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 10 * 1024 * 1024,
+    })
+    const trimmed = result.trim()
+    if (!trimmed) {
+      process.stderr.write(`${LOG_PREFIX}: whisper returned empty output for ${filePath}\n`)
+      return null
+    }
+    return trimmed
+  } catch (err: unknown) {
+    const e = err as NodeJS.ErrnoException & {
+      status?: number | null
+      signal?: string | null
+      stderr?: Buffer | string
+      stdout?: Buffer | string
+    }
+    const stderrText = e.stderr ? e.stderr.toString().trim() : ''
+    const parts: string[] = [`${LOG_PREFIX}: whisper transcription failed for ${filePath}`]
+    if (e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT') {
+      parts.push(`timed out after ${WHISPER_TIMEOUT_MS}ms (override with WHISPER_TIMEOUT_MS env var; first run downloads the model)`)
+    } else if (typeof e.status === 'number') {
+      parts.push(`exit ${e.status}`)
+    } else if (e.code) {
+      parts.push(`error code ${e.code}`)
+    }
+    if (stderrText) {
+      parts.push(`stderr: ${stderrText.slice(0, 2000)}`)
+    } else {
+      parts.push(`message: ${e.message}`)
+    }
+    process.stderr.write(parts.join(' | ') + '\n')
     return null
   }
 }
