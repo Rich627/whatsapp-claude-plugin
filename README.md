@@ -86,7 +86,32 @@ A: The WhatsApp session disconnects too. Just relaunch—no re-pairing needed, a
 | 440 disconnect error | Only one connection per auth state allowed. Kill stale processes: `pkill -f "whatsapp.*server"` |
 | Messages not arriving | Known Claude Code client bug ([#37933](https://github.com/anthropics/claude-code/issues/37933)). Server-side is correct, awaiting client fix. |
 | Auth expired | Run `/whatsapp:configure reset-auth` and re-pair |
-| Voice transcription not working | Install mlx-whisper: `pip install mlx-whisper` |
+| Voice transcription not working | See [voice transcription setup](#voice-transcription-setup-optional) below |
+
+## Voice transcription setup (optional)
+
+Incoming voice messages are auto-transcribed via a user script at `~/whisper-transcribe.sh`. If the script is missing, voice messages are delivered as untranscribed attachments.
+
+One-time setup (Apple Silicon, mlx-whisper):
+
+```bash
+# 1. ffmpeg (mlx-whisper uses it to decode audio)
+brew install ffmpeg
+
+# 2. Python venv + mlx-whisper
+python3 -m venv ~/whisper-env
+source ~/whisper-env/bin/activate
+pip install mlx-whisper
+
+# 3. Install the transcribe script
+cp plugins/whatsapp-channel/scripts/whisper-transcribe.sh ~/whisper-transcribe.sh
+chmod +x ~/whisper-transcribe.sh
+
+# 4. (Optional) Test it
+~/whisper-transcribe.sh path/to/sample.ogg
+```
+
+The reference script uses `mlx-community/whisper-large-v3-turbo` — accurate, fast, multilingual. Swap the model in the script if you prefer a smaller one.
 
 ## Documentation
 
