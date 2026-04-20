@@ -102,6 +102,7 @@ type Access = {
   replyToMode?: 'off' | 'first' | 'all'
   textChunkLimit?: number
   chunkMode?: 'length' | 'newline'
+  docModeThreshold?: number // send as file attachment when text exceeds this (0 = disabled)
 }
 
 function defaultAccess(): Access {
@@ -137,6 +138,7 @@ function readAccessFile(): Access {
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
+      docModeThreshold: parsed.docModeThreshold,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -517,6 +519,46 @@ setInterval(() => {
   }
 }, 60_000).unref()
 
+// ─── Markdown → WhatsApp format conversion ────────────────────────────
+
+function markdownToWhatsApp(text: string): string {
+  // Protect code blocks from formatting — collect them, replace with placeholders
+  const codeBlocks: string[] = []
+  let result = text.replace(/```[\w]*\n([\s\S]*?)```/g, (_match, code) => {
+    codeBlocks.push('```\n' + code.trimEnd() + '\n```')
+    return `\x00CB${codeBlocks.length - 1}\x00`
+  })
+
+  // Inline code — leave as-is (WhatsApp supports ```)
+  const inlineCode: string[] = []
+  result = result.replace(/`([^`]+)`/g, (_match, code) => {
+    inlineCode.push('`' + code + '`')
+    return `\x00IC${inlineCode.length - 1}\x00`
+  })
+
+  // Headers → bold
+  result = result.replace(/^#{1,6}\s+(.+)$/gm, '*$1*')
+
+  // Bold: **text** or __text__ → *text*
+  result = result.replace(/\*\*(.+?)\*\*/g, '*$1*')
+  result = result.replace(/__(.+?)__/g, '*$1*')
+
+  // Italic: *text* (single) or _text_ → _text_
+  // Only match single * not preceded/followed by * (to avoid conflicts with bold)
+  result = result.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '_$1_')
+
+  // Strikethrough: ~~text~~ → ~text~
+  result = result.replace(/~~(.+?)~~/g, '~$1~')
+
+  // Restore inline code
+  result = result.replace(/\x00IC(\d+)\x00/g, (_m, i) => inlineCode[parseInt(i)])
+
+  // Restore code blocks
+  result = result.replace(/\x00CB(\d+)\x00/g, (_m, i) => codeBlocks[parseInt(i)])
+
+  return result
+}
+
 function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[] {
   if (text.length <= limit) return [text]
   const out: string[] = []
@@ -721,6 +763,44 @@ const mcp = new Server(
 )
 
 // Permission relay — forward to all allowlisted DMs.
+// Track permission request message IDs for emoji-based approval
+const permissionMessageMap = new Map<string, string>() // messageId → requestId
+
+function formatPermissionPreview(tool_name: string, input_preview: string): string {
+  // Smart formatting based on tool type
+  switch (tool_name) {
+    case 'Bash':
+    case 'bash': {
+      const cmd = input_preview.match(/command["\s:]+(.+)/s)?.[1]?.trim() ?? input_preview
+      return `\`\`\`\n${cmd.slice(0, 500)}\n\`\`\``
+    }
+    case 'Edit':
+    case 'edit': {
+      const file = input_preview.match(/file_path["\s:]+([^\n"]+)/)?.[1] ?? ''
+      const old_s = input_preview.match(/old_string["\s:]+(.{0,200})/s)?.[1] ?? ''
+      const new_s = input_preview.match(/new_string["\s:]+(.{0,200})/s)?.[1] ?? ''
+      return `📄 ${file}\n- ${old_s.slice(0, 150)}\n+ ${new_s.slice(0, 150)}`
+    }
+    case 'Read':
+    case 'read': {
+      const path = input_preview.match(/file_path["\s:]+([^\n"]+)/)?.[1] ?? input_preview
+      return `📖 ${path}`
+    }
+    case 'Write':
+    case 'write': {
+      const path = input_preview.match(/file_path["\s:]+([^\n"]+)/)?.[1] ?? input_preview
+      return `✏️ ${path}`
+    }
+    case 'Grep':
+    case 'grep': {
+      const pattern = input_preview.match(/pattern["\s:]+([^\n"]+)/)?.[1] ?? input_preview
+      return `🔍 ${pattern}`
+    }
+    default:
+      return input_preview.slice(0, 500)
+  }
+}
+
 mcp.setNotificationHandler(
   z.object({
     method: z.literal('notifications/claude/channel/permission_request'),
@@ -734,17 +814,26 @@ mcp.setNotificationHandler(
   async ({ params }) => {
     const { request_id, tool_name, description, input_preview } = params
     const access = loadAccess()
+    const preview = formatPermissionPreview(tool_name, input_preview)
     const text =
-      `\u{1F510} Permission request [${request_id}]\n` +
-      `${tool_name}: ${description}\n` +
-      `${input_preview}\n\n` +
-      `Reply "yes ${request_id}" to allow or "no ${request_id}" to deny.`
+      `\u{1F510} *Permission request* [${request_id}]\n` +
+      `*${tool_name}*: ${description}\n\n` +
+      `${preview}\n\n` +
+      `👍 react or "yes ${request_id}" to allow\n` +
+      `👎 react or "no ${request_id}" to deny`
     // Send to the first allowlisted contact (owner) only, to avoid spam
     const owner = access.allowFrom[0]
     if (sock && owner) {
-      void sock.sendMessage(owner, { text }).catch(e => {
+      const sent = await sock.sendMessage(owner, { text }).catch(e => {
         process.stderr.write(`permission_request send to ${owner} failed: ${e}\n`)
+        return undefined
       })
+      if (sent?.key?.id) {
+        permissionMessageMap.set(sent.key.id, request_id)
+        trackSent(sent.key)
+        // Clean up after 10 minutes
+        setTimeout(() => permissionMessageMap.delete(sent.key.id!), 10 * 60 * 1000)
+      }
     }
   },
 )
@@ -861,10 +950,30 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
+        const docThreshold = access.docModeThreshold ?? 0
         const sentIds: string[] = []
 
         const quotedMsg = reply_to ? messageProtoStore.get(reply_to) : undefined
+
+        // Document mode: send as file attachment when text is very long
+        if (docThreshold > 0 && text.length > docThreshold) {
+          const hasMarkdown = /[#*_`~\[\]]/.test(text)
+          const ext = hasMarkdown ? '.md' : '.txt'
+          const docPath = join(INBOX_DIR, `reply-${Date.now()}${ext}`)
+          writeFileSync(docPath, text)
+          const preview = markdownToWhatsApp(text.slice(0, 200) + (text.length > 200 ? '…' : ''))
+          const opts = quotedMsg ? { quoted: quotedMsg } : undefined
+          const sent = await sock.sendMessage(chat_id, { text: preview }, opts ?? undefined)
+          if (sent?.key) { trackSent(sent.key); if (sent.key.id) sentIds.push(sent.key.id) }
+          const docSent = await sock.sendMessage(chat_id, {
+            document: readFileSync(docPath),
+            fileName: `response${ext}`,
+            mimetype: hasMarkdown ? 'text/markdown' : 'text/plain',
+          })
+          if (docSent?.key) { trackSent(docSent.key); if (docSent.key.id) sentIds.push(docSent.key.id) }
+          rmSync(docPath, { force: true })
+        } else {
+        const chunks = chunk(text, limit, mode)
 
         for (let i = 0; i < chunks.length; i++) {
           const shouldQuote =
@@ -872,11 +981,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             replyMode !== 'off' &&
             (replyMode === 'all' || i === 0)
           const opts = shouldQuote && quotedMsg ? { quoted: quotedMsg } : undefined
-          const sent = await sock.sendMessage(chat_id, { text: chunks[i] }, opts ?? undefined)
+          const formatted = markdownToWhatsApp(chunks[i])
+          const sent = await sock.sendMessage(chat_id, { text: formatted }, opts ?? undefined)
           if (sent?.key) {
             trackSent(sent.key)
             if (sent.key.id) sentIds.push(sent.key.id)
           }
+        }
         }
 
         // Files as separate messages
@@ -1101,12 +1212,51 @@ function classifyMedia(msg: proto.IMessage | null | undefined): MediaInfo | null
 
 const WHISPER_SCRIPT = join(homedir(), 'whisper-transcribe.sh')
 const WHISPER_TIMEOUT_MS = Number(process.env.WHISPER_TIMEOUT_MS) || 180_000
+const TRANSCRIPTION_PROVIDER = (process.env.TRANSCRIPTION_PROVIDER ?? 'local').toLowerCase()
+const GROQ_API_KEY = process.env.GROQ_API_KEY
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY
 
 // Warn once per process when the script is missing — avoids spamming logs on
 // every voice message, but still makes the root cause visible on first use.
 let whisperMissingWarned = false
 
-function transcribeAudio(filePath: string): string | null {
+async function transcribeCloud(filePath: string, provider: 'groq' | 'openai'): Promise<string | null> {
+  const apiKey = provider === 'groq' ? GROQ_API_KEY : OPENAI_API_KEY
+  if (!apiKey) {
+    process.stderr.write(`${LOG_PREFIX}: ${provider} transcription requires ${provider === 'groq' ? 'GROQ_API_KEY' : 'OPENAI_API_KEY'} env var\n`)
+    return null
+  }
+  const url = provider === 'groq'
+    ? 'https://api.groq.com/openai/v1/audio/transcriptions'
+    : 'https://api.openai.com/v1/audio/transcriptions'
+  const model = provider === 'groq' ? 'whisper-large-v3' : 'whisper-1'
+
+  try {
+    const fileData = readFileSync(filePath)
+    const blob = new Blob([fileData], { type: 'audio/ogg' })
+    const form = new FormData()
+    form.append('file', blob, basename(filePath))
+    form.append('model', model)
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: form,
+    })
+    if (!res.ok) {
+      const errText = await res.text()
+      process.stderr.write(`${LOG_PREFIX}: ${provider} transcription failed (${res.status}): ${errText.slice(0, 500)}\n`)
+      return null
+    }
+    const data = await res.json() as { text?: string }
+    return data.text?.trim() || null
+  } catch (err) {
+    process.stderr.write(`${LOG_PREFIX}: ${provider} transcription error: ${err}\n`)
+    return null
+  }
+}
+
+function transcribeLocal(filePath: string): string | null {
   if (!existsSync(WHISPER_SCRIPT)) {
     if (!whisperMissingWarned) {
       whisperMissingWarned = true
@@ -1154,6 +1304,12 @@ function transcribeAudio(filePath: string): string | null {
     process.stderr.write(parts.join(' | ') + '\n')
     return null
   }
+}
+
+async function transcribeAudio(filePath: string): Promise<string | null> {
+  if (TRANSCRIPTION_PROVIDER === 'groq') return transcribeCloud(filePath, 'groq')
+  if (TRANSCRIPTION_PROVIDER === 'openai') return transcribeCloud(filePath, 'openai')
+  return transcribeLocal(filePath)
 }
 
 function safeName(s: string | undefined | null): string | undefined {
@@ -1289,7 +1445,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
         const ext = mimeToExt(media.mime)
         const audioPath = join(INBOX_DIR, `${Date.now()}-${messageId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)}.${ext}`)
         writeFileSync(audioPath, buffer)
-        const transcript = transcribeAudio(audioPath)
+        const transcript = await transcribeAudio(audioPath)
         if (transcript) {
           // Replace text with transcript — Claude sees it as a regular text message
           text = `[Voice message] ${transcript}`
@@ -1586,6 +1742,28 @@ async function connectWhatsApp(): Promise<void> {
       } catch (err) {
         process.stderr.write(`${LOG_PREFIX}: message handler error: ${err}\n`)
       }
+    }
+  })
+
+  // Handle emoji reactions on permission request messages
+  sock.ev.on('messages.reaction' as any, async (reactions: { key: WAMessageKey; reaction: { text: string } }[]) => {
+    for (const { key, reaction } of reactions) {
+      if (!key.id || key.fromMe) continue
+      const requestId = permissionMessageMap.get(key.id)
+      if (!requestId) continue
+      const emoji = reaction.text
+      const isApprove = ['👍', '✅', '👌', '🆗'].includes(emoji)
+      const isDeny = ['👎', '❌', '🚫', '✋'].includes(emoji)
+      if (!isApprove && !isDeny) continue
+      permissionMessageMap.delete(key.id)
+      void mcp.notification({
+        method: 'notifications/claude/channel/permission',
+        params: {
+          request_id: requestId,
+          behavior: isApprove ? 'allow' : 'deny',
+        },
+      })
+      process.stderr.write(`${LOG_PREFIX}: permission ${requestId} ${isApprove ? 'approved' : 'denied'} via reaction ${emoji}\n`)
     }
   })
 }
