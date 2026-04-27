@@ -48,6 +48,7 @@ const ENV_FILE = join(STATE_DIR, '.env')
 const GROUPS_DIR = join(STATE_DIR, 'groups')
 const LID_MAP_FILE = join(STATE_DIR, 'lid-map.json')
 const MESSAGE_LOG = join(STATE_DIR, 'messages.jsonl')
+const LOCK_FILE = join(STATE_DIR, '.server.lock')
 
 // Load ~/.whatsapp-channel/.env into process.env. Real env wins.
 try {
@@ -66,6 +67,39 @@ const LOG_PREFIX = ACCOUNT_NAME ? `whatsapp[${ACCOUNT_NAME}]` : 'whatsapp channe
 
 mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 })
 mkdirSync(INBOX_DIR, { recursive: true })
+
+// ─── Single-instance lock ──────────────────────────────────────────────
+// Two server.ts processes connecting to the same Baileys auth state will
+// silently kick each other off WhatsApp. Hold a PID-based lock so a second
+// instance fails loudly at startup instead of poisoning the live session.
+function acquireSingletonLock(): void {
+  if (existsSync(LOCK_FILE)) {
+    const raw = (() => { try { return readFileSync(LOCK_FILE, 'utf8').trim() } catch { return '' } })()
+    const otherPid = Number(raw)
+    if (Number.isFinite(otherPid) && otherPid > 0 && otherPid !== process.pid) {
+      let alive = false
+      try { process.kill(otherPid, 0); alive = true } catch {}
+      if (alive) {
+        process.stderr.write(
+          `${LOG_PREFIX}: another whatsapp server is already running (pid ${otherPid}). ` +
+          `Refusing to start — duplicate instances kick each other off Baileys. ` +
+          `Lock file: ${LOCK_FILE}\n`,
+        )
+        process.exit(2)
+      }
+    }
+  }
+  writeFileSync(LOCK_FILE, String(process.pid))
+}
+
+function releaseSingletonLock(): void {
+  try {
+    const raw = readFileSync(LOCK_FILE, 'utf8').trim()
+    if (Number(raw) === process.pid) rmSync(LOCK_FILE, { force: true })
+  } catch {}
+}
+
+acquireSingletonLock()
 
 process.on('unhandledRejection', err => {
   process.stderr.write(`${LOG_PREFIX}: unhandled rejection: ${err}\n`)
@@ -1146,6 +1180,7 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write(`${LOG_PREFIX}: shutting down\n`)
+  releaseSingletonLock()
   setTimeout(() => process.exit(0), 2000)
   try { sock?.end(undefined as any) } catch {}
   process.exit(0)
