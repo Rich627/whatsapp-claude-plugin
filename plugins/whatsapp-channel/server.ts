@@ -70,16 +70,39 @@ mkdirSync(INBOX_DIR, { recursive: true })
 
 // ─── Single-instance lock ──────────────────────────────────────────────
 // Two server.ts processes connecting to the same Baileys auth state will
-// silently kick each other off WhatsApp. Hold a PID-based lock so a second
-// instance fails loudly at startup instead of poisoning the live session.
+// silently kick each other off WhatsApp. Hold a lock so a second instance
+// fails loudly at startup instead of poisoning the live session.
+//
+// The lock records PID *and* process start time. A bare PID is not enough:
+// after a reboot the OS reuses PID numbers, so a dead server's PID reappears
+// as some unrelated process and `process.kill(pid, 0)` reports it "alive" —
+// making every new instance refuse to start forever. Matching the start time
+// tells a genuine duplicate apart from a reused PID.
+
+// OS start time of a process ("Sat May 16 07:43:46 2026"), or null if no
+// such process. lstart is unique enough to distinguish a reused PID.
+function processStartTime(pid: number): string | null {
+  try {
+    return execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+      encoding: 'utf8',
+    }).trim() || null
+  } catch {
+    return null
+  }
+}
+
 function acquireSingletonLock(): void {
   if (existsSync(LOCK_FILE)) {
-    const raw = (() => { try { return readFileSync(LOCK_FILE, 'utf8').trim() } catch { return '' } })()
-    const otherPid = Number(raw)
+    const raw = (() => { try { return readFileSync(LOCK_FILE, 'utf8') } catch { return '' } })()
+    const [pidLine = '', startLine = ''] = raw.split('\n')
+    const otherPid = Number(pidLine.trim())
+    const lockedStart = startLine.trim()
     if (Number.isFinite(otherPid) && otherPid > 0 && otherPid !== process.pid) {
-      let alive = false
-      try { process.kill(otherPid, 0); alive = true } catch {}
-      if (alive) {
+      // Genuine duplicate only if the PID is alive AND started when the lock
+      // recorded. A missing lockedStart is a legacy lock we can't verify —
+      // take over rather than risk a false refusal (the bug this fixes).
+      const currentStart = processStartTime(otherPid)
+      if (currentStart !== null && lockedStart && currentStart === lockedStart) {
         process.stderr.write(
           `${LOG_PREFIX}: another whatsapp server is already running (pid ${otherPid}). ` +
           `Refusing to start — duplicate instances kick each other off Baileys. ` +
@@ -89,13 +112,13 @@ function acquireSingletonLock(): void {
       }
     }
   }
-  writeFileSync(LOCK_FILE, String(process.pid))
+  writeFileSync(LOCK_FILE, `${process.pid}\n${processStartTime(process.pid) ?? ''}\n`)
 }
 
 function releaseSingletonLock(): void {
   try {
-    const raw = readFileSync(LOCK_FILE, 'utf8').trim()
-    if (Number(raw) === process.pid) rmSync(LOCK_FILE, { force: true })
+    const pidLine = readFileSync(LOCK_FILE, 'utf8').split('\n')[0].trim()
+    if (Number(pidLine) === process.pid) rmSync(LOCK_FILE, { force: true })
   } catch {}
 }
 
