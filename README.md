@@ -122,6 +122,10 @@ The reference script uses `mlx-community/whisper-large-v3-turbo` — accurate, f
 
 See [plugins/whatsapp-channel/README.md](./plugins/whatsapp-channel/README.md) for full documentation including access control, dual-account setup, fine-grained permissions, and more.
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Rich627/whatsapp-claude-plugin&type=Date)](https://star-history.com/#Rich627/whatsapp-claude-plugin&Date)
+
 ## License
 
 [Apache 2.0](./plugins/whatsapp-channel/LICENSE) — Copyright 2025 Richie Liu
