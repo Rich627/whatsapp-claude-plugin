@@ -8,7 +8,7 @@
 #   source ~/whisper-env/bin/activate
 #   pip install mlx-whisper
 #   brew install ffmpeg
-#   cp plugins/whatsapp-channel/scripts/whisper-transcribe.sh ~/whisper-transcribe.sh
+#   cp scripts/whisper-transcribe.sh ~/whisper-transcribe.sh
 #   chmod +x ~/whisper-transcribe.sh
 #
 # The whatsapp-channel plugin invokes ~/whisper-transcribe.sh on every

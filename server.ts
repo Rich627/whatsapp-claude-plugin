@@ -1320,7 +1320,7 @@ function transcribeLocal(filePath: string): string | null {
       whisperMissingWarned = true
       process.stderr.write(
         `${LOG_PREFIX}: whisper script missing at ${WHISPER_SCRIPT} — voice messages will be delivered untranscribed. ` +
-        `See plugins/whatsapp-channel/scripts/whisper-transcribe.sh for a reference.\n`
+        `See scripts/whisper-transcribe.sh for a reference.\n`
       )
     }
     return null

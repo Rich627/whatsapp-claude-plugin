@@ -109,7 +109,7 @@ source ~/whisper-env/bin/activate
 pip install mlx-whisper
 
 # 3. Install the transcribe script
-cp plugins/whatsapp-channel/scripts/whisper-transcribe.sh ~/whisper-transcribe.sh
+cp scripts/whisper-transcribe.sh ~/whisper-transcribe.sh
 chmod +x ~/whisper-transcribe.sh
 
 # 4. (Optional) Test it
@@ -120,7 +120,7 @@ The reference script uses `mlx-community/whisper-large-v3-turbo` — accurate, f
 
 ## Documentation
 
-See [plugins/whatsapp-channel/README.md](./plugins/whatsapp-channel/README.md) for full documentation including access control, dual-account setup, fine-grained permissions, and more.
+See [USAGE.md](./USAGE.md) for full documentation including access control, dual-account setup, fine-grained permissions, and more.
 
 ## Star History
 
@@ -128,4 +128,4 @@ See [plugins/whatsapp-channel/README.md](./plugins/whatsapp-channel/README.md) f
 
 ## License
 
-[Apache 2.0](./plugins/whatsapp-channel/LICENSE) — Copyright 2025 Richie Liu
+[Apache 2.0](./LICENSE) — Copyright 2025 Richie Liu

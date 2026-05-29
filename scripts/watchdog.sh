@@ -4,7 +4,7 @@
 # external alert hook so you find out before replies silently die for hours.
 #
 # Setup:
-#   cp plugins/whatsapp-channel/scripts/watchdog.sh ~/.whatsapp-channel/watchdog.sh
+#   cp scripts/watchdog.sh ~/.whatsapp-channel/watchdog.sh
 #   chmod +x ~/.whatsapp-channel/watchdog.sh
 #
 # Crontab (every 2 minutes):
