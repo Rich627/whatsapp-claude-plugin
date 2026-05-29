@@ -2,9 +2,9 @@
 
 WhatsApp has no bot API — this channel connects as a **linked device** (like WhatsApp Web). Any contact who can message the linked phone number can reach the server. The access model described here decides who gets through.
 
-By default, a DM from an unknown sender triggers **pairing**: the server replies with a 6-character code and drops the message. You run `/whatsapp:access pair <code>` from your Claude Code session to approve them. Once approved, their messages pass through.
+By default, a DM from an unknown sender triggers **pairing**: the server replies with a 6-character code and drops the message. You run `/whatsapp-claude-channel:access pair <code>` from your Claude Code session to approve them. Once approved, their messages pass through.
 
-All state lives in `~/.whatsapp-channel/access.json`. The `/whatsapp:access` skill commands edit this file; the server re-reads it on every inbound message, so changes take effect without a restart. Set `WHATSAPP_ACCESS_MODE=static` to pin config to what was on disk at boot (pairing is unavailable in static mode since it requires runtime writes).
+All state lives in `~/.whatsapp-channel/access.json`. The `/whatsapp-claude-channel:access` skill commands edit this file; the server re-reads it on every inbound message, so changes take effect without a restart. Set `WHATSAPP_ACCESS_MODE=static` to pin config to what was on disk at boot (pairing is unavailable in static mode since it requires runtime writes).
 
 ## At a glance
 
@@ -22,12 +22,12 @@ All state lives in `~/.whatsapp-channel/access.json`. The `/whatsapp:access` ski
 
 | Policy | Behavior |
 | --- | --- |
-| `pairing` (default) | Reply with a pairing code, drop the message. Approve with `/whatsapp:access pair <code>`. |
+| `pairing` (default) | Reply with a pairing code, drop the message. Approve with `/whatsapp-claude-channel:access pair <code>`. |
 | `allowlist` | Drop silently. No reply. Prevents strangers from knowing the linked device is active. |
 | `disabled` | Drop everything, including allowlisted users and groups. |
 
 ```
-/whatsapp:access policy allowlist
+/whatsapp-claude-channel:access policy allowlist
 ```
 
 ## User IDs (JIDs)
@@ -37,8 +37,8 @@ WhatsApp identifies users by **JIDs** — phone number + `@s.whatsapp.net`, e.g.
 Pairing captures the JID automatically. To add one manually, use the phone number with country code, no leading `+`, followed by `@s.whatsapp.net`.
 
 ```
-/whatsapp:access allow 886912345678@s.whatsapp.net
-/whatsapp:access remove 886912345678@s.whatsapp.net
+/whatsapp-claude-channel:access allow 886912345678@s.whatsapp.net
+/whatsapp-claude-channel:access remove 886912345678@s.whatsapp.net
 ```
 
 ## Groups
@@ -46,7 +46,7 @@ Pairing captures the JID automatically. To add one manually, use the phone numbe
 Groups are off by default. Opt each one in individually.
 
 ```
-/whatsapp:access group add 120363424405607157@g.us
+/whatsapp-claude-channel:access group add 120363424405607157@g.us
 ```
 
 Group JIDs end in `@g.us`. To find one, add the linked device to the group — the server logs the group JID when it receives a message from an unenabled group.
@@ -54,10 +54,10 @@ Group JIDs end in `@g.us`. To find one, add the linked device to the group — t
 With the default `requireMention: false`, the server responds to every message. Pass `--mention` to require @mention, or `--allow jid1,jid2` to restrict which members can trigger it.
 
 ```
-/whatsapp:access group add 120363424405607157@g.us
-/whatsapp:access group add 120363424405607157@g.us --mention
-/whatsapp:access group add 120363424405607157@g.us --allow 886912345678@s.whatsapp.net
-/whatsapp:access group rm 120363424405607157@g.us
+/whatsapp-claude-channel:access group add 120363424405607157@g.us
+/whatsapp-claude-channel:access group add 120363424405607157@g.us --mention
+/whatsapp-claude-channel:access group add 120363424405607157@g.us --allow 886912345678@s.whatsapp.net
+/whatsapp-claude-channel:access group rm 120363424405607157@g.us
 ```
 
 ### Per-group personality & memory
@@ -69,7 +69,7 @@ Each enabled group gets a config directory at `~/.whatsapp-channel/groups/<group
 | `config.md` | Personality, goals, and instructions for Claude in this group. User edits this. |
 | `memory.md` | Conversation summaries appended by Claude automatically. Persists across sessions. |
 
-Created automatically when a group is added. Edit `config.md` to customize Claude's behavior per group. View or clear with `/whatsapp:access group config <jid>` and `/whatsapp:access group memory <jid>`.
+Created automatically when a group is added. Edit `config.md` to customize Claude's behavior per group. View or clear with `/whatsapp-claude-channel:access group config <jid>` and `/whatsapp-claude-channel:access group memory <jid>`.
 
 ### LID identifiers
 
@@ -83,18 +83,18 @@ In groups with `requireMention: true`, any of the following triggers the server:
 - A match against any regex in `mentionPatterns`
 
 ```
-/whatsapp:access set mentionPatterns '["claude", "assistant"]'
+/whatsapp-claude-channel:access set mentionPatterns '["claude", "assistant"]'
 ```
 
 ## Delivery
 
-Configure outbound behavior with `/whatsapp:access set <key> <value>`.
+Configure outbound behavior with `/whatsapp-claude-channel:access set <key> <value>`.
 
 **`ackReaction`** reacts to inbound messages on receipt. WhatsApp supports **any emoji** — there's no fixed whitelist like Telegram.
 
 ```
-/whatsapp:access set ackReaction 👀
-/whatsapp:access set ackReaction ""
+/whatsapp-claude-channel:access set ackReaction 👀
+/whatsapp-claude-channel:access set ackReaction ""
 ```
 
 **`replyToMode`** controls threading on chunked replies. When a long response is split, `first` (default) threads only the first chunk under the inbound message; `all` threads every chunk; `off` sends all chunks standalone.
@@ -107,15 +107,15 @@ Configure outbound behavior with `/whatsapp:access set <key> <value>`.
 
 | Command | Effect |
 | --- | --- |
-| `/whatsapp:access` | Print current state: policy, allowlist, pending pairings, enabled groups. |
-| `/whatsapp:access pair a4f91c` | Approve pairing code `a4f91c`. Adds the sender to `allowFrom` and sends a confirmation on WhatsApp. |
-| `/whatsapp:access deny a4f91c` | Discard a pending code. The sender is not notified. |
-| `/whatsapp:access allow 886912345678@s.whatsapp.net` | Add a JID directly. |
-| `/whatsapp:access remove 886912345678@s.whatsapp.net` | Remove from the allowlist. |
-| `/whatsapp:access policy allowlist` | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`. |
-| `/whatsapp:access group add 120363424405607157@g.us` | Enable a group. Flags: `--no-mention`, `--allow jid1,jid2`. |
-| `/whatsapp:access group rm 120363424405607157@g.us` | Disable a group. |
-| `/whatsapp:access set ackReaction 👀` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`. |
+| `/whatsapp-claude-channel:access` | Print current state: policy, allowlist, pending pairings, enabled groups. |
+| `/whatsapp-claude-channel:access pair a4f91c` | Approve pairing code `a4f91c`. Adds the sender to `allowFrom` and sends a confirmation on WhatsApp. |
+| `/whatsapp-claude-channel:access deny a4f91c` | Discard a pending code. The sender is not notified. |
+| `/whatsapp-claude-channel:access allow 886912345678@s.whatsapp.net` | Add a JID directly. |
+| `/whatsapp-claude-channel:access remove 886912345678@s.whatsapp.net` | Remove from the allowlist. |
+| `/whatsapp-claude-channel:access policy allowlist` | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`. |
+| `/whatsapp-claude-channel:access group add 120363424405607157@g.us` | Enable a group. Flags: `--no-mention`, `--allow jid1,jid2`. |
+| `/whatsapp-claude-channel:access group rm 120363424405607157@g.us` | Disable a group. |
+| `/whatsapp-claude-channel:access set ackReaction 👀` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`. |
 
 ## Config file
 

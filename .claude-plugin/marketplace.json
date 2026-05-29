@@ -1,16 +1,16 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "whatsapp-claude-plugin",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "WhatsApp channel plugin for Claude Code",
   "owner": {
     "name": "Rich627"
   },
   "plugins": [
     {
-      "name": "whatsapp",
+      "name": "whatsapp-claude-channel",
       "description": "WhatsApp channel for Claude Code — linked-device messaging bridge with built-in access control, pairing, allowlists, and group policy.",
-      "version": "0.7.0",
+      "version": "0.8.0",
       "source": "./",
       "category": "channels"
     }

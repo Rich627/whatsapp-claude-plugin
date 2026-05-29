@@ -31,7 +31,7 @@ Connect WhatsApp as a native channel to your Claude Code session using this MCP 
 claude plugin marketplace add Rich627/whatsapp-claude-plugin
 
 # 2. Install the plugin
-claude plugin install whatsapp@whatsapp-claude-plugin
+claude plugin install whatsapp-claude-channel@whatsapp-claude-plugin
 
 # 3. Launch Claude Code — the plugin loads automatically
 claude
@@ -40,7 +40,7 @@ claude
 Inside the session, configure your phone number and pair:
 
 ```
-/whatsapp:configure <phone>   # country code + number, no +
+/whatsapp-claude-channel:configure <phone>   # country code + number, no +
 ```
 
 On first launch, a pairing code is printed to your terminal. On your phone: WhatsApp > Settings > Linked Devices > Link a Device > **Link with phone number instead** > enter the code.
@@ -87,10 +87,10 @@ A: The WhatsApp session disconnects too. Just relaunch—no re-pairing needed, a
 
 | Issue | Solution |
 |-------|----------|
-| Pairing code not showing | Run `/whatsapp:configure <phone>` first, then relaunch |
+| Pairing code not showing | Run `/whatsapp-claude-channel:configure <phone>` first, then relaunch |
 | 440 disconnect error | Only one connection per auth state allowed. Kill stale processes: `pkill -f "whatsapp.*server"` |
 | Messages not arriving | Known Claude Code client bug ([#37933](https://github.com/anthropics/claude-code/issues/37933)). Server-side is correct, awaiting client fix. |
-| Auth expired | Run `/whatsapp:configure reset-auth` and re-pair |
+| Auth expired | Run `/whatsapp-claude-channel:configure reset-auth` and re-pair |
 | Voice transcription not working | See [voice transcription setup](#voice-transcription-setup-optional) below |
 
 ## Voice transcription setup (optional)

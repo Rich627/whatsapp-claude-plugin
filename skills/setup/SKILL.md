@@ -48,7 +48,7 @@ If no, skip to Phase 4.
 ## Phase 4: Access Control
 
 Explain the access model:
-> "By default, when someone DMs your WhatsApp account, they'll get a pairing code. You approve them by running `/whatsapp:access pair <code>` here. This prevents random people from talking to your Claude session."
+> "By default, when someone DMs your WhatsApp account, they'll get a pairing code. You approve them by running `/whatsapp-claude-channel:access pair <code>` here. This prevents random people from talking to your Claude session."
 
 Ask:
 > "Would you like to:"
@@ -66,7 +66,7 @@ Summarize:
 - Connection status (connected as [JID] or waiting for scan)
 - Access policy (pairing / allowlist)
 - Allowed contacts (if any)
-- How to manage access later: `/whatsapp:access`
-- How to reset auth if needed: `/whatsapp:configure reset-auth`
+- How to manage access later: `/whatsapp-claude-channel:access`
+- How to reset auth if needed: `/whatsapp-claude-channel:configure reset-auth`
 
 Tell the user they're all set. Messages from approved contacts will now appear in their Claude Code session.

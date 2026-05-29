@@ -17,7 +17,7 @@ The MCP server connects to WhatsApp as a linked device (like WhatsApp Web) and p
 
 ```
 /plugin marketplace add Rich627/whatsapp-claude-plugin
-/plugin install whatsapp@whatsapp-claude-plugin
+/plugin install whatsapp-claude-channel@whatsapp-claude-plugin
 /exit
 ```
 
@@ -30,7 +30,7 @@ claude
 **2. Configure your phone number.**
 
 ```
-/whatsapp:configure 886912345678
+/whatsapp-claude-channel:configure 886912345678
 /exit
 ```
 
@@ -39,7 +39,7 @@ Use your WhatsApp phone number with country code, no leading `+`.
 **3. Launch with the channel flag.**
 
 ```sh
-claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:whatsapp@whatsapp-claude-plugin
+claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:whatsapp-claude-channel@whatsapp-claude-plugin
 ```
 
 The pairing code appears automatically in your session. On your phone:
@@ -57,13 +57,13 @@ Once paired, your own number is **auto-added to the allowlist** and the policy i
 Have someone DM the linked number. Briefly flip to pairing mode:
 
 ```
-/whatsapp:access policy pairing
+/whatsapp-claude-channel:access policy pairing
 ```
 
 They'll receive a 6-character code. Approve in your Claude Code session:
 
 ```
-/whatsapp:access pair <code>
+/whatsapp-claude-channel:access pair <code>
 ```
 
 After pairing, the policy auto-locks back to `allowlist`.
@@ -71,7 +71,7 @@ After pairing, the policy auto-locks back to `allowlist`.
 **5. Add groups (optional).**
 
 ```
-/whatsapp:access group add <groupJid>
+/whatsapp-claude-channel:access group add <groupJid>
 ```
 
 Each group gets its own personality config at `~/.whatsapp-channel/groups/<groupJid>/config.md`. Edit that file to customize how Claude behaves in each group. Conversation memory is auto-saved to `memory.md` in the same directory.
@@ -83,7 +83,7 @@ See [ACCESS.md](./ACCESS.md) for group options (`--mention`, `--allow`).
 After initial setup, just run:
 
 ```sh
-claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:whatsapp@whatsapp-claude-plugin
+claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:whatsapp-claude-channel@whatsapp-claude-plugin
 ```
 
 - `--dangerously-skip-permissions` — auto-approve all tool calls (no permission prompts)
@@ -99,11 +99,11 @@ If you prefer to auto-allow only WhatsApp tools (instead of all tools), add to y
 {
   "permissions": {
     "allow": [
-      "mcp__plugin_whatsapp_whatsapp__reply",
-      "mcp__plugin_whatsapp_whatsapp__react",
-      "mcp__plugin_whatsapp_whatsapp__status",
-      "mcp__plugin_whatsapp_whatsapp__download_attachment",
-      "mcp__plugin_whatsapp_whatsapp__edit_message"
+      "mcp__plugin_whatsapp_claude_channel_whatsapp__reply",
+      "mcp__plugin_whatsapp_claude_channel_whatsapp__react",
+      "mcp__plugin_whatsapp_claude_channel_whatsapp__status",
+      "mcp__plugin_whatsapp_claude_channel_whatsapp__download_attachment",
+      "mcp__plugin_whatsapp_claude_channel_whatsapp__edit_message"
     ]
   }
 }
@@ -195,7 +195,7 @@ pkill -f "whatsapp.*server"
 ## Resetting auth
 
 ```
-/whatsapp:configure reset-auth
+/whatsapp-claude-channel:configure reset-auth
 ```
 
 Then relaunch to re-pair.
