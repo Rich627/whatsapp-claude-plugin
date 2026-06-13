@@ -1707,11 +1707,11 @@ async function connectWhatsApp(): Promise<void> {
       pairingCodeRequested = false
       ownJid = jidNormalizedUser(sock!.user?.id ?? '')
       process.stderr.write(`${LOG_PREFIX}: connected as ${ownJid}\n`)
+      const resolvedOwn = resolveToPhone(ownJid)
 
       // Auto-add owner to allowlist on first connection
       if (ownJid && !STATIC) {
         const access = loadAccess()
-        const resolvedOwn = resolveToPhone(ownJid)
         if (!isAllowedJid(ownJid, access.allowFrom)) {
           access.allowFrom.push(resolvedOwn)
           if (access.dmPolicy === 'pairing' && access.allowFrom.length > 0) {
