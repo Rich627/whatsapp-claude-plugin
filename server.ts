@@ -979,6 +979,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: 'list_groups',
+      description: "List every WhatsApp group this account is currently a member of, with each group's name and JID, and whether it's already allowlisted. Use this to find the JID of a newly-joined group so it can be added via the /whatsapp-claude-channel:access skill — no need to guess the JID from logs. Read-only: does not change access.",
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+    },
   ],
 }))
 
@@ -1175,6 +1183,28 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           return parts.join('\n')
         }).join('\n\n')
         return { content: [{ type: 'text', text: `${unreplied.length} unreplied message(s):\n\n${summary}` }] }
+      }
+
+      case 'list_groups': {
+        if (!sock) throw new Error('WhatsApp not connected')
+        const access = loadAccess()
+        const meta = await sock.groupFetchAllParticipating()
+        const groups = Object.values(meta)
+        if (groups.length === 0) {
+          return { content: [{ type: 'text', text: 'This account is not in any groups.' }] }
+        }
+        groups.sort((a, b) => (a.subject ?? '').localeCompare(b.subject ?? ''))
+        const lines = groups.map(g => {
+          const allowed = g.id in access.groups
+          const name = g.subject || '(no name)'
+          if (g.subject) groupNameCache[g.id] = g.subject // warm the cache while we have it
+          return `${allowed ? '✓' : '+'} ${name}\n    ${g.id}${allowed ? '' : '  (NOT allowlisted)'}`
+        })
+        const legend =
+          '✓ = allowlisted   + = joined but not allowlisted (add via /whatsapp-claude-channel:access)'
+        return {
+          content: [{ type: 'text', text: `${groups.length} group(s):\n\n${lines.join('\n')}\n\n${legend}` }],
+        }
       }
 
       default:
