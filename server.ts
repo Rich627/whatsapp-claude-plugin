@@ -1736,8 +1736,8 @@ async function connectWhatsApp(): Promise<void> {
       reconnectAttempt = 0
       pairingCodeRequested = false
       ownJid = jidNormalizedUser(sock!.user?.id ?? '')
+      const resolvedOwn = ownJid ? resolveToPhone(ownJid) : ''
       process.stderr.write(`${LOG_PREFIX}: connected as ${ownJid}\n`)
-      const resolvedOwn = resolveToPhone(ownJid)
 
       // Auto-add owner to allowlist on first connection
       if (ownJid && !STATIC) {
