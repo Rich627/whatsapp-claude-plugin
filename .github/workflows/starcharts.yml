@@ -1,0 +1,19 @@
+name: Starcharts
+on:
+  schedule:
+    - cron: "0 0 * * *" # Runs daily at midnight
+  workflow_dispatch:      # Allows manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  starcharts:
+    name: Generate starcharts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: MaoLongLong/actions-starcharts@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          svg_path: assets/star-history.svg
