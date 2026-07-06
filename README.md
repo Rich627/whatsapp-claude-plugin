@@ -124,13 +124,7 @@ See [USAGE.md](./USAGE.md) for full documentation including access control, dual
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=Rich627%2Fwhatsapp-claude-plugin&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Rich627/whatsapp-claude-plugin&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=Rich627/whatsapp-claude-plugin&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=Rich627/whatsapp-claude-plugin&type=date&legend=top-left" />
- </picture>
-</a>
+[View the Star History chart](https://www.star-history.com/?repos=Rich627%2Fwhatsapp-claude-plugin&type=date&legend=top-left)
 
 ## License
 
