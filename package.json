@@ -11,5 +11,8 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@whiskeysockets/baileys": "7.0.0-rc.9"
+  },
+  "devDependencies": {
+    "puppeteer": "^25.3.0"
   }
 }
