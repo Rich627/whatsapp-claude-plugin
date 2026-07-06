@@ -55,7 +55,9 @@ try {
   chmodSync(ENV_FILE, 0o600)
   for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
     const m = line.match(/^(\w+)=(.*)$/)
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+    if (m && process.env[m[1]] === undefined) {
+      process.env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2')
+    }
   }
 } catch {}
 
@@ -265,8 +267,13 @@ function resolveToPhone(jid: string): string {
   return lidMap[jidNormalizedUser(jid)] ?? jid
 }
 
+// Fail-closed: an empty allowlist means nobody is allowed yet (the pairing
+// flow, or the owner auto-add on connect, is what populates it). Callers
+// that want "empty = anyone" (e.g. a group with no allowFrom restriction)
+// must guard the call themselves — see the `groups[jid].allowFrom` check
+// in gate(), which only calls this when the list is non-empty.
 function isAllowedJid(jid: string, allowList: string[]): boolean {
-  if (allowList.length === 0) return true
+  if (allowList.length === 0) return false
   const phone = resolveToPhone(jid)
   if (allowList.includes(phone)) return true
   if (allowList.includes(jid)) return true
@@ -485,6 +492,13 @@ function cronMatches(expr: string, date: Date): boolean {
     parseCronField(dow, date.getDay(), 6)
 }
 
+function to24Hour(hr: number, ampm: string | undefined): number {
+  const p = (ampm ?? '').toLowerCase()
+  if (p === 'pm' && hr < 12) return hr + 12
+  if (p === 'am' && hr === 12) return 0
+  return hr
+}
+
 function loadGroupCrons(): CronJob[] {
   const jobs: CronJob[] = []
   const access = loadAccess()
@@ -500,26 +514,28 @@ function loadGroupCrons(): CronJob[] {
       for (const line of lines) {
         // Match cron expressions in the line
         const cronMatch = line.match(/(?:每|every)\s*(\d+)\s*(?:分鐘|分|min)/i)
-        const dailyMatch = line.match(/(?:每天|daily)\s*(\d{1,2}):?(\d{2})?\s*(?:AM|PM|am|pm)?/i)
-        const twiceMatch = line.match(/(?:每天|daily)\s*(\d{1,2})(?::(\d{2}))?\s*(?:AM|am)?\s*(?:&|和|,)\s*(\d{1,2})(?::(\d{2}))?\s*(?:PM|pm)?/i)
+        const dailyMatch = line.match(/(?:每天|daily)\s*(\d{1,2}):?(\d{2})?\s*(am|pm)?/i)
+        const twiceMatch = line.match(/(?:每天|daily)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:&|和|,)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i)
 
         let cronExpr = ''
         const desc = line.replace(/^-\s*\*\*[^*]+\*\*:?\s*/, '').trim()
 
         if (twiceMatch) {
-          // Two times per day — create two entries
-          const h1 = parseInt(twiceMatch[1])
+          // Two times per day — create two entries. Each time's am/pm marker
+          // is captured next to that time, not inferred from the whole line
+          // (a line like "daily 1pm & 6am" previously mis-parsed both times
+          // off a single line-wide "includes pm" check).
+          const h1 = to24Hour(parseInt(twiceMatch[1]), twiceMatch[3])
           const m1 = parseInt(twiceMatch[2] || '0')
-          const h2 = parseInt(twiceMatch[3]) + (line.toLowerCase().includes('pm') ? 12 : 0)
-          const m2 = parseInt(twiceMatch[4] || '0')
+          const h2 = to24Hour(parseInt(twiceMatch[4]), twiceMatch[6])
+          const m2 = parseInt(twiceMatch[5] || '0')
           jobs.push({ groupJid, cron: `${m1} ${h1} * * *`, prompt: desc })
           jobs.push({ groupJid, cron: `${m2} ${h2} * * *`, prompt: desc })
           continue
         } else if (dailyMatch) {
-          const hr = parseInt(dailyMatch[1])
+          const hr = to24Hour(parseInt(dailyMatch[1]), dailyMatch[3])
           const min = parseInt(dailyMatch[2] || '0')
-          const isPM = line.toLowerCase().includes('pm') && hr < 12
-          cronExpr = `${min} ${isPM ? hr + 12 : hr} * * *`
+          cronExpr = `${min} ${hr} * * *`
         } else if (cronMatch) {
           cronExpr = `*/${cronMatch[1]} * * * *`
         }
@@ -1410,6 +1426,10 @@ async function handleMessage(msg: WAMessage): Promise<void> {
   if (!msg.key.remoteJid) return
 
   const remoteJid = msg.key.remoteJid
+  // Status updates / channel broadcasts aren't DMs or groups — treating them
+  // as a DM would burn a pairing slot and, in pairing mode, publish the
+  // "pairing required" reply as your own public status update.
+  if (remoteJid === 'status@broadcast' || remoteJid.endsWith('@broadcast') || remoteJid.endsWith('@newsletter')) return
   const isGroup = remoteJid.endsWith('@g.us')
   const senderJid = isGroup
     ? jidNormalizedUser(msg.key.participant ?? remoteJid)
