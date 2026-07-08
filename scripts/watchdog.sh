@@ -1,5 +1,9 @@
 #!/bin/bash
 # WhatsApp agent watchdog — detects stuck Claude sessions and nudges them.
+# If nudging doesn't unstick it within STUCK_STREAK_LIMIT consecutive checks
+# (e.g. the WhatsApp/Baileys connection itself dropped, which a nudge can't
+# fix), it hard-restarts the agent instead — via $HOME/start-whatsapp-agent.sh
+# if you have one, otherwise a launchd kickstart.
 # Also detects API auth failures (401) in the agent's tmux pane and fires an
 # external alert hook so you find out before replies silently die for hours.
 #
@@ -40,14 +44,59 @@ TMUX_SESSION="whatsapp-agent"
 COOLDOWN_FILE="$STATE_DIR/.watchdog-cooldown"
 AUTH_ALERT_FILE="$STATE_DIR/.watchdog-auth-alert"
 NOTIFY_HOOK="$STATE_DIR/notify-hook.sh"
+STUCK_STREAK_FILE="$STATE_DIR/.watchdog-stuck-streak"
+RESTART_COOLDOWN_FILE="$STATE_DIR/.watchdog-restart-cooldown"
+# Optional: a full agent restart script (graceful /exit + relaunch), e.g. one
+# that ends with `tmux new-session -d -s whatsapp-agent ... claude ...`.
+# If absent, hard restarts fall back to a launchd kickstart.
+RESTART_SCRIPT="$HOME/start-whatsapp-agent.sh"
 
 # Thresholds — only nudge if things are really stuck
 MSG_STALE_SECS=600              # 10 min unreplied message
 PENDING_STALE_MIN=15            # 15 min pending file untouched
 COOLDOWN_SECS=600               # don't nudge more than once per 10 min
 AUTH_ALERT_COOLDOWN_SECS=1800   # don't re-alert auth failure more than once per 30 min
+STUCK_STREAK_LIMIT=3            # after this many consecutive stuck-and-nudged checks
+                                 # (~20-30 min), stop nudging and hard-restart instead —
+                                 # a nudge only re-asks the agent to call its tools, which
+                                 # can't fix a dead WhatsApp connection the agent itself
+                                 # can't reconnect (see docs/governance/A-diagnosis.md #2)
+RESTART_COOLDOWN_SECS=1800      # don't hard-restart more than once per 30 min
 
 now=$(date +%s)
+
+# Full restart: tmux session is alive but repeated nudges haven't unstuck it
+# (e.g. the WhatsApp/Baileys connection itself dropped and won't self-heal —
+# a nudge just re-asks the agent to call tools against a connection that's
+# still dead). Returns 1 (does nothing) if the restart cooldown is active.
+hard_restart() {
+  local reason="$1"
+  local last_restart=0
+  [ -f "$RESTART_COOLDOWN_FILE" ] && last_restart=$(cat "$RESTART_COOLDOWN_FILE" 2>/dev/null || echo 0)
+  if [ $((now - last_restart)) -lt $RESTART_COOLDOWN_SECS ]; then
+    echo "[$(date -Iseconds)] would hard-restart ($reason) but restart cooldown active; nudging instead"
+    return 1
+  fi
+
+  echo "[$(date -Iseconds)] HARD-RESTART: $reason"
+  if [ -x "$RESTART_SCRIPT" ]; then
+    nohup "$RESTART_SCRIPT" >>"$STATE_DIR/watchdog-restart.log" 2>&1 &
+  else
+    launchctl kickstart -k "gui/$(id -u)/com.claude.whatsapp-agent" 2>&1 || true
+  fi
+
+  msg="WhatsApp agent on $(hostname -s) auto-restarted by watchdog ($reason)."
+  if [ -x "$NOTIFY_HOOK" ]; then
+    "$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
+  elif command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$msg\" with title \"WhatsApp agent auto-restarted\" sound name \"Funk\"" 2>/dev/null || true
+  fi
+
+  echo "0" > "$STUCK_STREAK_FILE"
+  echo "$now" > "$RESTART_COOLDOWN_FILE"
+  echo "$now" > "$COOLDOWN_FILE"
+  return 0
+}
 
 # ── Auth-failure detection ──
 # If the agent's tmux pane shows 401 / "Please run /login", nudging is
@@ -85,6 +134,7 @@ fi
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
   pane=$(tmux capture-pane -t "$TMUX_SESSION" -p 2>/dev/null | tail -20)
   if echo "$pane" | grep -qE "(Sautéing|Embellishing|Crunching|Boogieing|Thinking|Noodling|thinking with|tokens|esc to interrupt|\(ctrl\+)"; then
+    echo "0" > "$STUCK_STREAK_FILE"
     exit 0
   fi
 fi
@@ -130,6 +180,7 @@ if [ -d "$PENDING_DIR" ]; then
 fi
 
 if [ "$stuck" -eq 0 ]; then
+  echo "0" > "$STUCK_STREAK_FILE"
   exit 0
 fi
 
@@ -139,9 +190,26 @@ echo "[$(date -Iseconds)] STUCK: $reason"
 if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
   echo "[$(date -Iseconds)] tmux session $TMUX_SESSION missing; kickstarting launchd"
   launchctl kickstart -k "gui/$(id -u)/com.claude.whatsapp-agent" 2>&1 || true
+  echo "0" > "$STUCK_STREAK_FILE"
   echo "$now" > "$COOLDOWN_FILE"
   exit 0
 fi
+
+# Session is alive but stuck again — bump the streak. Past STUCK_STREAK_LIMIT
+# consecutive stuck checks, nudging clearly isn't working (e.g. the WhatsApp
+# connection itself died), so hard-restart instead of nudging forever.
+streak=0
+[ -f "$STUCK_STREAK_FILE" ] && streak=$(cat "$STUCK_STREAK_FILE" 2>/dev/null || echo 0)
+streak=$((streak + 1))
+
+if [ "$streak" -ge "$STUCK_STREAK_LIMIT" ]; then
+  if hard_restart "$reason; stuck through $streak consecutive checks"; then
+    exit 0
+  fi
+  # restart cooldown was active — fall through and nudge as a fallback
+fi
+
+echo "$streak" > "$STUCK_STREAK_FILE"
 
 # Nudge: ESC + catch-up prompt
 tmux send-keys -t "$TMUX_SESSION" Escape
@@ -151,4 +219,4 @@ sleep 1
 tmux send-keys -t "$TMUX_SESSION" Enter
 
 echo "$now" > "$COOLDOWN_FILE"
-echo "[$(date -Iseconds)] nudged agent"
+echo "[$(date -Iseconds)] nudged agent (streak $streak/$STUCK_STREAK_LIMIT)"
