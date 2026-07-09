@@ -124,13 +124,14 @@ See [USAGE.md](./USAGE.md) for full documentation including access control, dual
 
 ## Star History
 
-<a href="https://star-history.com/#Rich627/whatsapp-claude-plugin&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Rich627/whatsapp-claude-plugin&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Rich627/whatsapp-claude-plugin&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Rich627/whatsapp-claude-plugin&type=Date" />
-  </picture>
+<a href="https://www.star-history.com/?type=date&repos=Rich627%2Fwhatsapp-claude-plugin">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Rich627/whatsapp-claude-plugin&type=date&theme=dark&legend=top-left&sealed_token=NrfP1Fv0z7ipQM961lFZJbXE76GS7paukclIhr6km37t0lJAzivyX0JUNQTkRaxa5lSpRCYmef3xvHaiUKCgBS0KbwpeIohfMOqur0ULPiTt2h2DWcUui1YJ2nux4W9Ug8u8D6CNl91ZYInSZCrrdNi5hydWjSLy89XtzYYM83F-mhgJI44lLZoxj7Na" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=Rich627/whatsapp-claude-plugin&type=date&legend=top-left&sealed_token=NrfP1Fv0z7ipQM961lFZJbXE76GS7paukclIhr6km37t0lJAzivyX0JUNQTkRaxa5lSpRCYmef3xvHaiUKCgBS0KbwpeIohfMOqur0ULPiTt2h2DWcUui1YJ2nux4W9Ug8u8D6CNl91ZYInSZCrrdNi5hydWjSLy89XtzYYM83F-mhgJI44lLZoxj7Na" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=Rich627/whatsapp-claude-plugin&type=date&legend=top-left&sealed_token=NrfP1Fv0z7ipQM961lFZJbXE76GS7paukclIhr6km37t0lJAzivyX0JUNQTkRaxa5lSpRCYmef3xvHaiUKCgBS0KbwpeIohfMOqur0ULPiTt2h2DWcUui1YJ2nux4W9Ug8u8D6CNl91ZYInSZCrrdNi5hydWjSLy89XtzYYM83F-mhgJI44lLZoxj7Na" />
+ </picture>
 </a>
+
 
 ## License
 
