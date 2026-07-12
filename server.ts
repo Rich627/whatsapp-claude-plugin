@@ -267,6 +267,27 @@ function resolveToPhone(jid: string): string {
   return lidMap[jidNormalizedUser(jid)] ?? jid
 }
 
+// Our own lidMap is only populated passively, by the `lid-mapping.update`
+// event (see connectWhatsApp). That event does not reliably fire for every
+// contact, which left allowlisted senders permanently unresolvable — and
+// thus silently dropped by gate() — whenever it didn't. Baileys itself
+// already resolves LID↔PN as part of decrypting the Signal session (that's
+// how the session file gets written at all), and keeps its own persisted
+// mapping in signalRepository.lidMapping. Consult that as an active
+// fallback before gate() runs, so a decryptable message is never dropped
+// just because our passive cache missed the event.
+async function ensureLidResolved(jid: string): Promise<void> {
+  if (!isLidUser(jid) || !sock) return
+  const normalized = jidNormalizedUser(jid)
+  if (lidMap[normalized]) return
+  try {
+    const pn = await sock.signalRepository.lidMapping.getPNForLID(normalized)
+    if (pn) recordLidMapping(normalized, pn)
+  } catch (err) {
+    process.stderr.write(`${LOG_PREFIX}: active LID resolution failed for ${normalized}: ${err}\n`)
+  }
+}
+
 // Fail-closed: an empty allowlist means nobody is allowed yet (the pairing
 // flow, or the owner auto-add on connect, is what populates it). Callers
 // that want "empty = anyone" (e.g. a group with no allowFrom restriction)
@@ -1445,10 +1466,21 @@ async function handleMessage(msg: WAMessage): Promise<void> {
   // Store for later use by reply_to and download_attachment
   storeMessage(msg)
 
+  // Resolve LID → phone before the allowlist check runs, so a sender whose
+  // messages arrive under an @lid we haven't cached isn't dropped purely
+  // because our passive lid-mapping.update listener missed it.
+  await ensureLidResolved(senderJid)
+
   // Gate check
   const result = gate(remoteJid, senderJid, text, mentionedJids)
 
-  if (result.action === 'drop') return
+  if (result.action === 'drop') {
+    process.stderr.write(
+      `${LOG_PREFIX}: dropped inbound from ${senderJid}` +
+      `${isLidUser(senderJid) ? ` (resolved: ${resolveToPhone(senderJid)})` : ''} chat=${remoteJid}\n`,
+    )
+    return
+  }
 
   if (result.action === 'pair') {
     if (!sock) return
