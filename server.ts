@@ -51,12 +51,15 @@ const MESSAGE_LOG = join(STATE_DIR, 'messages.jsonl')
 const LOCK_FILE = join(STATE_DIR, '.server.lock')
 
 // Load ~/.whatsapp-channel/.env into process.env. Real env wins.
+try { chmodSync(ENV_FILE, 0o600) } catch {}
 try {
-  chmodSync(ENV_FILE, 0o600)
-  for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
+  const envRaw = readFileSync(ENV_FILE, 'utf8')
+  // Strip BOM and normalize CRLF — Notepad/Windows-authored .env files commonly have both.
+  const envText = envRaw.charCodeAt(0) === 0xFEFF ? envRaw.slice(1) : envRaw
+  for (const line of envText.split(/\r?\n/)) {
     const m = line.match(/^(\w+)=(.*)$/)
     if (m && process.env[m[1]] === undefined) {
-      process.env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2')
+      process.env[m[1]] = m[2].replace(/\r$/, '').replace(/^(['"])(.*)\1$/, '$2')
     }
   }
 } catch {}
@@ -1176,6 +1179,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const connected = sock !== null
         const paired = ownJid !== ''
         const lines: string[] = []
+        // Fall back to the persisted pairing code if the in-memory one was lost
+        // (e.g. a process restart) — see the 428/timeout handling below.
+        let resolvedPairingCode = lastPairingCode
+        if (!resolvedPairingCode) {
+          try { resolvedPairingCode = readFileSync(join(STATE_DIR, 'pairing-code.txt'), 'utf8').trim() } catch {}
+        }
         if (paired) {
           lines.push(`Connected as ${ownJid}`)
           const access = loadAccess()
@@ -1193,11 +1202,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           if (Object.keys(access.pending).length > 0) {
             lines.push(`Pending pairings: ${Object.keys(access.pending).join(', ')}`)
           }
-        } else if (lastPairingCode) {
-          lines.push(`Not paired yet. Pairing code: ${lastPairingCode}`)
+        } else if (resolvedPairingCode) {
+          lines.push(`Not paired yet. Pairing code: ${resolvedPairingCode}`)
           lines.push(`On your phone: WhatsApp > Linked Devices > Link a Device > "Link with phone number instead" > enter the code`)
         } else if (connected) {
           lines.push('Connected but waiting for pairing code...')
+          try {
+            const errLog = readFileSync(join(STATE_DIR, 'pairing-errors.log'), 'utf8')
+            const lastLines = errLog.trim().split('\n').slice(-3).join('\n')
+            if (lastLines) lines.push(`Recent errors:\n${lastLines}`)
+          } catch {}
         } else {
           lines.push('Not connected. Server is starting up or reconnecting.')
         }
@@ -1709,12 +1723,36 @@ async function connectWhatsApp(): Promise<void> {
   if (needsPairing && PHONE_NUMBER && !pairingCodeRequested) {
     const localSock = sock
     ;(async () => {
-      // Small delay to let the WebSocket handshake begin
-      await new Promise(r => setTimeout(r, 5000))
-      if (pairingCodeRequested) return
+      // Shorter delay — a 428 disconnect during pairing often happens within
+      // 3-5s on Bun/Windows, so waiting the full 5s just wastes the window.
+      await new Promise(r => setTimeout(r, 1500))
+      // Abort if this socket was already replaced (disconnect happened during
+      // the delay) or another path already requested the code.
+      if (pairingCodeRequested || sock !== localSock) return
       pairingCodeRequested = true
+      const PAIRING_CODE_FILE = join(STATE_DIR, 'pairing-code.txt')
+      const errLogFile = join(STATE_DIR, 'pairing-errors.log')
       try {
-        const code = await localSock.requestPairingCode(PHONE_NUMBER)
+        // Race against socket disconnect AND a hard 20s timeout. On Bun/Windows
+        // requestPairingCode can hang forever when the underlying WebSocket is
+        // already dead — reacting to the disconnect event cancels it immediately
+        // instead of waiting for a timeout that doesn't fire reliably on Bun.
+        const code = await Promise.race([
+          localSock.requestPairingCode(PHONE_NUMBER!),
+          new Promise<never>((_, reject) => {
+            const onUpdate = ({ connection }: { connection?: string }) => {
+              if (connection === 'close') {
+                localSock.ev.off('connection.update', onUpdate)
+                reject(new Error('socket closed during pairing code request'))
+              }
+            }
+            localSock.ev.on('connection.update', onUpdate)
+            setTimeout(() => {
+              localSock.ev.off('connection.update', onUpdate)
+              reject(new Error('requestPairingCode timed out after 20s'))
+            }, 20000)
+          }),
+        ])
         lastPairingCode = code
         const pairingMsg =
           `Pairing code: ${code}\n` +
@@ -1722,6 +1760,13 @@ async function connectWhatsApp(): Promise<void> {
           `Tap "Link with phone number instead"\n` +
           `Enter the code above`
         process.stderr.write(`${LOG_PREFIX}: ${pairingMsg}\n`)
+        // Persist to file so the status tool can show it even after a restart.
+        try {
+          writeFileSync(PAIRING_CODE_FILE, code, { mode: 0o600 })
+        } catch (writeErr) {
+          process.stderr.write(`${LOG_PREFIX}: failed to write pairing-code.txt: ${writeErr}\n`)
+          try { appendFileSync(errLogFile, `${new Date().toISOString()} [write-code] ${writeErr}\n`) } catch {}
+        }
         // Surface pairing code to Claude session via MCP notification
         mcp.notification({
           method: 'notifications/claude/channel',
@@ -1737,9 +1782,11 @@ async function connectWhatsApp(): Promise<void> {
           },
         }).catch(() => {})
       } catch (err) {
-        // Will retry on next connectWhatsApp call
+        // Will retry on next connectWhatsApp call (triggered by 428 reconnect)
         pairingCodeRequested = false
-        process.stderr.write(`${LOG_PREFIX}: pairing code request failed: ${err}\n`)
+        const errMsg = `${LOG_PREFIX}: pairing code request failed: ${err}\n`
+        process.stderr.write(errMsg)
+        try { appendFileSync(errLogFile, `${new Date().toISOString()} ${errMsg}`) } catch {}
       }
     })()
   } else if (needsPairing && !PHONE_NUMBER) {
@@ -1757,8 +1804,16 @@ async function connectWhatsApp(): Promise<void> {
     if (qr && PHONE_NUMBER && !pairingCodeRequested) {
       // QR event fired (works in Node.js) — also request pairing code as alternative
       pairingCodeRequested = true
+      const PAIRING_CODE_FILE = join(STATE_DIR, 'pairing-code.txt')
+      const errLogFile = join(STATE_DIR, 'pairing-errors.log')
+      const qrSock = sock!
       try {
-        const code = await sock!.requestPairingCode(PHONE_NUMBER)
+        const code = await Promise.race([
+          qrSock.requestPairingCode(PHONE_NUMBER),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('requestPairingCode timed out after 20s')), 20000)
+          ),
+        ])
         lastPairingCode = code
         const pairingMsg =
           `Pairing code: ${code}\n` +
@@ -1766,6 +1821,11 @@ async function connectWhatsApp(): Promise<void> {
           `Tap "Link with phone number instead"\n` +
           `Enter the code above`
         process.stderr.write(`${LOG_PREFIX}: ${pairingMsg}\n`)
+        try {
+          writeFileSync(PAIRING_CODE_FILE, code, { mode: 0o600 })
+        } catch (writeErr) {
+          process.stderr.write(`${LOG_PREFIX}: failed to write pairing-code.txt: ${writeErr}\n`)
+        }
         mcp.notification({
           method: 'notifications/claude/channel',
           params: {
@@ -1780,7 +1840,10 @@ async function connectWhatsApp(): Promise<void> {
           },
         }).catch(() => {})
       } catch (err) {
-        process.stderr.write(`${LOG_PREFIX}: pairing code request failed: ${err}\n`)
+        pairingCodeRequested = false
+        const errMsg = `${LOG_PREFIX}: pairing code request failed (qr path): ${err}\n`
+        process.stderr.write(errMsg)
+        try { appendFileSync(errLogFile, `${new Date().toISOString()} ${errMsg}`) } catch {}
       }
     }
 
@@ -1856,6 +1919,7 @@ async function connectWhatsApp(): Promise<void> {
 
       // During pairing, 428 is expected — gentle backoff, retry will re-request pairing code
       if (statusCode === 428) {
+        pairingCodeRequested = false  // reset so next connectWhatsApp retries the request
         reconnectAttempt++
         const delay = Math.min(2000 * reconnectAttempt, 15000)
         process.stderr.write(`${LOG_PREFIX}: pairing in progress, retrying in ${delay / 1000}s\n`)
