@@ -1678,10 +1678,48 @@ let reconnectAttempt = 0
 
 let pairingCodeRequested = false
 let lastPairingCode = ''
+// Bumped per socket. WhatsApp only honours a pairing code on the socket that
+// registered it, so a request started by a superseded socket must not touch
+// shared pairing state.
+let pairingGeneration = 0
+
+// Registers `lastPairingCode` (or a fresh one) on `targetSock` and tells the
+// user. Reusing the existing code keeps whatever we already showed them valid
+// across reconnects, so they don't have to retype on every 428.
+async function requestAndAnnouncePairingCode(targetSock: NonNullable<typeof sock>): Promise<void> {
+  const code = await targetSock.requestPairingCode(PHONE_NUMBER!, lastPairingCode || undefined)
+  const isNewCode = code !== lastPairingCode
+  lastPairingCode = code
+
+  const pairingMsg =
+    `Pairing code: ${code}\n` +
+    `Open WhatsApp > Linked Devices > Link a Device\n` +
+    `Tap "Link with phone number instead"\n` +
+    `Enter the code above`
+  process.stderr.write(`${LOG_PREFIX}: ${pairingMsg}\n`)
+
+  // Re-registering an unchanged code is routine during pairing — only surface
+  // it to the session when there is actually something new to type.
+  if (!isNewCode) return
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: pairingMsg,
+      meta: {
+        chat_id: 'system',
+        message_id: `pairing-${Date.now()}`,
+        user: 'WhatsApp Setup',
+        user_id: 'system',
+        ts: new Date().toISOString(),
+      },
+    },
+  }).catch(() => {})
+}
 
 async function connectWhatsApp(): Promise<void> {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
   const needsPairing = !state.creds.registered
+  const myGeneration = ++pairingGeneration
 
   sock = makeWASocket({
     auth: state,
@@ -1711,34 +1749,14 @@ async function connectWhatsApp(): Promise<void> {
     ;(async () => {
       // Small delay to let the WebSocket handshake begin
       await new Promise(r => setTimeout(r, 5000))
+      if (myGeneration !== pairingGeneration) return
       if (pairingCodeRequested) return
       pairingCodeRequested = true
       try {
-        const code = await localSock.requestPairingCode(PHONE_NUMBER)
-        lastPairingCode = code
-        const pairingMsg =
-          `Pairing code: ${code}\n` +
-          `Open WhatsApp > Linked Devices > Link a Device\n` +
-          `Tap "Link with phone number instead"\n` +
-          `Enter the code above`
-        process.stderr.write(`${LOG_PREFIX}: ${pairingMsg}\n`)
-        // Surface pairing code to Claude session via MCP notification
-        mcp.notification({
-          method: 'notifications/claude/channel',
-          params: {
-            content: pairingMsg,
-            meta: {
-              chat_id: 'system',
-              message_id: `pairing-${Date.now()}`,
-              user: 'WhatsApp Setup',
-              user_id: 'system',
-              ts: new Date().toISOString(),
-            },
-          },
-        }).catch(() => {})
+        await requestAndAnnouncePairingCode(localSock)
       } catch (err) {
         // Will retry on next connectWhatsApp call
-        pairingCodeRequested = false
+        if (myGeneration === pairingGeneration) pairingCodeRequested = false
         process.stderr.write(`${LOG_PREFIX}: pairing code request failed: ${err}\n`)
       }
     })()
@@ -1758,28 +1776,9 @@ async function connectWhatsApp(): Promise<void> {
       // QR event fired (works in Node.js) — also request pairing code as alternative
       pairingCodeRequested = true
       try {
-        const code = await sock!.requestPairingCode(PHONE_NUMBER)
-        lastPairingCode = code
-        const pairingMsg =
-          `Pairing code: ${code}\n` +
-          `Open WhatsApp > Linked Devices > Link a Device\n` +
-          `Tap "Link with phone number instead"\n` +
-          `Enter the code above`
-        process.stderr.write(`${LOG_PREFIX}: ${pairingMsg}\n`)
-        mcp.notification({
-          method: 'notifications/claude/channel',
-          params: {
-            content: pairingMsg,
-            meta: {
-              chat_id: 'system',
-              message_id: `pairing-${Date.now()}`,
-              user: 'WhatsApp Setup',
-              user_id: 'system',
-              ts: new Date().toISOString(),
-            },
-          },
-        }).catch(() => {})
+        await requestAndAnnouncePairingCode(sock!)
       } catch (err) {
+        if (myGeneration === pairingGeneration) pairingCodeRequested = false
         process.stderr.write(`${LOG_PREFIX}: pairing code request failed: ${err}\n`)
       }
     }
@@ -1840,6 +1839,11 @@ async function connectWhatsApp(): Promise<void> {
 
     if (connection === 'close') {
       sock = null
+      // A dead socket can never complete pairing: WhatsApp drops the code it
+      // registered for us along with the connection. Clear the flag so the
+      // reconnect below re-registers it, otherwise we keep showing the user a
+      // code that nothing is listening for.
+      pairingCodeRequested = false
       const statusCode = (lastDisconnect?.error as any)?.output?.statusCode
       const reason = statusCode ?? 'unknown'
       process.stderr.write(`${LOG_PREFIX}: disconnected (reason: ${reason})\n`)
