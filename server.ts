@@ -1281,6 +1281,28 @@ process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
+// stdin EOF alone is not a reliable parent-death signal (2026-07-18: a killed
+// parent left this server orphaned under PID 1, still holding the singleton
+// lock and the Baileys session, so the replacement agent's server could never
+// start). Poll the parent by PID + start time — start time, not bare PID,
+// because a reused PID would otherwise masquerade as a live parent. Two
+// consecutive misses required so a transient ps failure can't kill us.
+const PARENT_PID = process.ppid
+const PARENT_START = processStartTime(PARENT_PID)
+let parentMisses = 0
+setInterval(() => {
+  if (PARENT_START === null) return
+  if (processStartTime(PARENT_PID) === PARENT_START) {
+    parentMisses = 0
+    return
+  }
+  parentMisses++
+  if (parentMisses >= 2) {
+    process.stderr.write(`${LOG_PREFIX}: parent process gone; shutting down orphaned server\n`)
+    shutdown()
+  }
+}, 15_000).unref()
+
 // ─── Silent logger for Baileys ─────────────────────────────────────────
 
 const noop = () => {}

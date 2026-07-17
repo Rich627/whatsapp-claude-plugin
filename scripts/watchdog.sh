@@ -50,6 +50,7 @@ RESTART_COOLDOWN_FILE="$STATE_DIR/.watchdog-restart-cooldown"
 # that ends with `tmux new-session -d -s whatsapp-agent ... claude ...`.
 # If absent, hard restarts fall back to a launchd kickstart.
 RESTART_SCRIPT="$HOME/start-whatsapp-agent.sh"
+LOCK_FILE="$STATE_DIR/.server.lock"
 
 # Thresholds — only nudge if things are really stuck
 MSG_STALE_SECS=600              # 10 min unreplied message
@@ -65,6 +66,29 @@ RESTART_COOLDOWN_SECS=1800      # don't hard-restart more than once per 30 min
 
 now=$(date +%s)
 
+# Kill an orphaned WhatsApp server left behind by a dead agent (reparented to
+# PID 1). It keeps holding the singleton lock and the Baileys session, so the
+# relaunched agent's own server can never start — seen 2026-07-18. Target only
+# the PID named in the lockfile: pattern-matching "bun server.ts" could hit
+# unrelated projects on the same box.
+kill_orphaned_server() {
+  [ -f "$LOCK_FILE" ] || return 0
+  local pid ppid
+  pid=$(head -1 "$LOCK_FILE" 2>/dev/null | tr -d '[:space:]')
+  case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+  ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  [ -z "$ppid" ] && return 0     # lockholder already dead; server.ts handles the stale file
+  [ "$ppid" != "1" ] && return 0 # parent still alive — a healthy server, not ours to kill
+  echo "[$(date -Iseconds)] killing orphaned whatsapp server (pid $pid, ppid 1) holding the singleton lock"
+  kill "$pid" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 1
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  rm -f "$LOCK_FILE"
+}
+
 # Full restart: tmux session is alive but repeated nudges haven't unstuck it
 # (e.g. the WhatsApp/Baileys connection itself dropped and won't self-heal —
 # a nudge just re-asks the agent to call tools against a connection that's
@@ -79,6 +103,7 @@ hard_restart() {
   fi
 
   echo "[$(date -Iseconds)] HARD-RESTART: $reason"
+  kill_orphaned_server
   if [ -x "$RESTART_SCRIPT" ]; then
     nohup "$RESTART_SCRIPT" >>"$STATE_DIR/watchdog-restart.log" 2>&1 &
   else
@@ -204,6 +229,7 @@ echo "[$(date -Iseconds)] STUCK: $reason"
 # (falling back to launchd). Kickstarting a launchd service that was never
 # installed 502s forever and the agent stays down — seen 2026-07-14.
 if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  kill_orphaned_server
   if [ -x "$RESTART_SCRIPT" ]; then
     echo "[$(date -Iseconds)] tmux session $TMUX_SESSION missing; relaunching via $RESTART_SCRIPT"
     nohup "$RESTART_SCRIPT" >>"$STATE_DIR/watchdog-restart.log" 2>&1 &
