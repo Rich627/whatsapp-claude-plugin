@@ -272,6 +272,35 @@ function resolveToPhone(jid: string): string {
   return lidMap[jidNormalizedUser(jid)] ?? jid
 }
 
+// ─── Outbound mentions ──────────────────────────────────────────────
+// Writing "@12345" in the text is not enough: WhatsApp only renders a mention —
+// and only notifies the person — when the message also carries a `mentions`
+// array of JIDs. Without it the @ is inert text. Accept ids in whatever shape
+// the caller has (bare, @-prefixed, LID or phone, full JID) and normalise.
+function normalizeMentionJids(raw: string[]): string[] {
+  const out: string[] = []
+  for (const entry of raw) {
+    const s = String(entry ?? '').trim().replace(/^@/, '')
+    if (!s) continue
+    if (s.includes('@')) { out.push(jidNormalizedUser(s)); continue }
+    // Group participants are LID-addressed, and the text convention is "@<lid>",
+    // so prefer the LID form whenever we know it.
+    const asLid = `${s}@lid`
+    if (lidMap[asLid]) { out.push(asLid); continue }
+    const lidForPhone = Object.keys(lidMap).find(k => lidMap[k] === `${s}@s.whatsapp.net`)
+    out.push(lidForPhone ?? `${s}@s.whatsapp.net`)
+  }
+  return [...new Set(out)]
+}
+
+// A long reply is split into chunks; only attach a mention to the chunk whose
+// text actually references it, so nobody gets pinged once per chunk.
+function mentionsForChunk(text: string, all: string[]): string[] | undefined {
+  if (!all.length) return undefined
+  const hits = all.filter(jid => text.includes(`@${jid.split('@')[0]}`))
+  return hits.length ? hits : undefined
+}
+
 // Our own lidMap is only populated passively, by the `lid-mapping.update`
 // event (see connectWhatsApp). That event does not reliably fire for every
 // contact, which left allowlisted senders permanently unresolvable — and
@@ -975,7 +1004,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on WhatsApp. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for quoting, and files (absolute paths) to attach images or documents.',
+        'Reply on WhatsApp. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for quoting, mentions (to @-tag people) and files (absolute paths) to attach images or documents.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -984,6 +1013,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           reply_to: {
             type: 'string',
             description: 'Message ID to quote-reply. Use message_id from the inbound <channel> block.',
+          },
+          mentions: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'User ids to @-tag, e.g. ["210363773620264"] — the user_id/lid from an inbound <channel> block (a phone number or full JID also works). You MUST also write the matching "@<id>" into text, using the same id you pass here; the array is what makes WhatsApp render it as a real mention and notify them, the text alone does nothing.',
           },
           files: {
             type: 'array',
@@ -1081,6 +1116,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
+        const mentionJids = normalizeMentionJids((args.mentions as string[] | undefined) ?? [])
 
         assertAllowedChat(chat_id)
         if (!sock) throw new Error('WhatsApp not connected')
@@ -1110,7 +1146,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           writeFileSync(docPath, text)
           const preview = markdownToWhatsApp(text.slice(0, 200) + (text.length > 200 ? '…' : ''))
           const opts = quotedMsg ? { quoted: quotedMsg } : undefined
-          const sent = await sock.sendMessage(chat_id, { text: preview }, opts ?? undefined)
+          const previewMentions = mentionsForChunk(preview, mentionJids)
+          const sent = await sock.sendMessage(
+            chat_id,
+            previewMentions ? { text: preview, mentions: previewMentions } : { text: preview },
+            opts ?? undefined,
+          )
           if (sent?.key) { trackSent(sent.key); if (sent.key.id) sentIds.push(sent.key.id) }
           const docSent = await sock.sendMessage(chat_id, {
             document: readFileSync(docPath),
@@ -1129,7 +1170,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             (replyMode === 'all' || i === 0)
           const opts = shouldQuote && quotedMsg ? { quoted: quotedMsg } : undefined
           const formatted = markdownToWhatsApp(chunks[i])
-          const sent = await sock.sendMessage(chat_id, { text: formatted }, opts ?? undefined)
+          const chunkMentions = mentionsForChunk(formatted, mentionJids)
+          const sent = await sock.sendMessage(
+            chat_id,
+            chunkMentions ? { text: formatted, mentions: chunkMentions } : { text: formatted },
+            opts ?? undefined,
+          )
           if (sent?.key) {
             trackSent(sent.key)
             if (sent.key.id) sentIds.push(sent.key.id)
