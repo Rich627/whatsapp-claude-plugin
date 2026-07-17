@@ -362,14 +362,116 @@ function checkActivity(): void {
   }
 }
 
+function checkTranscription(): void {
+  if (!existsSync(WHISPER_SCRIPT)) {
+    report(
+      "INFO",
+      "transcription",
+      `voice transcription not set up (optional) — ${WHISPER_SCRIPT} not found; voice notes arrive as plain audio attachments`,
+    );
+    return;
+  }
+  try {
+    accessSync(WHISPER_SCRIPT, constants.X_OK);
+    report("PASS", "transcription", `${WHISPER_SCRIPT} present and executable`);
+  } catch {
+    report(
+      "WARN",
+      "transcription",
+      `${WHISPER_SCRIPT} exists but is not executable — transcription will fail`,
+      { kind: "safe", text: `chmod +x ${WHISPER_SCRIPT}` },
+    );
+  }
+}
+
+function checkGroupConfigs(acc: AccessShape | null): void {
+  if (!acc) return;
+  for (const gid of Object.keys(acc.groups)) {
+    const cfg = join(GROUPS_DIR, gid, "config.md");
+    if (!existsSync(cfg)) {
+      report("INFO", "group-configs", `${gid}: no config.md (defaults apply)`);
+      continue;
+    }
+    let content = "";
+    try {
+      content = readFileSync(cfg, "utf8");
+    } catch {
+      report(
+        "WARN",
+        "group-configs",
+        `${gid}: config.md exists but is unreadable`,
+      );
+      continue;
+    }
+    // Exact regex the server uses (loadGroupCrons) — a heading that doesn't
+    // match it byte-for-byte is silently ignored.
+    const section = content.match(/## Cron Jobs\n([\s\S]*?)(?=\n## |\n# |$)/);
+    if (section) {
+      const bullets = section[1]
+        .split("\n")
+        .filter((l) => l.startsWith("- ")).length;
+      report(
+        "INFO",
+        "group-configs",
+        `${gid}: ## Cron Jobs section with ${bullets} ${bullets === 1 ? "entry" : "entries"}`,
+      );
+    } else if (/^#{1,6}\s.*cron/im.test(content)) {
+      report(
+        "WARN",
+        "group-configs",
+        `${gid}: config.md has a cron-like heading that is not exactly "## Cron Jobs" — the server silently ignores it`,
+        {
+          kind: "manual",
+          text: `Rename the heading in ${cfg} to exactly "## Cron Jobs"`,
+        },
+      );
+    } else {
+      report("PASS", "group-configs", `${gid}: config.md present`);
+    }
+  }
+}
+
+function checkWatchdog(): void {
+  if (!existsSync(WATCHDOG_SCRIPT)) {
+    report(
+      "INFO",
+      "watchdog",
+      "watchdog not installed (optional) — scripts/watchdog.sh in the plugin repo enables auto-recovery",
+    );
+    return;
+  }
+  let executable = true;
+  try {
+    accessSync(WATCHDOG_SCRIPT, constants.X_OK);
+  } catch {
+    executable = false;
+  }
+  let inCrontab = false;
+  try {
+    inCrontab = execFileSync("crontab", ["-l"], { encoding: "utf8" }).includes(
+      "watchdog.sh",
+    );
+  } catch {
+    /* no crontab for this user */
+  }
+  report(
+    "INFO",
+    "watchdog",
+    `installed at ${WATCHDOG_SCRIPT} (${executable ? "executable" : "NOT executable — chmod +x it"}, ${inCrontab ? "referenced in crontab" : "not in crontab — add a */2 entry per the script header"})`,
+  );
+}
+
 // ── main ────────────────────────────────────────────────────────────────
 
 checkEnv();
 if (checkStateDir()) {
   checkAuth();
   checkServer();
-  checkAccess();
+  const acc = checkAccess();
   checkActivity();
+  checkTranscription();
+  checkGroupConfigs(acc);
+  checkWatchdog();
 }
 out.push(
   `SUMMARY: ${counts.ERROR} error, ${counts.WARN} warn, ${counts.INFO} info, ${counts.PASS} pass`,

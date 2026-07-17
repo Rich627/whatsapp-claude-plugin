@@ -146,3 +146,48 @@ describe("activity", () => {
     expect(out).toContain("[PASS] activity: no stale unreplied messages");
   });
 });
+
+describe("group-configs", () => {
+  function withGroup(configMd: string): string {
+    const dir = freshStateDir();
+    writeFileSync(
+      join(dir, "access.json"),
+      JSON.stringify({
+        dmPolicy: "pairing",
+        allowFrom: [],
+        groups: { "123@g.us": {} },
+        pending: {},
+      }),
+    );
+    mkdirSync(join(dir, "groups", "123@g.us"), { recursive: true });
+    writeFileSync(join(dir, "groups", "123@g.us", "config.md"), configMd);
+    return dir;
+  }
+  test("near-miss cron heading → WARN (server silently ignores it)", () => {
+    const out = runDoctor(withGroup("# P\n\n## Cron jobs\n\n- daily 9am standup\n"));
+    expect(out).toContain("[WARN] group-configs: 123@g.us");
+    expect(out).toContain('not exactly "## Cron Jobs"');
+  });
+  test("exact heading → INFO with entry count", () => {
+    const out = runDoctor(
+      withGroup("# P\n\n## Cron Jobs\n\n- daily 9am standup\n- every 30 min check\n"),
+    );
+    expect(out).toContain(
+      "[INFO] group-configs: 123@g.us: ## Cron Jobs section with 2 entries",
+    );
+  });
+  test("config without cron → PASS", () => {
+    const out = runDoctor(withGroup("# Personality\n\nBe helpful.\n"));
+    expect(out).toContain("[PASS] group-configs: 123@g.us: config.md present");
+  });
+});
+
+describe("optional features", () => {
+  test("no whisper script and no watchdog → INFO only, never ERROR", () => {
+    // Empty state dir: transcription/watchdog absence must not add errors
+    // beyond the core-chain ones (auth+server = exactly 2 errors here).
+    const out = runDoctor(freshStateDir());
+    expect(out).toMatch(/\[INFO\] (transcription|watchdog)/);
+    expect(out).toMatch(/SUMMARY: 2 error/);
+  });
+});
