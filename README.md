@@ -41,6 +41,7 @@ A pairing code is printed on first launch. On your phone: WhatsApp → Settings 
 - **Cron tasks.** A `## Cron Jobs` section in a group's `config.md` schedules recurring server-side tasks.
 - **Context recovery.** After a restart, the `catch_up` tool replays recent two-way conversation per chat, unreplied counts, and open tasks from `tasks.md`, so a fresh session resumes mid-flight work.
 - **Dual accounts.** Run personal and business numbers side by side with separate state and behaviors.
+- **Self-diagnosis.** `/whatsapp-claude-channel:doctor` checks the server process, device link, singleton lock, and config, then walks you through the fixes — no more guessing why replies stopped.
 
 ## How it works
 

@@ -99,7 +99,12 @@ describe("access-config", () => {
     const dir = freshStateDir();
     writeFileSync(
       join(dir, "access.json"),
-      JSON.stringify({ dmPolicy: "open", allowFrom: [], groups: {}, pending: {} }),
+      JSON.stringify({
+        dmPolicy: "open",
+        allowFrom: [],
+        groups: {},
+        pending: {},
+      }),
     );
     const out = runDoctor(dir);
     expect(out).toContain('dmPolicy "open" invalid');
@@ -139,7 +144,12 @@ describe("activity", () => {
       join(dir, "messages.jsonl"),
       JSON.stringify({ ts: oldTs, chat_id: "c", replied: true }) +
         "\n" +
-        JSON.stringify({ ts: oldTs, chat_id: "c", direction: "out", replied: true }) +
+        JSON.stringify({
+          ts: oldTs,
+          chat_id: "c",
+          direction: "out",
+          replied: true,
+        }) +
         "\n",
     );
     const out = runDoctor(dir);
@@ -164,13 +174,17 @@ describe("group-configs", () => {
     return dir;
   }
   test("near-miss cron heading → WARN (server silently ignores it)", () => {
-    const out = runDoctor(withGroup("# P\n\n## Cron jobs\n\n- daily 9am standup\n"));
+    const out = runDoctor(
+      withGroup("# P\n\n## Cron jobs\n\n- daily 9am standup\n"),
+    );
     expect(out).toContain("[WARN] group-configs: 123@g.us");
     expect(out).toContain('not exactly "## Cron Jobs"');
   });
   test("exact heading → INFO with entry count", () => {
     const out = runDoctor(
-      withGroup("# P\n\n## Cron Jobs\n\n- daily 9am standup\n- every 30 min check\n"),
+      withGroup(
+        "# P\n\n## Cron Jobs\n\n- daily 9am standup\n- every 30 min check\n",
+      ),
     );
     expect(out).toContain(
       "[INFO] group-configs: 123@g.us: ## Cron Jobs section with 2 entries",

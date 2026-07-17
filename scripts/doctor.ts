@@ -43,7 +43,12 @@ type Severity = "PASS" | "INFO" | "WARN" | "ERROR";
 type Fix = { kind: "safe" | "manual"; text: string };
 
 const out: string[] = [];
-const counts: Record<Severity, number> = { PASS: 0, INFO: 0, WARN: 0, ERROR: 0 };
+const counts: Record<Severity, number> = {
+  PASS: 0,
+  INFO: 0,
+  WARN: 0,
+  ERROR: 0,
+};
 
 function report(sev: Severity, id: string, msg: string, fix?: Fix): void {
   counts[sev]++;
@@ -271,7 +276,11 @@ function checkAccess(): AccessShape | null {
       `dmPolicy "${acc.dmPolicy}" invalid (expected ${VALID_POLICIES.join("/")})`,
     );
   if (!Array.isArray(acc.allowFrom)) problems.push("allowFrom is not an array");
-  if (!acc.groups || typeof acc.groups !== "object" || Array.isArray(acc.groups))
+  if (
+    !acc.groups ||
+    typeof acc.groups !== "object" ||
+    Array.isArray(acc.groups)
+  )
     problems.push("groups is not an object");
   if (
     !acc.pending ||

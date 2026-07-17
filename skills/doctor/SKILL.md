@@ -15,7 +15,7 @@ from this skill.
 
 ## Step 1: Run the diagnostic script
 
-```
+```bash
 bun "${CLAUDE_PLUGIN_ROOT}/scripts/doctor.ts"
 ```
 
