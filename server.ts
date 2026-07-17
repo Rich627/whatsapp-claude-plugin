@@ -727,6 +727,8 @@ interface MessageLogEntry {
   text: string
   ts: string
   replied: boolean
+  /** Absent on legacy lines — treat missing as 'in'. */
+  direction?: 'in' | 'out'
   image_path?: string
   attachment_kind?: string
   group_name?: string
@@ -1116,6 +1118,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         markReplied(chat_id)
+
+        // Log the outbound reply for catch_up — full original text once, not per chunk
+        const outText = text || (files.length ? `(sent ${files.length} file(s))` : '')
+        if (outText) {
+          const outGroupName = chat_id.endsWith('@g.us') ? await resolveGroupName(chat_id) : undefined
+          persistMessage({
+            id: sentIds[0] ?? `out-${Date.now()}`,
+            chat_id,
+            user: 'You',
+            user_id: sock.user?.id ?? 'self',
+            text: outText,
+            ts: new Date().toISOString(),
+            replied: true,
+            direction: 'out',
+            ...(outGroupName && outGroupName !== chat_id ? { group_name: outGroupName } : {}),
+          })
+        }
 
         const result =
           sentIds.length === 1
@@ -1655,6 +1674,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
     text: contentText,
     ts: new Date(timestamp * 1000).toISOString(),
     replied: false,
+    direction: 'in',
     ...(imagePath ? { image_path: imagePath } : {}),
     ...(attachment ? { attachment_kind: attachment.kind } : {}),
     ...(groupName ? { group_name: groupName } : {}),
