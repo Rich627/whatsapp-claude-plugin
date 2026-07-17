@@ -1,3 +1,4 @@
+<!-- markdownlint-disable-file MD041 -->
 <!-- Thanks for contributing! Please fill this out so your PR is easy to review. -->
 
 ## What & why
