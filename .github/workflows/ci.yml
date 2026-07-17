@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  version-consistency:
+    name: Plugin versions match
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check plugin.json and marketplace.json versions match
+        run: |
+          plugin=$(jq -r '.version' .claude-plugin/plugin.json)
+          market=$(jq -r '.plugins[0].version' .claude-plugin/marketplace.json)
+          echo "plugin.json version:               $plugin"
+          echo "marketplace.json plugins[0].version: $market"
+          if [ "$plugin" != "$market" ]; then
+            echo "::error::Version mismatch. Bump BOTH .claude-plugin/plugin.json (.version) and .claude-plugin/marketplace.json (.plugins[0].version) to the SAME value. (The top-level marketplace version is separate — leave it alone.)"
+            exit 1
+          fi
+          echo "OK: versions match ($plugin)"
+
+  trunk:
+    name: Trunk check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Trunk Check
+        uses: trunk-io/trunk-action@v1
