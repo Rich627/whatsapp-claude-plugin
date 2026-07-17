@@ -122,6 +122,20 @@ if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
   fi
 fi
 
+# ── Dead-pane detection ──
+# A tmux session whose pane is dead means claude exited without a relaunch
+# (e.g. the start script's /exit went through but the script was interrupted
+# before spawning the replacement). has-session still passes in that state,
+# so without this check the watchdog stays blind until pending files pile up.
+# hard_restart carries its own cooldown, so this can't churn.
+if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  if [ "$(tmux list-panes -t "$TMUX_SESSION" -F '#{pane_dead}' 2>/dev/null | head -1)" = "1" ]; then
+    echo "[$(date -Iseconds)] pane dead in $TMUX_SESSION; hard-restarting"
+    hard_restart "dead pane (claude exited, no relaunch)" || true
+    exit 0
+  fi
+fi
+
 # Cooldown
 if [ -f "$COOLDOWN_FILE" ]; then
   last=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)
