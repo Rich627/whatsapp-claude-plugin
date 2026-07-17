@@ -122,6 +122,14 @@ The reference script uses `mlx-community/whisper-large-v3-turbo` — accurate, f
 
 See [USAGE.md](./USAGE.md) for full documentation including access control, dual-account setup, fine-grained permissions, and more.
 
+## Contributors
+
+Thanks to the community members whose diagnosis and code shaped recent releases:
+
+- [@nicojones](https://github.com/nicojones) — root-caused pairing-code invalidation across reconnects and designed the re-registration fix (#6, shipped in v0.11.1); `reply` @-mentions support (#7, shipped in v0.12.0)
+- [@pdfluxo-sys](https://github.com/pdfluxo-sys) — BOM/CRLF-tolerant `.env` parsing and the `requestPairingCode` hang guard (#5, shipped in v0.11.1)
+- [@jawadbokhari](https://github.com/jawadbokhari) — independently diagnosed and verified the stale WA Web version behind 405 pairing failures (#9)
+
 ## Star History
 
 <a href="https://www.star-history.com/?type=date&repos=Rich627%2Fwhatsapp-claude-plugin">
