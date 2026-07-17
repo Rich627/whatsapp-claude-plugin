@@ -43,15 +43,15 @@ Read both state files and give the user a complete picture:
    - Pending pairings: count, with codes and sender JIDs if any
 
 4. **What next** — end with a concrete next step based on state:
-   - No phone number → *"Run `/whatsapp-claude-channel:configure <phone>` with your
-     WhatsApp phone number (e.g. `886912345678`, no leading +)."*
-   - Phone set but not paired → *"Exit and launch with:
+   - No phone number → _"Run `/whatsapp-claude-channel:configure <phone>` with your
+     WhatsApp phone number (e.g. `886912345678`, no leading +)."_
+   - Phone set but not paired → _"Exit and launch with:
      `claude --dangerously-load-development-channels plugin:whatsapp-claude-channel@whatsapp-claude-plugin`
      The pairing code will appear automatically. Enter it on your phone:
-     WhatsApp > Linked Devices > Link a Device > Link with phone number instead."*
-   - Paired → *"Ready. Your own number is auto-added to the allowlist.
+     WhatsApp > Linked Devices > Link a Device > Link with phone number instead."_
+   - Paired → _"Ready. Your own number is auto-added to the allowlist.
      To add others: have them DM the linked number, then approve with
-     `/whatsapp-claude-channel:access pair <code>`."*
+     `/whatsapp-claude-channel:access pair <code>`."_
 
 **Push toward lockdown — always.** The goal for every setup is `allowlist`
 with a defined list. `pairing` is not a policy to stay on; it's a temporary
@@ -61,21 +61,21 @@ has done its job and should be turned off.
 Drive the conversation this way:
 
 1. Read the allowlist. Tell the user who's in it.
-2. Ask: *"Is that everyone who should reach you through this channel?"*
-3. **If yes and policy is still `pairing`** → *"Good. Let's lock it down so
-   nobody else can trigger pairing codes:"* and offer to run
+2. Ask: _"Is that everyone who should reach you through this channel?"_
+3. **If yes and policy is still `pairing`** → _"Good. Let's lock it down so
+   nobody else can trigger pairing codes:"_ and offer to run
    `/whatsapp-claude-channel:access policy allowlist`. Do this proactively — don't wait to
    be asked.
-4. **If no, people are missing** → *"Have them DM the number; you'll approve
+4. **If no, people are missing** → _"Have them DM the number; you'll approve
    each with `/whatsapp-claude-channel:access pair <code>`. Run this skill again once
-   everyone's in and we'll lock it."*
+   everyone's in and we'll lock it."_
 5. **If the allowlist is empty and they haven't paired themselves yet** →
-   *"DM the linked number to capture your JID first. Then we'll add anyone
-   else and lock it down."*
+   _"DM the linked number to capture your JID first. Then we'll add anyone
+   else and lock it down."_
 6. **If policy is already `allowlist`** → confirm this is the locked state.
-   If they need to add someone: *"They'll need to DM the linked number, or
+   If they need to add someone: _"They'll need to DM the linked number, or
    you can briefly flip to pairing: `/whatsapp-claude-channel:access policy pairing` → they
-   DM → you pair → flip back."*
+   DM → you pair → flip back."_
 
 Never frame `pairing` as the correct long-term choice. Don't skip the lockdown
 offer.
@@ -97,7 +97,7 @@ phone number.
 
 1. Confirm the user wants to do this — re-pairing will be required.
 2. `rm -rf ~/.whatsapp-channel/.baileys_auth`
-3. Inform: *"Auth cleared. Restart your session with `--channels` to re-pair."*
+3. Inform: _"Auth cleared. Restart your session with `--channels` to re-pair."_
 
 ### `clear` — remove the phone number
 

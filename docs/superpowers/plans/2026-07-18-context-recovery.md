@@ -15,7 +15,7 @@
 - **Hard Rule 1 (version pairing):** minor bump `0.10.4` → `0.11.0` in BOTH `.claude-plugin/marketplace.json` `plugins[0].version` AND `.claude-plugin/plugin.json` `version`. Ignore marketplace's top-level `"version": "1.5.0"` (that's the marketplace's own).
 - **Hard Rule 2 (danger zones):** every task that edits `server.ts` starts with `grep -n <symbol> server.ts` for each touched symbol, and its commit summary must name the invariant preserved. This change must NOT touch connection lifecycle, singleton lock, or access gating (spec: explicitly out of scope).
 - **Hard Rule 3 (remote commands to mini):** every ssh command uses `timeout <n>` or backgrounds with a log redirect.
-- **Hard Rule 4:** runtime state stays in `~/.whatsapp-channel/`; `tasks.md` is created by the *agent* at runtime, never by this repo.
+- **Hard Rule 4:** runtime state stays in `~/.whatsapp-channel/`; `tasks.md` is created by the _agent_ at runtime, never by this repo.
 - **No new dependencies.** Only existing imports (`readFileSync`, `writeFileSync`, `existsSync`, `join` — all already imported in server.ts).
 - Line numbers below are from the pre-edit file (1972 lines). After Task 1's edits, later tasks' line numbers shift by roughly +15 — anchor by grep/string match, not raw line number.
 
@@ -32,11 +32,13 @@
 ### Task 1: `direction` field + outbound reply logging
 
 **Files:**
+
 - Modify: `server.ts:722-733` (`MessageLogEntry` interface)
 - Modify: `server.ts:1650-1661` (inbound `persistMessage` call — tag `direction: 'in'`)
 - Modify: `server.ts:1118` (reply handler, after `markReplied(chat_id)` — log outbound)
 
 **Interfaces:**
+
 - Consumes: existing `persistMessage(entry: MessageLogEntry): void`, `resolveGroupName(groupJid: string): Promise<string>` (never throws; falls back to the JID), `markReplied(chat_id: string)`, `sentIds: string[]` (in-scope in the reply handler).
 - Produces: `MessageLogEntry.direction?: 'in' | 'out'` — Task 2's `getRecentByChat()` relies on `(entry.direction ?? 'in')` semantics and on outbound entries having `user: 'You'` is NOT assumed (Task 2 labels by `direction`, not by `user`).
 
@@ -56,16 +58,16 @@ In `server.ts`, change:
 
 ```ts
 interface MessageLogEntry {
-  id: string
-  chat_id: string
-  user: string
-  user_id: string
-  text: string
-  ts: string
-  replied: boolean
-  image_path?: string
-  attachment_kind?: string
-  group_name?: string
+  id: string;
+  chat_id: string;
+  user: string;
+  user_id: string;
+  text: string;
+  ts: string;
+  replied: boolean;
+  image_path?: string;
+  attachment_kind?: string;
+  group_name?: string;
 }
 ```
 
@@ -73,18 +75,18 @@ to:
 
 ```ts
 interface MessageLogEntry {
-  id: string
-  chat_id: string
-  user: string
-  user_id: string
-  text: string
-  ts: string
-  replied: boolean
+  id: string;
+  chat_id: string;
+  user: string;
+  user_id: string;
+  text: string;
+  ts: string;
+  replied: boolean;
   /** Absent on legacy lines — treat missing as 'in'. */
-  direction?: 'in' | 'out'
-  image_path?: string
-  attachment_kind?: string
-  group_name?: string
+  direction?: "in" | "out";
+  image_path?: string;
+  attachment_kind?: string;
+  group_name?: string;
 }
 ```
 
@@ -102,25 +104,30 @@ In the inbound pipeline (`persistMessage({ ... })` call at ~1650, the one with `
 In `case 'reply':`, immediately AFTER the existing `markReplied(chat_id)` line and BEFORE the `const result =` block, insert:
 
 ```ts
-        // Log the outbound reply for catch_up — full original text once, not per chunk
-        const outText = text || (files.length ? `(sent ${files.length} file(s))` : '')
-        if (outText) {
-          const outGroupName = chat_id.endsWith('@g.us') ? await resolveGroupName(chat_id) : undefined
-          persistMessage({
-            id: sentIds[0] ?? `out-${Date.now()}`,
-            chat_id,
-            user: 'You',
-            user_id: sock.user?.id ?? 'self',
-            text: outText,
-            ts: new Date().toISOString(),
-            replied: true,
-            direction: 'out',
-            ...(outGroupName && outGroupName !== chat_id ? { group_name: outGroupName } : {}),
-          })
-        }
+// Log the outbound reply for catch_up — full original text once, not per chunk
+const outText = text || (files.length ? `(sent ${files.length} file(s))` : "");
+if (outText) {
+  const outGroupName = chat_id.endsWith("@g.us")
+    ? await resolveGroupName(chat_id)
+    : undefined;
+  persistMessage({
+    id: sentIds[0] ?? `out-${Date.now()}`,
+    chat_id,
+    user: "You",
+    user_id: sock.user?.id ?? "self",
+    text: outText,
+    ts: new Date().toISOString(),
+    replied: true,
+    direction: "out",
+    ...(outGroupName && outGroupName !== chat_id
+      ? { group_name: outGroupName }
+      : {}),
+  });
+}
 ```
 
 Notes for the implementer:
+
 - This single call covers both the chunked branch and the doc-mode branch — both fall through to `markReplied` (invariant 4).
 - `replied: true` keeps outbound rows out of `getUnreplied()` (invariant 1).
 - `resolveGroupName` returns the JID itself on failure — the `!== chat_id` guard avoids storing a useless `group_name`.
@@ -149,6 +156,7 @@ unchanged; legacy lines without direction still read as inbound."
 ### Task 2: `catch_up` tool + `tasks.md` + session-start instructions
 
 **Files:**
+
 - Modify: `server.ts:51` area (path constants — add `TASKS_FILE`)
 - Modify: `server.ts:779` area (after `getUnreplied`, before `pruneMessageLog` — add `getRecentByChat`)
 - Modify: `server.ts:1007-1019` area (ListTools — add `catch_up` entry after `unreplied`)
@@ -156,6 +164,7 @@ unchanged; legacy lines without direction still read as inbound."
 - Modify: `server.ts:838` (session-start instruction) and `server.ts:851` area (add tasks.md maintenance paragraph)
 
 **Interfaces:**
+
 - Consumes: `MessageLogEntry` with `direction?: 'in' | 'out'` (Task 1), `MESSAGE_LOG`, `STATE_DIR`, `existsSync`/`readFileSync`/`join` (already imported).
 - Produces: `getRecentByChat(limit?: number): Map<string, { entries: MessageLogEntry[]; unreplied: number }>` and MCP tool `catch_up` (no arguments). `unreplied` tool untouched.
 
@@ -172,7 +181,7 @@ Expected: `MESSAGE_LOG` def at 51 and uses only inside the persistence section; 
 After the line `const MESSAGE_LOG = join(STATE_DIR, 'messages.jsonl')`, add:
 
 ```ts
-const TASKS_FILE = join(STATE_DIR, 'tasks.md')
+const TASKS_FILE = join(STATE_DIR, "tasks.md");
 ```
 
 - [ ] **Step 3: Add `getRecentByChat`**
@@ -182,29 +191,35 @@ Immediately after the closing brace of `getUnreplied()` (before the `pruneMessag
 ```ts
 /** Last ~N messages per chat, both directions, chronological — for catch_up.
  *  The 24h window is enforced by pruneMessageLog, not here. */
-function getRecentByChat(limit = 15): Map<string, { entries: MessageLogEntry[]; unreplied: number }> {
-  const byChat = new Map<string, { entries: MessageLogEntry[]; unreplied: number }>()
+function getRecentByChat(
+  limit = 15,
+): Map<string, { entries: MessageLogEntry[]; unreplied: number }> {
+  const byChat = new Map<
+    string,
+    { entries: MessageLogEntry[]; unreplied: number }
+  >();
   try {
-    if (!existsSync(MESSAGE_LOG)) return byChat
-    const lines = readFileSync(MESSAGE_LOG, 'utf8').split('\n').filter(Boolean)
+    if (!existsSync(MESSAGE_LOG)) return byChat;
+    const lines = readFileSync(MESSAGE_LOG, "utf8").split("\n").filter(Boolean);
     for (const line of lines) {
       try {
-        const entry = JSON.parse(line) as MessageLogEntry
-        let bucket = byChat.get(entry.chat_id)
+        const entry = JSON.parse(line) as MessageLogEntry;
+        let bucket = byChat.get(entry.chat_id);
         if (!bucket) {
-          bucket = { entries: [], unreplied: 0 }
-          byChat.set(entry.chat_id, bucket)
+          bucket = { entries: [], unreplied: 0 };
+          byChat.set(entry.chat_id, bucket);
         }
-        bucket.entries.push(entry)
-        if ((entry.direction ?? 'in') === 'in' && !entry.replied) bucket.unreplied++
+        bucket.entries.push(entry);
+        if ((entry.direction ?? "in") === "in" && !entry.replied)
+          bucket.unreplied++;
       } catch {}
     }
     for (const bucket of byChat.values()) {
-      bucket.entries.sort((a, b) => a.ts.localeCompare(b.ts))
-      bucket.entries = bucket.entries.slice(-limit)
+      bucket.entries.sort((a, b) => a.ts.localeCompare(b.ts));
+      bucket.entries = bucket.entries.slice(-limit);
     }
   } catch {}
-  return byChat
+  return byChat;
 }
 ```
 
@@ -338,7 +353,7 @@ Expected: `SMOKE_OK`. The JSON-RPC response embeds the text with `\n` escapes an
 - [ ] **Step 10: Verify `unreplied` is untouched**
 
 ```bash
-git diff server.ts | grep -n "case 'unreplied'" ; git diff server.ts | grep -c '^-' 
+git diff server.ts | grep -n "case 'unreplied'" ; git diff server.ts | grep -c '^-'
 ```
 
 Expected: no hunk modifies the `unreplied` case body (additions only around it). Also confirm the diff has no changes in connection lifecycle / lock / access-gate regions: `git diff server.ts | grep -in 'lock\|allowlist\|connection'` → no matches (or only incidental context lines).
@@ -359,6 +374,7 @@ Legacy log lines without direction are treated as inbound."
 ### Task 3: Version bump + push
 
 **Files:**
+
 - Modify: `.claude-plugin/marketplace.json` (`plugins[0].version`: `0.10.4` → `0.11.0`)
 - Modify: `.claude-plugin/plugin.json` (`version`: `0.10.4` → `0.11.0`)
 

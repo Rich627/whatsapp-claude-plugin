@@ -53,16 +53,16 @@ RESTART_SCRIPT="$HOME/start-whatsapp-agent.sh"
 LOCK_FILE="$STATE_DIR/.server.lock"
 
 # Thresholds — only nudge if things are really stuck
-MSG_STALE_SECS=600              # 10 min unreplied message
-PENDING_STALE_MIN=15            # 15 min pending file untouched
-COOLDOWN_SECS=600               # don't nudge more than once per 10 min
-AUTH_ALERT_COOLDOWN_SECS=1800   # don't re-alert auth failure more than once per 30 min
-STUCK_STREAK_LIMIT=3            # after this many consecutive stuck-and-nudged checks
-                                 # (~20-30 min), stop nudging and hard-restart instead —
-                                 # a nudge only re-asks the agent to call its tools, which
-                                 # can't fix a dead WhatsApp connection the agent itself
-                                 # can't reconnect (see docs/governance/A-diagnosis.md #2)
-RESTART_COOLDOWN_SECS=1800      # don't hard-restart more than once per 30 min
+MSG_STALE_SECS=600            # 10 min unreplied message
+PENDING_STALE_MIN=15          # 15 min pending file untouched
+COOLDOWN_SECS=600             # don't nudge more than once per 10 min
+AUTH_ALERT_COOLDOWN_SECS=1800 # don't re-alert auth failure more than once per 30 min
+STUCK_STREAK_LIMIT=3          # after this many consecutive stuck-and-nudged checks
+# (~20-30 min), stop nudging and hard-restart instead —
+# a nudge only re-asks the agent to call its tools, which
+# can't fix a dead WhatsApp connection the agent itself
+# can't reconnect (see docs/governance/A-diagnosis.md #2)
+RESTART_COOLDOWN_SECS=1800 # don't hard-restart more than once per 30 min
 
 now=$(date +%s)
 
@@ -72,21 +72,21 @@ now=$(date +%s)
 # the PID named in the lockfile: pattern-matching "bun server.ts" could hit
 # unrelated projects on the same box.
 kill_orphaned_server() {
-  [ -f "$LOCK_FILE" ] || return 0
-  local pid ppid
-  pid=$(head -1 "$LOCK_FILE" 2>/dev/null | tr -d '[:space:]')
-  case "$pid" in '' | *[!0-9]*) return 0 ;; esac
-  ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-  [ -z "$ppid" ] && return 0     # lockholder already dead; server.ts handles the stale file
-  [ "$ppid" != "1" ] && return 0 # parent still alive — a healthy server, not ours to kill
-  echo "[$(date -Iseconds)] killing orphaned whatsapp server (pid $pid, ppid 1) holding the singleton lock"
-  kill "$pid" 2>/dev/null || true
-  for _ in 1 2 3 4 5; do
-    kill -0 "$pid" 2>/dev/null || return 0
-    sleep 1
-  done
-  kill -9 "$pid" 2>/dev/null || true
-  rm -f "$LOCK_FILE"
+	[ -f "$LOCK_FILE" ] || return 0
+	local pid ppid
+	pid=$(head -1 "$LOCK_FILE" 2>/dev/null | tr -d '[:space:]')
+	case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+	ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+	[ -z "$ppid" ] && return 0     # lockholder already dead; server.ts handles the stale file
+	[ "$ppid" != "1" ] && return 0 # parent still alive — a healthy server, not ours to kill
+	echo "[$(date -Iseconds)] killing orphaned whatsapp server (pid $pid, ppid 1) holding the singleton lock"
+	kill "$pid" 2>/dev/null || true
+	for _ in 1 2 3 4 5; do
+		kill -0 "$pid" 2>/dev/null || return 0
+		sleep 1
+	done
+	kill -9 "$pid" 2>/dev/null || true
+	rm -f "$LOCK_FILE"
 }
 
 # Full restart: tmux session is alive but repeated nudges haven't unstuck it
@@ -94,33 +94,33 @@ kill_orphaned_server() {
 # a nudge just re-asks the agent to call tools against a connection that's
 # still dead). Returns 1 (does nothing) if the restart cooldown is active.
 hard_restart() {
-  local reason="$1"
-  local last_restart=0
-  [ -f "$RESTART_COOLDOWN_FILE" ] && last_restart=$(cat "$RESTART_COOLDOWN_FILE" 2>/dev/null || echo 0)
-  if [ $((now - last_restart)) -lt $RESTART_COOLDOWN_SECS ]; then
-    echo "[$(date -Iseconds)] would hard-restart ($reason) but restart cooldown active; nudging instead"
-    return 1
-  fi
+	local reason="$1"
+	local last_restart=0
+	[ -f "$RESTART_COOLDOWN_FILE" ] && last_restart=$(cat "$RESTART_COOLDOWN_FILE" 2>/dev/null || echo 0)
+	if [ $((now - last_restart)) -lt $RESTART_COOLDOWN_SECS ]; then
+		echo "[$(date -Iseconds)] would hard-restart ($reason) but restart cooldown active; nudging instead"
+		return 1
+	fi
 
-  echo "[$(date -Iseconds)] HARD-RESTART: $reason"
-  kill_orphaned_server
-  if [ -x "$RESTART_SCRIPT" ]; then
-    nohup "$RESTART_SCRIPT" >>"$STATE_DIR/watchdog-restart.log" 2>&1 &
-  else
-    launchctl kickstart -k "gui/$(id -u)/com.claude.whatsapp-agent" 2>&1 || true
-  fi
+	echo "[$(date -Iseconds)] HARD-RESTART: $reason"
+	kill_orphaned_server
+	if [ -x "$RESTART_SCRIPT" ]; then
+		nohup "$RESTART_SCRIPT" >>"$STATE_DIR/watchdog-restart.log" 2>&1 &
+	else
+		launchctl kickstart -k "gui/$(id -u)/com.claude.whatsapp-agent" 2>&1 || true
+	fi
 
-  msg="WhatsApp agent on $(hostname -s) auto-restarted by watchdog ($reason)."
-  if [ -x "$NOTIFY_HOOK" ]; then
-    "$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
-  elif command -v osascript >/dev/null 2>&1; then
-    osascript -e "display notification \"$msg\" with title \"WhatsApp agent auto-restarted\" sound name \"Funk\"" 2>/dev/null || true
-  fi
+	msg="WhatsApp agent on $(hostname -s) auto-restarted by watchdog ($reason)."
+	if [ -x "$NOTIFY_HOOK" ]; then
+		"$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
+	elif command -v osascript >/dev/null 2>&1; then
+		osascript -e "display notification \"$msg\" with title \"WhatsApp agent auto-restarted\" sound name \"Funk\"" 2>/dev/null || true
+	fi
 
-  echo "0" > "$STUCK_STREAK_FILE"
-  echo "$now" > "$RESTART_COOLDOWN_FILE"
-  echo "$now" > "$COOLDOWN_FILE"
-  return 0
+	echo "0" >"$STUCK_STREAK_FILE"
+	echo "$now" >"$RESTART_COOLDOWN_FILE"
+	echo "$now" >"$COOLDOWN_FILE"
+	return 0
 }
 
 # ── Auth-failure detection ──
@@ -129,22 +129,22 @@ hard_restart() {
 # Fire the alert hook (rate-limited) and bail. This runs BEFORE the cooldown
 # gate because auth failure is special and the user needs to know now.
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-  pane_recent=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -50 2>/dev/null || true)
-  if echo "$pane_recent" | grep -qE "(API Error: 401|Please run /login|authentication_error|Invalid authentication credentials)"; then
-    last_alert=0
-    [ -f "$AUTH_ALERT_FILE" ] && last_alert=$(cat "$AUTH_ALERT_FILE" 2>/dev/null || echo 0)
-    if [ $((now - last_alert)) -ge $AUTH_ALERT_COOLDOWN_SECS ]; then
-      msg="WhatsApp agent on $(hostname -s) is auth-broken (API 401). SSH in and run /login: tmux attach -t $TMUX_SESSION"
-      echo "[$(date -Iseconds)] AUTH-BROKEN: $msg"
-      if [ -x "$NOTIFY_HOOK" ]; then
-        "$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
-      elif command -v osascript >/dev/null 2>&1; then
-        osascript -e "display notification \"$msg\" with title \"WhatsApp agent auth broken\" sound name \"Funk\"" 2>/dev/null || true
-      fi
-      echo "$now" > "$AUTH_ALERT_FILE"
-    fi
-    exit 0
-  fi
+	pane_recent=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -50 2>/dev/null || true)
+	if echo "$pane_recent" | grep -qE "(API Error: 401|Please run /login|authentication_error|Invalid authentication credentials)"; then
+		last_alert=0
+		[ -f "$AUTH_ALERT_FILE" ] && last_alert=$(cat "$AUTH_ALERT_FILE" 2>/dev/null || echo 0)
+		if [ $((now - last_alert)) -ge $AUTH_ALERT_COOLDOWN_SECS ]; then
+			msg="WhatsApp agent on $(hostname -s) is auth-broken (API 401). SSH in and run /login: tmux attach -t $TMUX_SESSION"
+			echo "[$(date -Iseconds)] AUTH-BROKEN: $msg"
+			if [ -x "$NOTIFY_HOOK" ]; then
+				"$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
+			elif command -v osascript >/dev/null 2>&1; then
+				osascript -e "display notification \"$msg\" with title \"WhatsApp agent auth broken\" sound name \"Funk\"" 2>/dev/null || true
+			fi
+			echo "$now" >"$AUTH_ALERT_FILE"
+		fi
+		exit 0
+	fi
 fi
 
 # ── Dead-pane detection ──
@@ -154,28 +154,28 @@ fi
 # so without this check the watchdog stays blind until pending files pile up.
 # hard_restart carries its own cooldown, so this can't churn.
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-  if [ "$(tmux list-panes -t "$TMUX_SESSION" -F '#{pane_dead}' 2>/dev/null | head -1)" = "1" ]; then
-    echo "[$(date -Iseconds)] pane dead in $TMUX_SESSION; hard-restarting"
-    hard_restart "dead pane (claude exited, no relaunch)" || true
-    exit 0
-  fi
+	if [ "$(tmux list-panes -t "$TMUX_SESSION" -F '#{pane_dead}' 2>/dev/null | head -1)" = "1" ]; then
+		echo "[$(date -Iseconds)] pane dead in $TMUX_SESSION; hard-restarting"
+		hard_restart "dead pane (claude exited, no relaunch)" || true
+		exit 0
+	fi
 fi
 
 # Cooldown
 if [ -f "$COOLDOWN_FILE" ]; then
-  last=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)
-  if [ $((now - last)) -lt $COOLDOWN_SECS ]; then
-    exit 0
-  fi
+	last=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)
+	if [ $((now - last)) -lt $COOLDOWN_SECS ]; then
+		exit 0
+	fi
 fi
 
 # ── Liveness check: if tmux pane shows Claude actively working, skip nudging ──
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-  pane=$(tmux capture-pane -t "$TMUX_SESSION" -p 2>/dev/null | tail -20)
-  if echo "$pane" | grep -qE "(Sautéing|Embellishing|Crunching|Boogieing|Thinking|Noodling|thinking with|tokens|esc to interrupt|\(ctrl\+)"; then
-    echo "0" > "$STUCK_STREAK_FILE"
-    exit 0
-  fi
+	pane=$(tmux capture-pane -t "$TMUX_SESSION" -p 2>/dev/null | tail -20)
+	if echo "$pane" | grep -qE "(Sautéing|Embellishing|Crunching|Boogieing|Thinking|Noodling|thinking with|tokens|esc to interrupt|\(ctrl\+)"; then
+		echo "0" >"$STUCK_STREAK_FILE"
+		exit 0
+	fi
 fi
 
 stuck=0
@@ -183,7 +183,7 @@ reason=""
 
 # Check 1: unreplied messages older than MSG_STALE_SECS
 if [ -f "$MSG_LOG" ]; then
-  stale_count=$(python3 -c "
+	stale_count=$(python3 -c "
 import json, os
 from datetime import datetime, timezone
 now = datetime.now(timezone.utc).timestamp()
@@ -203,24 +203,24 @@ except FileNotFoundError:
   pass
 print(stale)
 " 2>/dev/null || echo 0)
-  if [ "$stale_count" -gt 0 ]; then
-    stuck=1
-    reason="$stale_count unreplied msg(s) >${MSG_STALE_SECS}s"
-  fi
+	if [ "$stale_count" -gt 0 ]; then
+		stuck=1
+		reason="$stale_count unreplied msg(s) >${MSG_STALE_SECS}s"
+	fi
 fi
 
 # Check 2: pending/ files older than PENDING_STALE_MIN
 if [ -d "$PENDING_DIR" ]; then
-  pending_stale=$(find "$PENDING_DIR" -type f -mmin +$PENDING_STALE_MIN 2>/dev/null | wc -l | tr -d " ")
-  if [ "$pending_stale" -gt 0 ]; then
-    stuck=1
-    reason="${reason:+$reason; }$pending_stale pending file(s) >${PENDING_STALE_MIN}m"
-  fi
+	pending_stale=$(find "$PENDING_DIR" -type f -mmin +$PENDING_STALE_MIN 2>/dev/null | wc -l | tr -d " ")
+	if [ "$pending_stale" -gt 0 ]; then
+		stuck=1
+		reason="${reason:+$reason; }$pending_stale pending file(s) >${PENDING_STALE_MIN}m"
+	fi
 fi
 
 if [ "$stuck" -eq 0 ]; then
-  echo "0" > "$STUCK_STREAK_FILE"
-  exit 0
+	echo "0" >"$STUCK_STREAK_FILE"
+	exit 0
 fi
 
 echo "[$(date -Iseconds)] STUCK: $reason"
@@ -229,17 +229,17 @@ echo "[$(date -Iseconds)] STUCK: $reason"
 # (falling back to launchd). Kickstarting a launchd service that was never
 # installed 502s forever and the agent stays down — seen 2026-07-14.
 if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-  kill_orphaned_server
-  if [ -x "$RESTART_SCRIPT" ]; then
-    echo "[$(date -Iseconds)] tmux session $TMUX_SESSION missing; relaunching via $RESTART_SCRIPT"
-    nohup "$RESTART_SCRIPT" >>"$STATE_DIR/watchdog-restart.log" 2>&1 &
-  else
-    echo "[$(date -Iseconds)] tmux session $TMUX_SESSION missing; kickstarting launchd"
-    launchctl kickstart -k "gui/$(id -u)/com.claude.whatsapp-agent" 2>&1 || true
-  fi
-  echo "0" > "$STUCK_STREAK_FILE"
-  echo "$now" > "$COOLDOWN_FILE"
-  exit 0
+	kill_orphaned_server
+	if [ -x "$RESTART_SCRIPT" ]; then
+		echo "[$(date -Iseconds)] tmux session $TMUX_SESSION missing; relaunching via $RESTART_SCRIPT"
+		nohup "$RESTART_SCRIPT" >>"$STATE_DIR/watchdog-restart.log" 2>&1 &
+	else
+		echo "[$(date -Iseconds)] tmux session $TMUX_SESSION missing; kickstarting launchd"
+		launchctl kickstart -k "gui/$(id -u)/com.claude.whatsapp-agent" 2>&1 || true
+	fi
+	echo "0" >"$STUCK_STREAK_FILE"
+	echo "$now" >"$COOLDOWN_FILE"
+	exit 0
 fi
 
 # Session is alive but stuck again — bump the streak. Past STUCK_STREAK_LIMIT
@@ -250,13 +250,13 @@ streak=0
 streak=$((streak + 1))
 
 if [ "$streak" -ge "$STUCK_STREAK_LIMIT" ]; then
-  if hard_restart "$reason; stuck through $streak consecutive checks"; then
-    exit 0
-  fi
-  # restart cooldown was active — fall through and nudge as a fallback
+	if hard_restart "$reason; stuck through $streak consecutive checks"; then
+		exit 0
+	fi
+	# restart cooldown was active — fall through and nudge as a fallback
 fi
 
-echo "$streak" > "$STUCK_STREAK_FILE"
+echo "$streak" >"$STUCK_STREAK_FILE"
 
 # Nudge: ESC + catch-up prompt
 tmux send-keys -t "$TMUX_SESSION" Escape
@@ -265,5 +265,5 @@ tmux send-keys -t "$TMUX_SESSION" "Watchdog: call whatsapp unreplied tool and re
 sleep 1
 tmux send-keys -t "$TMUX_SESSION" Enter
 
-echo "$now" > "$COOLDOWN_FILE"
+echo "$now" >"$COOLDOWN_FILE"
 echo "[$(date -Iseconds)] nudged agent (streak $streak/$STUCK_STREAK_LIMIT)"

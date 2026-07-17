@@ -21,10 +21,10 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 source ~/whisper-env/bin/activate
 
-python3 -c "
+python3 -c '
 import sys
 import mlx_whisper
 
-result = mlx_whisper.transcribe(sys.argv[1], path_or_hf_repo=\"mlx-community/whisper-large-v3-turbo\")
-print(result[\"text\"].strip())
-" "$1"
+result = mlx_whisper.transcribe(sys.argv[1], path_or_hf_repo="mlx-community/whisper-large-v3-turbo")
+print(result["text"].strip())
+' "$1"

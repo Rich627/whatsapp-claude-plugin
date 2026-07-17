@@ -79,9 +79,9 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
    file contents. The channel server polls this dir and sends "you're in".
 8. If `dmPolicy` is still `pairing` and there are no remaining pending
    entries, automatically set `dmPolicy` to `allowlist` and write back.
-   Tell the user: *"Locked down — only approved contacts can reach you now.
+   Tell the user: _"Locked down — only approved contacts can reach you now.
    To add more people later, briefly flip back with
-   `/whatsapp-claude-channel:access policy pairing`."*
+   `/whatsapp-claude-channel:access policy pairing`."_
 9. Confirm: who was approved (senderId).
 
 ### `deny <code>`
@@ -108,7 +108,7 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 
 1. Read access.json (create default if missing).
 2. Set `groups[<groupJid>] = { requireMention: hasFlag("--mention"),
-   allowFrom: parsedAllowList }`.
+allowFrom: parsedAllowList }`.
    Default is `requireMention: false` — Claude responds to all messages.
    Pass `--mention` to require @mention before Claude responds.
 3. Write access.json.
@@ -188,6 +188,7 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 
 Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
 `textChunkLimit`, `chunkMode`, `mentionPatterns`. Validate types:
+
 - `ackReaction`: string (emoji) or `""` to disable
 - `replyToMode`: `off` | `first` | `all`
 - `textChunkLimit`: number

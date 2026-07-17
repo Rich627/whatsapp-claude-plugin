@@ -70,12 +70,12 @@ The reference script uses `mlx-community/whisper-large-v3-turbo` — accurate, f
 
 ## Troubleshooting
 
-| Issue | Solution |
-| --- | --- |
-| Pairing code not showing | Run `/whatsapp-claude-channel:configure <phone>` first, then relaunch |
-| 440 disconnect error | Only one connection per auth state allowed. Kill stale processes: `pkill -f "whatsapp.*server"` |
-| Messages not arriving | Known Claude Code client bug ([#37933](https://github.com/anthropics/claude-code/issues/37933)). Server-side is correct, awaiting client fix. |
-| Auth expired | Run `/whatsapp-claude-channel:configure reset-auth` and re-pair |
+| Issue                    | Solution                                                                                                                                      |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pairing code not showing | Run `/whatsapp-claude-channel:configure <phone>` first, then relaunch                                                                         |
+| 440 disconnect error     | Only one connection per auth state allowed. Kill stale processes: `pkill -f "whatsapp.*server"`                                               |
+| Messages not arriving    | Known Claude Code client bug ([#37933](https://github.com/anthropics/claude-code/issues/37933)). Server-side is correct, awaiting client fix. |
+| Auth expired             | Run `/whatsapp-claude-channel:configure reset-auth` and re-pair                                                                               |
 
 ## Documentation
 
