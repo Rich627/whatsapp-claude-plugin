@@ -1146,7 +1146,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           writeFileSync(docPath, text)
           const preview = markdownToWhatsApp(text.slice(0, 200) + (text.length > 200 ? '…' : ''))
           const opts = quotedMsg ? { quoted: quotedMsg } : undefined
-          const previewMentions = mentionsForChunk(preview, mentionJids)
+          // The preview is the only text message in document mode (the document
+          // itself has no caption to carry mentions), so attach every requested
+          // mention here even when its "@id" text landed beyond the 200-char
+          // cut — the notification comes from the mentions array, not the text.
+          const previewMentions = mentionJids.length ? mentionJids : undefined
           const sent = await sock.sendMessage(
             chat_id,
             previewMentions ? { text: preview, mentions: previewMentions } : { text: preview },
