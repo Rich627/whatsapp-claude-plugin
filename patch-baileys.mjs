@@ -5,7 +5,10 @@
  * 1. passive: true → false  (causes device_removed disconnect)
  * 2. delete lidDbMigrated    (unrecognized field, rejected by WA)
  * 3. remove await on noise.finishInit()  (race condition)
- * 4. update WA Web version (old version rejected with 405)
+ *
+ * NOTE: The WA Web version is intentionally NOT patched here anymore.
+ * server.ts calls fetchLatestBaileysVersion() at runtime, so the version
+ * stays current automatically and never goes stale (was causing 405).
  */
 
 import { readFileSync, writeFileSync, existsSync } from 'fs'
@@ -59,21 +62,6 @@ patch(
   'await noise.finishInit()',
   'noise.finishInit()',
   'noise.finishInit race condition'
-)
-
-// Patch 4: update WA Web version (405 fix)
-patch(
-  'Defaults/index.js',
-  '1027934701',
-  '1034074495',
-  'WA Web version (Defaults)'
-)
-
-patch(
-  'Utils/generics.js',
-  '1027934701',
-  '1034074495',
-  'WA Web version (generics)'
 )
 
 console.log('done.')

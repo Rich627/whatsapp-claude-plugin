@@ -19,6 +19,7 @@ import {
 import { z } from 'zod'
 import makeWASocket, {
   useMultiFileAuthState,
+  fetchLatestBaileysVersion,
   DisconnectReason,
   downloadMediaMessage,
   getContentType,
@@ -1683,7 +1684,14 @@ async function connectWhatsApp(): Promise<void> {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
   const needsPairing = !state.creds.registered
 
+  // Fetch the current WhatsApp Web version at runtime so it never goes stale.
+  // fetchLatestBaileysVersion() falls back to the bundled default if the
+  // network fetch fails, so this stays safe offline.
+  const { version, isLatest } = await fetchLatestBaileysVersion()
+  process.stderr.write(`${LOG_PREFIX}: using WA Web version ${version.join('.')} (isLatest: ${isLatest})\n`)
+
   sock = makeWASocket({
+    version,
     auth: state,
     printQRInTerminal: !PHONE_NUMBER, // QR only if no phone number set
     logger: silentLogger,
