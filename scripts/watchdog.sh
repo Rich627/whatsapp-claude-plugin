@@ -261,7 +261,7 @@ echo "$streak" >"$STUCK_STREAK_FILE"
 # Nudge: ESC + catch-up prompt
 tmux send-keys -t "$TMUX_SESSION" Escape
 sleep 1
-tmux send-keys -t "$TMUX_SESSION" "Watchdog: call whatsapp unreplied tool and reply to pending messages, then process any files in ~/.whatsapp-channel/pending/ (execute each prompt, send to chat_id, then rm)." Enter
+tmux send-keys -t "$TMUX_SESSION" "Watchdog: call whatsapp catch_up tool to recover recent two-way context and open tasks, reply to any unreplied messages in-context, then process any files in ~/.whatsapp-channel/pending/ (execute each prompt, send to chat_id, then rm)." Enter
 sleep 1
 tmux send-keys -t "$TMUX_SESSION" Enter
 
