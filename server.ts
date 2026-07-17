@@ -49,6 +49,7 @@ const ENV_FILE = join(STATE_DIR, '.env')
 const GROUPS_DIR = join(STATE_DIR, 'groups')
 const LID_MAP_FILE = join(STATE_DIR, 'lid-map.json')
 const MESSAGE_LOG = join(STATE_DIR, 'messages.jsonl')
+const TASKS_FILE = join(STATE_DIR, 'tasks.md')
 const LOCK_FILE = join(STATE_DIR, '.server.lock')
 
 // Load ~/.whatsapp-channel/.env into process.env. Real env wins.
@@ -778,6 +779,33 @@ function getUnreplied(): MessageLogEntry[] {
   } catch { return [] }
 }
 
+/** Last ~N messages per chat, both directions, chronological — for catch_up.
+ *  The 24h window is enforced by pruneMessageLog, not here. */
+function getRecentByChat(limit = 15): Map<string, { entries: MessageLogEntry[]; unreplied: number }> {
+  const byChat = new Map<string, { entries: MessageLogEntry[]; unreplied: number }>()
+  try {
+    if (!existsSync(MESSAGE_LOG)) return byChat
+    const lines = readFileSync(MESSAGE_LOG, 'utf8').split('\n').filter(Boolean)
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line) as MessageLogEntry
+        let bucket = byChat.get(entry.chat_id)
+        if (!bucket) {
+          bucket = { entries: [], unreplied: 0 }
+          byChat.set(entry.chat_id, bucket)
+        }
+        bucket.entries.push(entry)
+        if ((entry.direction ?? 'in') === 'in' && !entry.replied) bucket.unreplied++
+      } catch {}
+    }
+    for (const bucket of byChat.values()) {
+      bucket.entries.sort((a, b) => a.ts.localeCompare(b.ts))
+      bucket.entries = bucket.entries.slice(-limit)
+    }
+  } catch {}
+  return byChat
+}
+
 /** Prune entries older than 24h to keep the log small */
 function pruneMessageLog(): void {
   try {
@@ -837,7 +865,7 @@ const mcp = new Server(
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions. WhatsApp supports any emoji for reactions (no whitelist restriction).',
       '',
-      'On session start, call the status tool immediately to check connection state and show the pairing code if the device is not yet paired. Then call the unreplied tool to catch up on any messages that arrived before this session or were missed due to a restart.',
+      'On session start, call the status tool immediately to check connection state and show the pairing code if the device is not yet paired. Then call the catch_up tool: it returns the recent two-way conversation for every active chat, unreplied counts, and open tasks from tasks.md. Resume any open tasks and reply to unreplied messages. (The unreplied tool still exists if you only want the plain unreplied list.)',
       '',
       "WhatsApp exposes no history or search API — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -851,6 +879,8 @@ const mcp = new Server(
       'config.md may contain a "## Cron Jobs" section describing recurring tasks for this group. These are automatically loaded by the server as permanent cron jobs (not session-level). When asked about cron jobs, read the group\'s config.md to report them.',
       '',
       'After a meaningful conversation in a group (not a quick one-off), append a brief summary to group_memory_path (memory.md). Format: "## YYYY-MM-DD HH:MM\\n- key point\\n\\n". Read memory.md at the start of each group conversation to recall prior context. Keep entries concise.',
+      '',
+      'When you take on a multi-step task from WhatsApp (anything you cannot finish within the current reply), append a line to ~/.whatsapp-channel/tasks.md: "- [ ] [YYYY-MM-DD HH:MM] [group or contact] task — progress note". Update the progress note as you work and change "- [ ]" to "- [x]" when done. The catch_up tool surfaces unchecked items after a restart so a fresh session can resume mid-flight work. Create the file if it does not exist.',
       '',
       'When a user references something that happened in a different group, do NOT recall it from your session context. Instead say you don\'t have that context and ask them to share the relevant details. Each group\'s config.md defines WHO you are in that group — you may have different names, roles, and expertise across groups.',
       '',
@@ -1017,6 +1047,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: 'Optional: filter to a specific chat. Omit to get all unreplied messages.',
           },
         },
+      },
+    },
+    {
+      name: 'catch_up',
+      description:
+        'Recover conversation context after a restart. For every chat active in the last 24h, returns the recent messages in BOTH directions (sender name for incoming, "You" for replies this agent sent), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
       },
     },
     {
@@ -1240,6 +1279,38 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           return parts.join('\n')
         }).join('\n\n')
         return { content: [{ type: 'text', text: `${unreplied.length} unreplied message(s):\n\n${summary}` }] }
+      }
+
+      case 'catch_up': {
+        const byChat = getRecentByChat()
+        const sections: string[] = []
+        for (const [chatId, { entries, unreplied }] of byChat) {
+          const name =
+            entries.find(e => e.group_name)?.group_name ??
+            entries.find(e => (e.direction ?? 'in') === 'in')?.user ??
+            chatId
+          const header = `=== ${name} (chat_id=${chatId})${unreplied ? ` — ${unreplied} unreplied` : ''} ===`
+          const lines = entries.map(e => {
+            const who = e.direction === 'out' ? 'You' : e.user
+            const extras =
+              (e.image_path ? ` (image: ${e.image_path})` : '') +
+              (e.attachment_kind ? ` (${e.attachment_kind} attachment)` : '')
+            return `[${e.ts}] ${who}: ${e.text}${extras}`
+          })
+          sections.push([header, ...lines].join('\n'))
+        }
+        let text = sections.length ? sections.join('\n\n') : 'No chat activity in the last 24h.'
+        try {
+          if (existsSync(TASKS_FILE)) {
+            const open = readFileSync(TASKS_FILE, 'utf8')
+              .split('\n')
+              .filter(l => l.trimStart().startsWith('- [ ]'))
+            if (open.length) {
+              text += `\n\nOpen tasks (~/.whatsapp-channel/tasks.md):\n${open.join('\n')}`
+            }
+          }
+        } catch {}
+        return { content: [{ type: 'text', text }] }
       }
 
       case 'list_groups': {
