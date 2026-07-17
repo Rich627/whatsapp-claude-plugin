@@ -186,10 +186,17 @@ fi
 
 echo "[$(date -Iseconds)] STUCK: $reason"
 
-# Missing tmux session → relaunch via launchd
+# Missing tmux session → relaunch via the restart script when available
+# (falling back to launchd). Kickstarting a launchd service that was never
+# installed 502s forever and the agent stays down — seen 2026-07-14.
 if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-  echo "[$(date -Iseconds)] tmux session $TMUX_SESSION missing; kickstarting launchd"
-  launchctl kickstart -k "gui/$(id -u)/com.claude.whatsapp-agent" 2>&1 || true
+  if [ -x "$RESTART_SCRIPT" ]; then
+    echo "[$(date -Iseconds)] tmux session $TMUX_SESSION missing; relaunching via $RESTART_SCRIPT"
+    nohup "$RESTART_SCRIPT" >>"$STATE_DIR/watchdog-restart.log" 2>&1 &
+  else
+    echo "[$(date -Iseconds)] tmux session $TMUX_SESSION missing; kickstarting launchd"
+    launchctl kickstart -k "gui/$(id -u)/com.claude.whatsapp-agent" 2>&1 || true
+  fi
   echo "0" > "$STUCK_STREAK_FILE"
   echo "$now" > "$COOLDOWN_FILE"
   exit 0

@@ -19,6 +19,7 @@ import {
 import { z } from 'zod'
 import makeWASocket, {
   useMultiFileAuthState,
+  fetchLatestBaileysVersion,
   DisconnectReason,
   downloadMediaMessage,
   getContentType,
@@ -1679,12 +1680,49 @@ let reconnectAttempt = 0
 let pairingCodeRequested = false
 let lastPairingCode = ''
 
+// ─── WA Web client version ─────────────────────────────────────────────
+// Baileys rc.9 bakes in WA Web version 2.3000.1034074495, which WhatsApp
+// servers started rejecting on 2026-07-14: every login (restored auth AND
+// fresh pairing) died ~4s in with a silent "Connection Terminated" (428)
+// before ever reaching 'open'. Fetch the current version from Baileys master
+// at connect time instead. If the fetch fails it returns the stale baked-in
+// default (isLatest: false), so fall back to a pin that is known to still
+// log in — never the baked default.
+const PINNED_WA_VERSION: [number, number, number] = [2, 3000, 1035194821] // verified working 2026-07-18
+const WA_VERSION_TTL_MS = 6 * 60 * 60 * 1000
+let waVersion: [number, number, number] | null = null
+let waVersionFetchedAt = 0
+
+async function resolveWaWebVersion(): Promise<[number, number, number]> {
+  if (waVersion && Date.now() - waVersionFetchedAt < WA_VERSION_TTL_MS) return waVersion
+  let fetched: [number, number, number] | null = null
+  try {
+    const { version, isLatest } = await fetchLatestBaileysVersion()
+    if (isLatest && Array.isArray(version) && version.length === 3) {
+      fetched = version as [number, number, number]
+    }
+  } catch {}
+  // On fetch failure keep the last good version if we have one, else the pin.
+  // Stamp fetchedAt either way so reconnect loops don't hammer the network.
+  const next = fetched ?? waVersion ?? PINNED_WA_VERSION
+  if (!waVersion || next.join('.') !== waVersion.join('.')) {
+    process.stderr.write(
+      `${LOG_PREFIX}: using WA Web version ${next.join('.')} (${fetched ? 'fetched' : 'pinned fallback'})\n`,
+    )
+  }
+  waVersion = next
+  waVersionFetchedAt = Date.now()
+  return waVersion
+}
+
 async function connectWhatsApp(): Promise<void> {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
   const needsPairing = !state.creds.registered
+  const version = await resolveWaWebVersion()
 
   sock = makeWASocket({
     auth: state,
+    version,
     printQRInTerminal: !PHONE_NUMBER, // QR only if no phone number set
     logger: silentLogger,
     browser: ['Mac OS', 'Chrome', '145.0.0'],
