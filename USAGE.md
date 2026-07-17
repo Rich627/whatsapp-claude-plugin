@@ -126,6 +126,9 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 | `download_attachment` | Download media from a received message. Returns the local file path. |
 | `edit_message` | Edit a message the account previously sent. |
 | `status` | Check connection state and get the pairing code if not yet paired. |
+| `unreplied` | List received messages not yet replied to. |
+| `catch_up` | Post-restart context recovery: recent two-way conversation per chat (last 24h), unreplied counts, and open items from `~/.whatsapp-channel/tasks.md`. |
+| `list_groups` | List every group the account is in, with JID and allowlist state. |
 
 ## Photos & Media
 
