@@ -120,11 +120,58 @@ function status(): void {
   }
 }
 
+function install(): void {
+  if (!existsSync(STATE_DIR) || !statSync(STATE_DIR).isDirectory()) {
+    report(
+      "ERROR",
+      "watchdog-file",
+      `state dir ${STATE_DIR} does not exist — run /whatsapp-claude-channel:setup first (the server creates it on first start)`,
+    );
+    return;
+  }
+
+  // 1. File: copy unless a locally modified copy is already there.
+  if (!existsSync(TARGET)) {
+    copyFileSync(SOURCE, TARGET);
+    chmodSync(TARGET, 0o755);
+    report("PASS", "watchdog-file", `installed ${TARGET} (executable)`);
+  } else if (sameAsRepoCopy()) {
+    chmodSync(TARGET, 0o755);
+    report("PASS", "watchdog-file", `already installed at ${TARGET} — unchanged`);
+  } else {
+    report(
+      "WARN",
+      "watchdog-file",
+      `${TARGET} exists with local modifications — NOT overwriting it (delete it first if you want the plugin's version)`,
+    );
+    if (!isExecutable(TARGET)) {
+      report(
+        "WARN",
+        "watchdog-file",
+        `${TARGET} is not executable — cron runs will fail (fix: chmod +x ${TARGET})`,
+      );
+    }
+  }
+
+  // 2. Crontab: append-only; never touch existing lines.
+  const current = readCrontab();
+  if (watchdogCronLines().length > 0) {
+    report("PASS", "watchdog-cron", "crontab entry already present — unchanged");
+  } else {
+    const base = current === "" || current.endsWith("\n") ? current : current + "\n";
+    writeCrontab(base + CRON_LINE + "\n");
+    report("PASS", "watchdog-cron", `appended: ${CRON_LINE}`);
+  }
+}
+
 function main(): void {
   const cmd = process.argv[2] ?? "status";
   switch (cmd) {
     case "status":
       status();
+      break;
+    case "install":
+      install();
       break;
     default:
       report("ERROR", "usage", `unknown subcommand "${cmd}" (expected status|install|uninstall)`);
