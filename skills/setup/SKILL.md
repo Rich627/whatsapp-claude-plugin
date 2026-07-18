@@ -73,7 +73,31 @@ For option 1: No action needed, just confirm.
 For option 2: Write `{"dmPolicy": "allowlist", "allowFrom": [], "groups": {}, "pending": {}}` to `~/.whatsapp-channel/access.json`.
 For option 3: Ask for the numeric user ID (e.g., `886912345678`). They can find it by having the contact message @userinfobot on Telegram, or by checking WhatsApp linked device logs. Add it to `allowFrom` in access.json.
 
-## Phase 5: Done
+## Phase 5: Auto-Recovery (Watchdog) — Optional
+
+Explain briefly:
+
+> "Optional last step: a watchdog — a cron job that checks every 2 minutes
+> whether the agent is stuck or dead, nudges or restarts it, and alerts you if
+> API auth breaks. Recommended if this agent runs unattended. One caveat: its
+> nudge/restart mechanics act on a tmux session named `whatsapp-agent` — if you
+> run Claude some other way, it can detect problems but not revive the agent.
+> Want it installed?"
+
+**If yes:**
+
+1. Show current state: run `bun "${CLAUDE_PLUGIN_ROOT}/scripts/install-watchdog.ts" status` and summarize the output.
+2. Tell the user exactly what install will do: copy `scripts/watchdog.sh` to `~/.whatsapp-channel/watchdog.sh`, make it executable, and append this line to their crontab (nothing else in the crontab is touched):
+   `*/2 * * * * ~/.whatsapp-channel/watchdog.sh >> ~/.whatsapp-channel/watchdog.log 2>&1`
+3. On confirmation, run `bun "${CLAUDE_PLUGIN_ROOT}/scripts/install-watchdog.ts" install`.
+4. Verify: run the `status` subcommand again and show the user both checks pass. If the script reports a WARN about local modifications, relay it verbatim — it means their existing watchdog.sh was preserved, not replaced.
+5. If the user does not appear to be running inside tmux, remind them: start the agent as `tmux new-session -s whatsapp-agent claude` for the watchdog's nudge/restart to work.
+
+**If no:** one sentence — they can re-run `/whatsapp-claude-channel:setup` anytime to install it. If they later want failure notifications on their phone, the notify-hook option is documented in the header of `watchdog.sh`.
+
+To undo later: `bun "${CLAUDE_PLUGIN_ROOT}/scripts/install-watchdog.ts" uninstall` removes the cron entry.
+
+## Phase 6: Done
 
 Summarize:
 
