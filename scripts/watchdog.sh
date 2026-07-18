@@ -172,7 +172,9 @@ fi
 # ── Liveness check: if tmux pane shows Claude actively working, skip nudging ──
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
 	pane=$(tmux capture-pane -t "$TMUX_SESSION" -p 2>/dev/null | tail -20)
-	if echo "$pane" | grep -qE "(Sautéing|Embellishing|Crunching|Boogieing|Thinking|Noodling|thinking with|tokens|esc to interrupt|\(ctrl\+)"; then
+	# NOTE: no bare "tokens" here — the idle prompt's "/clear to save NNNk tokens"
+	# hint matches it and blinds the watchdog (seen 2026-07-18: 11h of silence).
+	if echo "$pane" | grep -qE "(Sautéing|Embellishing|Crunching|Boogieing|Thinking|Noodling|thinking with|esc to interrupt|\(ctrl\+)"; then
 		echo "0" >"$STUCK_STREAK_FILE"
 		exit 0
 	fi
