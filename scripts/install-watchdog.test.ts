@@ -182,3 +182,23 @@ describe("install", () => {
     chmodSync(dir, 0o755);
   });
 });
+
+describe("uninstall", () => {
+  test("removes only the watchdog line; file and other lines stay", () => {
+    const dir = freshStateDir();
+    const store = freshCronStore();
+    writeFileSync(store, "0 9 * * * /usr/local/bin/backup.sh\n");
+    runScript(dir, store, "install");
+    const out = runScript(dir, store, "uninstall");
+    const cron = readFileSync(store, "utf8");
+    expect(cron).toContain("backup.sh");
+    expect(cron).not.toContain("watchdog.sh");
+    expect(existsSync(join(dir, "watchdog.sh"))).toBe(true);
+    expect(out).toContain("[PASS] watchdog-cron: removed");
+  });
+
+  test("nothing to remove → INFO", () => {
+    const out = runScript(freshStateDir(), freshCronStore(), "uninstall");
+    expect(out).toContain("[INFO] watchdog-cron: no crontab entry to remove");
+  });
+});
