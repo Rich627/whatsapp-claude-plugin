@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -97,5 +98,74 @@ describe("status", () => {
   test("status is the default subcommand", () => {
     const out = runScript(freshStateDir(), freshCronStore());
     expect(out).toContain("[INFO] watchdog-file: not installed");
+  });
+});
+
+describe("install", () => {
+  test("fresh install: file copied executable, cron line appended", () => {
+    const dir = freshStateDir();
+    const store = freshCronStore();
+    const out = runScript(dir, store, "install");
+    const target = join(dir, "watchdog.sh");
+    expect(readFileSync(target, "utf8")).toBe(
+      readFileSync(REPO_WATCHDOG, "utf8"),
+    );
+    // executable bit set
+    expect(() =>
+      execFileSync("test", ["-x", target]),
+    ).not.toThrow();
+    const cron = readFileSync(store, "utf8");
+    expect(cron).toContain(`*/2 * * * * ${target}`);
+    expect(cron).toContain("watchdog.log");
+    expect(out).toContain("[PASS] watchdog-cron:");
+  });
+
+  test("re-run is idempotent: no duplicate cron line, no rewrite", () => {
+    const dir = freshStateDir();
+    const store = freshCronStore();
+    runScript(dir, store, "install");
+    const out = runScript(dir, store, "install");
+    const cron = readFileSync(store, "utf8");
+    const hits = cron
+      .split("\n")
+      .filter((l) => l.includes(join(dir, "watchdog.sh"))).length;
+    expect(hits).toBe(1);
+    expect(out).toContain("already");
+  });
+
+  test("customized watchdog.sh is NOT overwritten (WARN), cron still handled", () => {
+    const dir = freshStateDir();
+    const store = freshCronStore();
+    const custom = "#!/bin/bash\n# my custom fork\n";
+    writeFileSync(join(dir, "watchdog.sh"), custom);
+    chmodSync(join(dir, "watchdog.sh"), 0o755);
+    const out = runScript(dir, store, "install");
+    expect(readFileSync(join(dir, "watchdog.sh"), "utf8")).toBe(custom);
+    expect(out).toContain("[WARN] watchdog-file:");
+    expect(readFileSync(store, "utf8")).toContain(
+      `*/2 * * * * ${join(dir, "watchdog.sh")}`,
+    );
+  });
+
+  test("existing unrelated crontab lines preserved byte-for-byte", () => {
+    const dir = freshStateDir();
+    const store = freshCronStore();
+    const existing = "0 9 * * * /usr/local/bin/backup.sh # nightly\n*/5 * * * * echo hi\n";
+    writeFileSync(store, existing);
+    runScript(dir, store, "install");
+    const cron = readFileSync(store, "utf8");
+    expect(cron.startsWith(existing)).toBe(true);
+    expect(cron).toContain(`*/2 * * * * ${join(dir, "watchdog.sh")}`);
+  });
+
+  test("missing state dir → ERROR, nothing done", () => {
+    const store = freshCronStore();
+    const out = runScript(
+      join(tmpdir(), "definitely-absent-state-dir-xyz"),
+      store,
+      "install",
+    );
+    expect(out).toContain("[ERROR] watchdog-file:");
+    expect(existsSync(store)).toBe(false);
   });
 });
