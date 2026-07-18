@@ -168,4 +168,17 @@ describe("install", () => {
     expect(out).toContain("[ERROR] watchdog-file:");
     expect(existsSync(store)).toBe(false);
   });
+
+  test("read-only state dir → ERROR, crontab never touched", () => {
+    const dir = freshStateDir();
+    const store = freshCronStore();
+    // Make state dir read-only so copy/chmod will fail
+    chmodSync(dir, 0o555);
+    const out = runScript(dir, store, "install");
+    expect(out).toContain("[ERROR] watchdog-file:");
+    // Verify crontab was never written to (store file does not exist)
+    expect(existsSync(store)).toBe(false);
+    // Restore permissions for cleanup
+    chmodSync(dir, 0o755);
+  });
 });
