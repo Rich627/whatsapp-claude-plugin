@@ -56,7 +56,8 @@ function readCrontab(): string {
 }
 
 function writeCrontab(content: string): void {
-  const body = content.endsWith("\n") || content === "" ? content : content + "\n";
+  const body =
+    content.endsWith("\n") || content === "" ? content : content + "\n";
   execFileSync("crontab", ["-"], { input: body });
 }
 
@@ -116,7 +117,11 @@ function status(): void {
       "no crontab entry — the watchdog never runs without one",
     );
   } else {
-    report("PASS", "watchdog-cron", `crontab entry present: ${lines[0].trim()}`);
+    report(
+      "PASS",
+      "watchdog-cron",
+      `crontab entry present: ${lines[0].trim()}`,
+    );
   }
 }
 
@@ -138,7 +143,11 @@ function install(): void {
       report("PASS", "watchdog-file", `installed ${TARGET} (executable)`);
     } else if (sameAsRepoCopy()) {
       chmodSync(TARGET, 0o755);
-      report("PASS", "watchdog-file", `already installed at ${TARGET} — unchanged`);
+      report(
+        "PASS",
+        "watchdog-file",
+        `already installed at ${TARGET} — unchanged`,
+      );
     } else {
       report(
         "WARN",
@@ -155,11 +164,7 @@ function install(): void {
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    report(
-      "ERROR",
-      "watchdog-file",
-      `failed to install ${TARGET}: ${message}`,
-    );
+    report("ERROR", "watchdog-file", `failed to install ${TARGET}: ${message}`);
     return;
   }
 
@@ -171,19 +176,20 @@ function install(): void {
       .some((line) => cronReferencesWatchdog(line));
 
     if (hasWatchdogLine) {
-      report("PASS", "watchdog-cron", "crontab entry already present — unchanged");
+      report(
+        "PASS",
+        "watchdog-cron",
+        "crontab entry already present — unchanged",
+      );
     } else {
-      const base = current === "" || current.endsWith("\n") ? current : current + "\n";
+      const base =
+        current === "" || current.endsWith("\n") ? current : current + "\n";
       writeCrontab(base + CRON_LINE + "\n");
       report("PASS", "watchdog-cron", `appended: ${CRON_LINE}`);
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    report(
-      "ERROR",
-      "watchdog-cron",
-      `failed to update crontab: ${message}`,
-    );
+    report("ERROR", "watchdog-cron", `failed to update crontab: ${message}`);
   }
 }
 
@@ -206,11 +212,7 @@ function uninstall(): void {
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    report(
-      "ERROR",
-      "watchdog-cron",
-      `failed to update crontab: ${message}`,
-    );
+    report("ERROR", "watchdog-cron", `failed to update crontab: ${message}`);
   }
 }
 
@@ -227,7 +229,11 @@ function main(): void {
       uninstall();
       break;
     default:
-      report("ERROR", "usage", `unknown subcommand "${cmd}" (expected status|install|uninstall)`);
+      report(
+        "ERROR",
+        "usage",
+        `unknown subcommand "${cmd}" (expected status|install|uninstall)`,
+      );
   }
 }
 

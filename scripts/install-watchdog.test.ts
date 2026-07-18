@@ -71,7 +71,10 @@ describe("status", () => {
     const target = join(dir, "watchdog.sh");
     writeFileSync(target, readFileSync(REPO_WATCHDOG));
     chmodSync(target, 0o755);
-    writeFileSync(store, `*/2 * * * * ${target} >> ${join(dir, "watchdog.log")} 2>&1\n`);
+    writeFileSync(
+      store,
+      `*/2 * * * * ${target} >> ${join(dir, "watchdog.log")} 2>&1\n`,
+    );
     const out = runScript(dir, store, "status");
     expect(out).toContain("[PASS] watchdog-file:");
     expect(out).toContain("[PASS] watchdog-cron:");
@@ -92,7 +95,9 @@ describe("status", () => {
     writeFileSync(join(dir, "watchdog.sh"), "#!/bin/bash\n# my custom fork\n");
     chmodSync(join(dir, "watchdog.sh"), 0o755);
     const out = runScript(dir, freshCronStore(), "status");
-    expect(out).toContain("[INFO] watchdog-file: installed with local modifications");
+    expect(out).toContain(
+      "[INFO] watchdog-file: installed with local modifications",
+    );
   });
 
   test("status is the default subcommand", () => {
@@ -111,9 +116,7 @@ describe("install", () => {
       readFileSync(REPO_WATCHDOG, "utf8"),
     );
     // executable bit set
-    expect(() =>
-      execFileSync("test", ["-x", target]),
-    ).not.toThrow();
+    expect(() => execFileSync("test", ["-x", target])).not.toThrow();
     const cron = readFileSync(store, "utf8");
     expect(cron).toContain(`*/2 * * * * ${target}`);
     expect(cron).toContain("watchdog.log");
@@ -150,7 +153,8 @@ describe("install", () => {
   test("existing unrelated crontab lines preserved byte-for-byte", () => {
     const dir = freshStateDir();
     const store = freshCronStore();
-    const existing = "0 9 * * * /usr/local/bin/backup.sh # nightly\n*/5 * * * * echo hi\n";
+    const existing =
+      "0 9 * * * /usr/local/bin/backup.sh # nightly\n*/5 * * * * echo hi\n";
     writeFileSync(store, existing);
     runScript(dir, store, "install");
     const cron = readFileSync(store, "utf8");

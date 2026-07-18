@@ -23,10 +23,12 @@
 ### Task 1: `install-watchdog.ts` skeleton + `status` subcommand
 
 **Files:**
+
 - Create: `scripts/install-watchdog.ts`
 - Test: `scripts/install-watchdog.test.ts`
 
 **Interfaces:**
+
 - Produces: CLI `bun scripts/install-watchdog.ts [status|install|uninstall]` (default `status`); env `WHATSAPP_STATE_DIR`; report lines `[SEV] watchdog-file: …` / `[SEV] watchdog-cron: …`.
 - Produces (for Tasks 2–3, module-internal): `STATE_DIR`, `SOURCE`, `TARGET`, `LOG_FILE`, `report()`, `readCrontab()`, `writeCrontab()`, `cronReferencesWatchdog()`, `CRON_LINE`.
 - Test harness produces (for Tasks 2–3): `runScript(stateDir, cronStore, args)`, `freshStateDir()`, `stubDir` with fake `crontab`.
@@ -107,7 +109,10 @@ describe("status", () => {
     const target = join(dir, "watchdog.sh");
     writeFileSync(target, readFileSync(REPO_WATCHDOG));
     chmodSync(target, 0o755);
-    writeFileSync(store, `*/2 * * * * ${target} >> ${join(dir, "watchdog.log")} 2>&1\n`);
+    writeFileSync(
+      store,
+      `*/2 * * * * ${target} >> ${join(dir, "watchdog.log")} 2>&1\n`,
+    );
     const out = runScript(dir, store, "status");
     expect(out).toContain("[PASS] watchdog-file:");
     expect(out).toContain("[PASS] watchdog-cron:");
@@ -128,7 +133,9 @@ describe("status", () => {
     writeFileSync(join(dir, "watchdog.sh"), "#!/bin/bash\n# my custom fork\n");
     chmodSync(join(dir, "watchdog.sh"), 0o755);
     const out = runScript(dir, freshCronStore(), "status");
-    expect(out).toContain("[INFO] watchdog-file: installed with local modifications");
+    expect(out).toContain(
+      "[INFO] watchdog-file: installed with local modifications",
+    );
   });
 
   test("status is the default subcommand", () => {
@@ -204,7 +211,8 @@ function readCrontab(): string {
 }
 
 function writeCrontab(content: string): void {
-  const body = content.endsWith("\n") || content === "" ? content : content + "\n";
+  const body =
+    content.endsWith("\n") || content === "" ? content : content + "\n";
   execFileSync("crontab", ["-"], { input: body });
 }
 
@@ -264,7 +272,11 @@ function status(): void {
       "no crontab entry — the watchdog never runs without one",
     );
   } else {
-    report("PASS", "watchdog-cron", `crontab entry present: ${lines[0].trim()}`);
+    report(
+      "PASS",
+      "watchdog-cron",
+      `crontab entry present: ${lines[0].trim()}`,
+    );
   }
 }
 
@@ -275,7 +287,11 @@ function main(): void {
       status();
       break;
     default:
-      report("ERROR", "usage", `unknown subcommand "${cmd}" (expected status|install|uninstall)`);
+      report(
+        "ERROR",
+        "usage",
+        `unknown subcommand "${cmd}" (expected status|install|uninstall)`,
+      );
   }
 }
 
@@ -302,10 +318,12 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ### Task 2: `install` subcommand
 
 **Files:**
+
 - Modify: `scripts/install-watchdog.ts` (add `install()`, wire into `main()`)
 - Test: `scripts/install-watchdog.test.ts` (append describe block)
 
 **Interfaces:**
+
 - Consumes: Task 1's helpers (`report`, `readCrontab`, `writeCrontab`, `cronReferencesWatchdog`, `watchdogCronLines`, `sameAsRepoCopy`, `isExecutable`, `SOURCE`, `TARGET`, `CRON_LINE`, `STATE_DIR`) and test harness (`runScript`, `freshStateDir`, `freshCronStore`, `REPO_WATCHDOG`).
 - Produces: `bun scripts/install-watchdog.ts install` — progress lines under check-ids `watchdog-file`, `watchdog-cron` (the setup skill re-runs `status` afterward for verification; install itself prints only what it did).
 
@@ -322,9 +340,7 @@ describe("install", () => {
       readFileSync(REPO_WATCHDOG, "utf8"),
     );
     // executable bit set
-    expect(() =>
-      execFileSync("test", ["-x", target]),
-    ).not.toThrow();
+    expect(() => execFileSync("test", ["-x", target])).not.toThrow();
     const cron = readFileSync(store, "utf8");
     expect(cron).toContain(`*/2 * * * * ${target}`);
     expect(cron).toContain("watchdog.log");
@@ -361,7 +377,8 @@ describe("install", () => {
   test("existing unrelated crontab lines preserved byte-for-byte", () => {
     const dir = freshStateDir();
     const store = freshCronStore();
-    const existing = "0 9 * * * /usr/local/bin/backup.sh # nightly\n*/5 * * * * echo hi\n";
+    const existing =
+      "0 9 * * * /usr/local/bin/backup.sh # nightly\n*/5 * * * * echo hi\n";
     writeFileSync(store, existing);
     runScript(dir, store, "install");
     const cron = readFileSync(store, "utf8");
@@ -411,7 +428,11 @@ function install(): void {
     report("PASS", "watchdog-file", `installed ${TARGET} (executable)`);
   } else if (sameAsRepoCopy()) {
     chmodSync(TARGET, 0o755);
-    report("PASS", "watchdog-file", `already installed at ${TARGET} — unchanged`);
+    report(
+      "PASS",
+      "watchdog-file",
+      `already installed at ${TARGET} — unchanged`,
+    );
   } else {
     report(
       "WARN",
@@ -430,9 +451,14 @@ function install(): void {
   // 2. Crontab: append-only; never touch existing lines.
   const current = readCrontab();
   if (watchdogCronLines().length > 0) {
-    report("PASS", "watchdog-cron", "crontab entry already present — unchanged");
+    report(
+      "PASS",
+      "watchdog-cron",
+      "crontab entry already present — unchanged",
+    );
   } else {
-    const base = current === "" || current.endsWith("\n") ? current : current + "\n";
+    const base =
+      current === "" || current.endsWith("\n") ? current : current + "\n";
     writeCrontab(base + CRON_LINE + "\n");
     report("PASS", "watchdog-cron", `appended: ${CRON_LINE}`);
   }
@@ -459,10 +485,12 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ### Task 3: `uninstall` subcommand
 
 **Files:**
+
 - Modify: `scripts/install-watchdog.ts` (add `uninstall()`, wire into `main()`)
 - Test: `scripts/install-watchdog.test.ts` (append describe block)
 
 **Interfaces:**
+
 - Consumes: Task 1's helpers and test harness.
 - Produces: `bun scripts/install-watchdog.ts uninstall` — removes only watchdog cron line(s), file untouched.
 
@@ -539,10 +567,12 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ### Task 4: Doctor linkage
 
 **Files:**
+
 - Modify: `scripts/doctor.ts:443-451` (the `checkWatchdog` not-installed branch)
 - Test: `scripts/doctor.test.ts` (add assertion in the `optional features` describe)
 
 **Interfaces:**
+
 - Consumes: nothing new. `server.ts` untouched.
 - Produces: doctor's watchdog-absent INFO now names the setup skill.
 
@@ -551,12 +581,12 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 Append inside `describe("optional features", …)`:
 
 ```typescript
-  test("watchdog absent → message points at setup for install", () => {
-    const out = runDoctor(freshStateDir());
-    expect(out).toContain(
-      "run /whatsapp-claude-channel:setup to install auto-recovery",
-    );
-  });
+test("watchdog absent → message points at setup for install", () => {
+  const out = runDoctor(freshStateDir());
+  expect(out).toContain(
+    "run /whatsapp-claude-channel:setup to install auto-recovery",
+  );
+});
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -598,9 +628,11 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ### Task 5: Setup skill Phase 5
 
 **Files:**
+
 - Modify: `skills/setup/SKILL.md` (insert new Phase 5, renumber old Phase 5 → Phase 6)
 
 **Interfaces:**
+
 - Consumes: `bun "${CLAUDE_PLUGIN_ROOT}/scripts/install-watchdog.ts" status|install` from Tasks 1–2.
 
 - [ ] **Step 1: Edit SKILL.md**
@@ -657,6 +689,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ### Task 6: Version bump + release verification
 
 **Files:**
+
 - Modify: `.claude-plugin/plugin.json` (`"version": "0.13.2"` → `"0.14.0"`)
 - Modify: `.claude-plugin/marketplace.json` (`plugins[0].version` `"0.13.2"` → `"0.14.0"`; leave top-level `"version": "1.5.0"` alone)
 
