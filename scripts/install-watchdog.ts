@@ -131,36 +131,59 @@ function install(): void {
   }
 
   // 1. File: copy unless a locally modified copy is already there.
-  if (!existsSync(TARGET)) {
-    copyFileSync(SOURCE, TARGET);
-    chmodSync(TARGET, 0o755);
-    report("PASS", "watchdog-file", `installed ${TARGET} (executable)`);
-  } else if (sameAsRepoCopy()) {
-    chmodSync(TARGET, 0o755);
-    report("PASS", "watchdog-file", `already installed at ${TARGET} — unchanged`);
-  } else {
-    report(
-      "WARN",
-      "watchdog-file",
-      `${TARGET} exists with local modifications — NOT overwriting it (delete it first if you want the plugin's version)`,
-    );
-    if (!isExecutable(TARGET)) {
+  try {
+    if (!existsSync(TARGET)) {
+      copyFileSync(SOURCE, TARGET);
+      chmodSync(TARGET, 0o755);
+      report("PASS", "watchdog-file", `installed ${TARGET} (executable)`);
+    } else if (sameAsRepoCopy()) {
+      chmodSync(TARGET, 0o755);
+      report("PASS", "watchdog-file", `already installed at ${TARGET} — unchanged`);
+    } else {
       report(
         "WARN",
         "watchdog-file",
-        `${TARGET} is not executable — cron runs will fail (fix: chmod +x ${TARGET})`,
+        `${TARGET} exists with local modifications — NOT overwriting it (delete it first if you want the plugin's version)`,
       );
+      if (!isExecutable(TARGET)) {
+        report(
+          "WARN",
+          "watchdog-file",
+          `${TARGET} is not executable — cron runs will fail (fix: chmod +x ${TARGET})`,
+        );
+      }
     }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    report(
+      "ERROR",
+      "watchdog-file",
+      `failed to install ${TARGET}: ${message}`,
+    );
+    return;
   }
 
   // 2. Crontab: append-only; never touch existing lines.
-  const current = readCrontab();
-  if (watchdogCronLines().length > 0) {
-    report("PASS", "watchdog-cron", "crontab entry already present — unchanged");
-  } else {
-    const base = current === "" || current.endsWith("\n") ? current : current + "\n";
-    writeCrontab(base + CRON_LINE + "\n");
-    report("PASS", "watchdog-cron", `appended: ${CRON_LINE}`);
+  try {
+    const current = readCrontab();
+    const hasWatchdogLine = current
+      .split("\n")
+      .some((line) => cronReferencesWatchdog(line));
+
+    if (hasWatchdogLine) {
+      report("PASS", "watchdog-cron", "crontab entry already present — unchanged");
+    } else {
+      const base = current === "" || current.endsWith("\n") ? current : current + "\n";
+      writeCrontab(base + CRON_LINE + "\n");
+      report("PASS", "watchdog-cron", `appended: ${CRON_LINE}`);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    report(
+      "ERROR",
+      "watchdog-cron",
+      `failed to update crontab: ${message}`,
+    );
   }
 }
 
