@@ -204,4 +204,10 @@ describe("optional features", () => {
     expect(out).toMatch(/\[INFO\] (transcription|watchdog)/);
     expect(out).toMatch(/SUMMARY: 2 error/);
   });
+  test("watchdog absent → message points at setup for install", () => {
+    const out = runDoctor(freshStateDir());
+    expect(out).toContain(
+      "run /whatsapp-claude-channel:setup to install auto-recovery",
+    );
+  });
 });

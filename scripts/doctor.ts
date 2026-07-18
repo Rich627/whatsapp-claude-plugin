@@ -445,7 +445,7 @@ function checkWatchdog(): void {
     report(
       "INFO",
       "watchdog",
-      "watchdog not installed (optional) — scripts/watchdog.sh in the plugin repo enables auto-recovery",
+      "watchdog not installed (optional) — run /whatsapp-claude-channel:setup to install auto-recovery",
     );
     return;
   }
