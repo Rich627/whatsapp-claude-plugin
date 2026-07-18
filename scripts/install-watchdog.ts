@@ -187,6 +187,33 @@ function install(): void {
   }
 }
 
+function uninstall(): void {
+  if (watchdogCronLines().length === 0) {
+    report("INFO", "watchdog-cron", "no crontab entry to remove");
+    return;
+  }
+  const current = readCrontab();
+  const kept = current
+    .split("\n")
+    .filter((l) => !cronReferencesWatchdog(l))
+    .join("\n");
+  try {
+    writeCrontab(kept);
+    report(
+      "PASS",
+      "watchdog-cron",
+      `removed the watchdog crontab entry (${TARGET} itself was left in place — inert without cron)`,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    report(
+      "ERROR",
+      "watchdog-cron",
+      `failed to update crontab: ${message}`,
+    );
+  }
+}
+
 function main(): void {
   const cmd = process.argv[2] ?? "status";
   switch (cmd) {
@@ -195,6 +222,9 @@ function main(): void {
       break;
     case "install":
       install();
+      break;
+    case "uninstall":
+      uninstall();
       break;
     default:
       report("ERROR", "usage", `unknown subcommand "${cmd}" (expected status|install|uninstall)`);
