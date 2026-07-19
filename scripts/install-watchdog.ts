@@ -194,15 +194,12 @@ function install(): void {
 }
 
 function uninstall(): void {
-  if (watchdogCronLines().length === 0) {
+  const lines = readCrontab().split("\n");
+  if (!lines.some(cronReferencesWatchdog)) {
     report("INFO", "watchdog-cron", "no crontab entry to remove");
     return;
   }
-  const current = readCrontab();
-  const kept = current
-    .split("\n")
-    .filter((l) => !cronReferencesWatchdog(l))
-    .join("\n");
+  const kept = lines.filter((l) => !cronReferencesWatchdog(l)).join("\n");
   try {
     writeCrontab(kept);
     report(
