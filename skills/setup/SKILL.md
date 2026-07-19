@@ -32,7 +32,11 @@ Check the connection status by calling the `whatsapp_status` tool.
 
 **If status is `disconnected`:**
 
-- Tell the user the server needs to start first. They should restart Claude Code with the WhatsApp channel enabled.
+- Tell the user the server needs to start first. They should restart Claude Code with the WhatsApp channel enabled:
+  ```sh
+  claude --dangerously-load-development-channels plugin:whatsapp-claude-channel@whatsapp-claude-plugin
+  ```
+  Explain that this flag is required every launch — it registers the plugin as a channel so incoming messages wake the session in real time. Without it, tools load but messages sit unanswered until something prompts Claude to check.
 
 ## Phase 3: Phone Number (Optional)
 

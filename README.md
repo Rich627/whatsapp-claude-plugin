@@ -18,8 +18,10 @@ The plugin connects to WhatsApp as a **linked device** (the same protocol as Wha
 ```sh
 claude plugin marketplace add Rich627/whatsapp-claude-plugin
 claude plugin install whatsapp-claude-channel@whatsapp-claude-plugin
-claude
+claude --dangerously-load-development-channels plugin:whatsapp-claude-channel@whatsapp-claude-plugin
 ```
+
+The `--dangerously-load-development-channels` flag matters: it registers the plugin as a **channel**, so an inbound WhatsApp message wakes your session immediately. Without it the tools still load, but nothing wakes the session when messages arrive — they sit unanswered until you (or a [watchdog](./scripts/watchdog.sh)) prompt Claude to check. `--channels` does not accept this plugin yet (it is not on the research-preview allowlist), so the development flag is currently the only way.
 
 Inside the session, set your number and pair:
 
@@ -71,12 +73,13 @@ The reference script uses `mlx-community/whisper-large-v3-turbo` — accurate, f
 
 ## Troubleshooting
 
-| Issue                    | Solution                                                                                                                                      |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pairing code not showing | Run `/whatsapp-claude-channel:configure <phone>` first, then relaunch                                                                         |
-| 440 disconnect error     | Only one connection per auth state allowed. Kill stale processes: `pkill -f "whatsapp.*server"`                                               |
-| Messages not arriving    | Known Claude Code client bug ([#37933](https://github.com/anthropics/claude-code/issues/37933)). Server-side is correct, awaiting client fix. |
-| Auth expired             | Run `/whatsapp-claude-channel:configure reset-auth` and re-pair                                                                               |
+| Issue                              | Solution                                                                                                                                                                                                                                                        |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pairing code not showing           | Run `/whatsapp-claude-channel:configure <phone>` first, then relaunch                                                                                                                                                                                           |
+| 440 disconnect error               | Only one connection per auth state allowed. Kill stale processes: `pkill -f "whatsapp.*server"`                                                                                                                                                                 |
+| Session not waking on new messages | Most common cause: launched without `--dangerously-load-development-channels plugin:whatsapp-claude-channel@whatsapp-claude-plugin`. Tools work but inbound pushes are dropped (`Channel notifications skipped` in the MCP debug log) — relaunch with the flag. |
+| Messages not arriving              | Known Claude Code client bug ([#37933](https://github.com/anthropics/claude-code/issues/37933)). Server-side is correct, awaiting client fix.                                                                                                                   |
+| Auth expired                       | Run `/whatsapp-claude-channel:configure reset-auth` and re-pair                                                                                                                                                                                                 |
 
 ## Documentation
 
