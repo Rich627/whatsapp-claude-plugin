@@ -46,6 +46,8 @@ AUTH_ALERT_FILE="$STATE_DIR/.watchdog-auth-alert"
 NOTIFY_HOOK="$STATE_DIR/notify-hook.sh"
 STUCK_STREAK_FILE="$STATE_DIR/.watchdog-stuck-streak"
 RESTART_COOLDOWN_FILE="$STATE_DIR/.watchdog-restart-cooldown"
+NET_FAIL_FILE="$STATE_DIR/.watchdog-net-fail-streak"
+NET_ALERT_FILE="$STATE_DIR/.watchdog-net-alert"
 # Optional: a full agent restart script (graceful /exit + relaunch), e.g. one
 # that ends with `tmux new-session -d -s whatsapp-agent ... claude ...`.
 # If absent, hard restarts fall back to a launchd kickstart.
@@ -62,7 +64,10 @@ STUCK_STREAK_LIMIT=3          # after this many consecutive stuck-and-nudged che
 # a nudge only re-asks the agent to call its tools, which
 # can't fix a dead WhatsApp connection the agent itself
 # can't reconnect (see docs/governance/A-diagnosis.md #2)
-RESTART_COOLDOWN_SECS=1800 # don't hard-restart more than once per 30 min
+RESTART_COOLDOWN_SECS=1800               # don't hard-restart more than once per 30 min
+NET_PROBE_URL="https://web.whatsapp.com" # cheap outbound reachability target
+NET_FAIL_LIMIT=3                         # consecutive failed probes before alerting
+NET_ALERT_COOLDOWN_SECS=1800             # don't re-alert an outage more than once per 30 min
 
 now=$(date +%s)
 
@@ -122,6 +127,65 @@ hard_restart() {
 	echo "$now" >"$COOLDOWN_FILE"
 	return 0
 }
+
+# ── Outbound-connectivity probe ──
+# A dead uplink looks exactly like a quiet night to every check below: WhatsApp
+# can't deliver inbound messages, so nothing goes unreplied and pending/ stays
+# empty while the tmux session and the agent both look perfectly healthy. On
+# 2026-08-17 that blind spot cost 1h20m of silent downtime — macOS had dropped
+# its primary IPv4 service, so every socket that didn't explicitly bind an
+# interface got NetworkUnreachable.
+# Alert only, never restart: relaunching the agent cannot bring back a route.
+if curl -fsS --max-time 5 -o /dev/null "$NET_PROBE_URL" 2>/dev/null; then
+	# Report the outage on the way out. The alert below fires while the network
+	# is down, which is exactly when the notify hook can't reach anywhere — so
+	# this recovery notice is often the only one that actually gets delivered.
+	if [ -f "$NET_ALERT_FILE" ]; then
+		down_checks=0
+		[ -f "$NET_FAIL_FILE" ] && down_checks=$(cat "$NET_FAIL_FILE" 2>/dev/null || echo 0)
+		msg="WhatsApp agent on $(hostname -s) is back online — outbound connectivity was down for $down_checks consecutive watchdog checks."
+		echo "[$(date -Iseconds)] NET-RECOVERED: $msg"
+		if [ -x "$NOTIFY_HOOK" ]; then
+			"$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
+		elif command -v osascript >/dev/null 2>&1; then
+			osascript -e "display notification \"$msg\" with title \"WhatsApp agent back online\" sound name \"Funk\"" 2>/dev/null || true
+		fi
+		rm -f "$NET_ALERT_FILE"
+	fi
+	echo "0" >"$NET_FAIL_FILE"
+else
+	net_streak=0
+	[ -f "$NET_FAIL_FILE" ] && net_streak=$(cat "$NET_FAIL_FILE" 2>/dev/null || echo 0)
+	case "$net_streak" in '' | *[!0-9]*) net_streak=0 ;; esac
+	net_streak=$((net_streak + 1))
+	echo "$net_streak" >"$NET_FAIL_FILE"
+	echo "[$(date -Iseconds)] NET-DOWN: $NET_PROBE_URL unreachable (streak $net_streak/$NET_FAIL_LIMIT)"
+
+	if [ "$net_streak" -ge "$NET_FAIL_LIMIT" ]; then
+		last_alert=0
+		[ -f "$NET_ALERT_FILE" ] && last_alert=$(cat "$NET_ALERT_FILE" 2>/dev/null || echo 0)
+		if [ $((now - last_alert)) -ge $NET_ALERT_COOLDOWN_SECS ]; then
+			detail=""
+			if command -v route >/dev/null 2>&1 && ! route -n get 8.8.8.8 >/dev/null 2>&1; then
+				detail=" No default route — the host has no primary IPv4 service."
+			elif command -v ip >/dev/null 2>&1 && ! ip route get 8.8.8.8 >/dev/null 2>&1; then
+				detail=" No default route."
+			fi
+			msg="WhatsApp agent on $(hostname -s) has no outbound connectivity ($NET_PROBE_URL unreachable for $net_streak consecutive checks).$detail Nothing will send or arrive until the network is back — the agent is left running."
+			echo "[$(date -Iseconds)] NET-DOWN-ALERT: $msg"
+			if [ -x "$NOTIFY_HOOK" ]; then
+				"$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
+			elif command -v osascript >/dev/null 2>&1; then
+				osascript -e "display notification \"$msg\" with title \"WhatsApp agent offline\" sound name \"Funk\"" 2>/dev/null || true
+			fi
+			echo "$now" >"$NET_ALERT_FILE"
+		fi
+	fi
+
+	# Every check below reads a signal a dead network cannot produce, so the
+	# stuck-streak would march into a hard restart that fixes nothing. Stop here.
+	exit 0
+fi
 
 # ── Auth-failure detection ──
 # If the agent's tmux pane shows 401 / "Please run /login", nudging is
