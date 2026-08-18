@@ -102,41 +102,106 @@ mkdirSync(INBOX_DIR, { recursive: true });
 // making every new instance refuse to start forever. Matching the start time
 // tells a genuine duplicate apart from a reused PID.
 
-// OS start time of a process ("Sat May 16 07:43:46 2026"), or null if no
-// such process. lstart is unique enough to distinguish a reused PID.
-function processStartTime(pid: number): string | null {
+// Command that prints a per-incarnation start time for a PID, or nothing when
+// there is no such process. Windows has no `ps -o lstart`, so ask PowerShell —
+// via CIM, which unlike Get-Process can read the start time of a process the
+// caller does not own (an elevated session's server).
+function startTimeProbe(pid: number): [string, string[]] {
+  return process.platform === "win32"
+    ? [
+        // Absolute path: a bare "powershell.exe" resolves via cwd/PATH.
+        `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction Stop | ForEach-Object { $_.CreationDate.ToFileTimeUtc() })`,
+        ],
+      ]
+    : ["ps", ["-p", String(pid), "-o", "lstart="]];
+}
+const PROBE_OPTS = {
+  encoding: "utf8" as const,
+  stdio: ["ignore", "pipe", "ignore"] as ("ignore" | "pipe")[],
+  timeout: 5000,
+  windowsHide: true,
+};
+
+// OS start time of a process ("Sat May 16 07:43:46 2026" / a FILETIME on
+// Windows): a string if it is running, null if there is no such process, and
+// undefined if the probe could not tell (timeout, spawn failure, WMI error).
+// Callers must not read undefined as "dead" — that is how a lock fails open.
+function processStartTime(pid: number): string | null | undefined {
+  const [cmd, args] = startTimeProbe(pid);
   try {
-    return (
-      execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
-        encoding: "utf8",
-      }).trim() || null
-    );
-  } catch {
-    return null;
+    return execFileSync(cmd, args, PROBE_OPTS).trim() || null;
+  } catch (err) {
+    // ps exits 1 for "no such process"; on Windows a non-zero exit is a real
+    // PowerShell/WMI failure (not-found prints nothing and exits 0).
+    return process.platform !== "win32" &&
+      typeof (err as { status?: unknown }).status === "number"
+      ? null
+      : undefined;
+  }
+}
+
+// Cheap liveness check with no spawn. EPERM = alive but not ours.
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
 function acquireSingletonLock(): void {
-  if (existsSync(LOCK_FILE)) {
-    const raw = (() => {
+  let myStart = processStartTime(process.pid);
+  if (myStart === undefined) myStart = processStartTime(process.pid); // one retry
+  if (myStart === undefined) {
+    process.stderr.write(
+      `${LOG_PREFIX}: could not read own start time; lock will be written without one\n`,
+    );
+  }
+  const mine = `${process.pid}\n${myStart ?? ""}\n`;
+  for (let attempt = 0; ; attempt++) {
+    // Atomic create: two instances racing here cannot both succeed.
+    try {
+      writeFileSync(LOCK_FILE, mine, { flag: "wx" });
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    // A lock exists. Refuse if its holder is a live server we cannot prove
+    // is a different process; otherwise it is stale — remove it and retry once.
+    const readLock = () => {
       try {
         return readFileSync(LOCK_FILE, "utf8");
       } catch {
         return "";
       }
-    })();
+    };
+    let raw = readLock();
+    if (!raw.trim()) {
+      // Empty: the creator may be between open and write. Give it a moment.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+      raw = readLock();
+    }
     const [pidLine = "", startLine = ""] = raw.split("\n");
     const otherPid = Number(pidLine.trim());
     const lockedStart = startLine.trim();
     if (Number.isFinite(otherPid) && otherPid > 0 && otherPid !== process.pid) {
-      // Genuine duplicate only if the PID is alive AND started when the lock
-      // recorded. A missing lockedStart is a legacy lock we can't verify —
-      // take over rather than risk a false refusal (the bug this fixes).
       const currentStart = processStartTime(otherPid);
+      const alive =
+        currentStart === undefined ? pidAlive(otherPid) : currentStart !== null;
+      // Genuine duplicate: alive AND (started when the lock recorded, or the
+      // probe could not tell — fail closed rather than double-connect). A
+      // missing lockedStart is a legacy lock we can't verify — take over
+      // rather than risk a false refusal (the bug the start time fixes).
       if (
-        currentStart !== null &&
-        lockedStart &&
-        currentStart === lockedStart
+        alive &&
+        (currentStart === undefined ||
+          (lockedStart !== "" && currentStart === lockedStart))
       ) {
         process.stderr.write(
           `${LOG_PREFIX}: another whatsapp server is already running (pid ${otherPid}). ` +
@@ -146,11 +211,15 @@ function acquireSingletonLock(): void {
         process.exit(2);
       }
     }
+    if (attempt > 0) {
+      // We removed a stale lock and someone else won the re-create race.
+      process.stderr.write(
+        `${LOG_PREFIX}: lost the lock race to another starting server; exiting\n`,
+      );
+      process.exit(2);
+    }
+    rmSync(LOCK_FILE, { force: true });
   }
-  writeFileSync(
-    LOCK_FILE,
-    `${process.pid}\n${processStartTime(process.pid) ?? ""}\n`,
-  );
 }
 
 function releaseSingletonLock(): void {
@@ -1684,12 +1753,29 @@ process.on("SIGINT", shutdown);
 // start). Poll the parent by PID + start time — start time, not bare PID,
 // because a reused PID would otherwise masquerade as a live parent. Two
 // consecutive misses required so a transient ps failure can't kill us.
+// Windows: a PowerShell spawn costs ~1.5 s of CPU, far too much for a 15 s
+// tick, so use a signal-0 liveness check there instead. Known ceiling: a
+// PID reused within one tick would mask a dead parent; hold a handle
+// (Wait-Process) if that ever bites.
 const PARENT_PID = process.ppid;
-const PARENT_START = processStartTime(PARENT_PID);
+let PARENT_START =
+  process.platform === "win32" ? undefined : processStartTime(PARENT_PID);
 let parentMisses = 0;
 setInterval(() => {
-  if (PARENT_START === null) return;
-  if (processStartTime(PARENT_PID) === PARENT_START) {
+  if (PARENT_START === null) return; // parent already gone at startup
+  let gone: boolean;
+  if (process.platform === "win32") {
+    gone = !pidAlive(PARENT_PID);
+  } else {
+    const now = processStartTime(PARENT_PID);
+    if (now === undefined) return; // probe failed: no evidence either way
+    if (PARENT_START === undefined) {
+      PARENT_START = now; // startup probe failed: arm from the first good one
+      return;
+    }
+    gone = now !== PARENT_START;
+  }
+  if (!gone) {
     parentMisses = 0;
     return;
   }

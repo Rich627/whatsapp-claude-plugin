@@ -56,23 +56,46 @@ function report(sev: Severity, id: string, msg: string, fix?: Fix): void {
   if (fix) out.push(`    fix[${fix.kind}]: ${fix.text}`);
 }
 
-// ── portable ps helpers (macOS + Linux) ─────────────────────────────────
+// ── portable process helpers ────────────────────────────────────────────
 
-// OS start time of a process, or null if no such process. Same probe as
-// server.ts's processStartTime — lstart distinguishes a reused PID.
-function processStartTime(pid: number): string | null {
+// OS start time of a process: a string if running, null if no such process,
+// undefined if the probe could not tell. Same probe as server.ts's
+// processStartTime (keep in sync: its output must match the lock file).
+function processStartTime(pid: number): string | null | undefined {
+  const [cmd, args]: [string, string[]] =
+    process.platform === "win32"
+      ? [
+          `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction Stop | ForEach-Object { $_.CreationDate.ToFileTimeUtc() })`,
+          ],
+        ]
+      : ["ps", ["-p", String(pid), "-o", "lstart="]];
   try {
     return (
-      execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
+      execFileSync(cmd, args, {
         encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 5000,
+        windowsHide: true,
       }).trim() || null
     );
-  } catch {
-    return null;
+  } catch (err) {
+    return process.platform !== "win32" &&
+      typeof (err as { status?: unknown }).status === "number"
+      ? null
+      : undefined;
   }
 }
 
+// Parent PID, or null when unknown. Windows has no "reparented to PID 1"
+// notion, so the orphan check below is not implemented there; the server's
+// own parent-death poll (and stdin EOF) is what ends an orphan on Windows.
 function processPpid(pid: number): number | null {
+  if (process.platform === "win32") return null;
   try {
     const n = Number(
       execFileSync("ps", ["-p", String(pid), "-o", "ppid="], {
@@ -200,13 +223,21 @@ function checkServer(): void {
   if (!Number.isFinite(pid) || pid <= 0) {
     report("WARN", "server", `lock file is malformed (${LOCK_FILE})`, {
       kind: "safe",
-      text: `rm ${LOCK_FILE}`,
+      text: `rm ${JSON.stringify(LOCK_FILE)}`,
     });
     return;
   }
   // Alive means: PID exists AND its start time matches what the lock
   // recorded — the same PID-reuse guard as server.ts's acquireSingletonLock.
   const currentStart = processStartTime(pid);
+  if (currentStart === undefined) {
+    report(
+      "WARN",
+      "server",
+      `could not verify whether PID ${pid} is the server (start-time probe failed) — not offering to remove the lock`,
+    );
+    return;
+  }
   const alive =
     currentStart !== null && lockedStart !== "" && currentStart === lockedStart;
   if (!alive) {
@@ -214,7 +245,7 @@ function checkServer(): void {
       "WARN",
       "server",
       `stale lock — PID ${pid} is gone or the PID was reused (the server also self-heals this on next start)`,
-      { kind: "safe", text: `rm ${LOCK_FILE}` },
+      { kind: "safe", text: `rm ${JSON.stringify(LOCK_FILE)}` },
     );
     return;
   }
@@ -226,7 +257,7 @@ function checkServer(): void {
       `orphaned server (pid ${pid}, parent dead) is holding the Baileys session — no new session can connect until it exits`,
       {
         kind: "safe",
-        text: `kill ${pid}   # wait ~5s; if still alive: kill -9 ${pid} && rm ${LOCK_FILE}`,
+        text: `kill ${pid}   # wait ~5s; if still alive: kill -9 ${pid} && rm ${JSON.stringify(LOCK_FILE)}`,
       },
     );
     return;
