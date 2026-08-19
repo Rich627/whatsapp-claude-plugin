@@ -18,9 +18,16 @@
  * singleton lock at module load).
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { parseArgs } from "node:util";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -70,11 +77,14 @@ function load(): Access {
   }
 }
 
-// Always load immediately before saving: the server may have added a pending
-// entry between our read and write, and clobbering it loses a pairing request.
+// load → mutate → save with no lock: a pending entry the server adds in that
+// few-ms window is lost. Accepted — the sender just messages again for a new
+// code. Atomic (tmp + rename) like server.ts, so it never reads a torn file.
 function save(access: Access): void {
-  mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(ACCESS_FILE, JSON.stringify(access, null, 2) + "\n");
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  const tmp = ACCESS_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(access, null, 2) + "\n", { mode: 0o600 });
+  renameSync(tmp, ACCESS_FILE);
 }
 
 function die(message: string): never {
@@ -162,8 +172,21 @@ function pair(code: string): void {
 }
 
 function group(args: string[]): void {
-  const sub = args[0];
-  const jid = requireArg(args[1], "group JID");
+  // Strict: an unknown flag, a missing --allow value, or a flag where the JID
+  // should be is an error, not a group called "--mention".
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args,
+      options: { mention: { type: "boolean" }, allow: { type: "string" } },
+      allowPositionals: true,
+    });
+  } catch (err) {
+    die(`${(err as Error).message}\n\n${USAGE}`);
+  }
+  const [sub, jidArg] = parsed.positionals;
+  const jid = requireArg(jidArg, "group JID");
+  const { mention = false, allow } = parsed.values;
   const a = load();
   if (sub === "rm") {
     if (!a.groups[jid]) die(`Group ${jid} is not configured.`);
@@ -176,13 +199,9 @@ function group(args: string[]): void {
   }
   if (sub !== "add") die(`Unknown group command "${sub}".\n\n${USAGE}`);
 
-  const allowArg = args[args.indexOf("--allow") + 1];
   a.groups[jid] = {
-    requireMention: args.includes("--mention"),
-    allowFrom:
-      args.includes("--allow") && allowArg
-        ? allowArg.split(",").map((s) => s.trim())
-        : [],
+    requireMention: mention,
+    allowFrom: allow?.split(",").map((s) => s.trim()) ?? [],
   };
   save(a);
 

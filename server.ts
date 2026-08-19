@@ -694,7 +694,9 @@ function checkApprovals(): void {
   }
 }
 
-if (!STATIC) setInterval(checkApprovals, 5000).unref();
+// Never from a conflict-mode server: it has no socket, so it would only delete
+// the handoff files the connected server is about to act on.
+if (!STATIC && !CONFLICT) setInterval(checkApprovals, 5000).unref();
 
 // ─── Server-side cron engine ────────────────────────────────────────
 
@@ -1038,10 +1040,7 @@ async function waitForUnreplied(maxMs: number): Promise<MessageLogEntry[]> {
     if (pending.length > 0) return pending;
     const remaining = deadline - Date.now();
     if (remaining <= 0) return [];
-    await new Promise((resolve) => {
-      const timer = setTimeout(resolve, Math.min(2000, remaining));
-      timer.unref?.();
-    });
+    await new Promise((r) => setTimeout(r, Math.min(2000, remaining)));
   }
 }
 
@@ -1126,8 +1125,9 @@ function pruneMessageLog(): void {
   } catch {}
 }
 
-// Prune every hour
-setInterval(pruneMessageLog, 60 * 60 * 1000).unref();
+// Prune every hour. Not from a conflict-mode server: a second read-then-rewrite
+// of the log could drop lines the connected server appended in between.
+if (!CONFLICT) setInterval(pruneMessageLog, 60 * 60 * 1000).unref();
 
 // ─── Photo extensions ──────────────────────────────────────────────────
 
@@ -1302,13 +1302,11 @@ mcp.setNotificationHandler(
         return undefined;
       });
       if (sent?.key?.id) {
+        // No expiry: Claude Code waits on a permission request indefinitely,
+        // so a "yes <id>" must be honoured whenever it arrives. The entry is
+        // removed when claimed; an unanswered one costs a few bytes.
         permissionMessageMap.set(sent.key.id, request_id);
         trackSent(sent.key);
-        // Clean up after 10 minutes
-        setTimeout(
-          () => permissionMessageMap.delete(sent.key.id!),
-          10 * 60 * 1000,
-        );
       }
     }
   },
@@ -1828,7 +1826,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const result = await handleToolCall(req);
   const pending = getUnreplied().length;
   const last = result.content?.[result.content.length - 1];
-  if (pending > 0 && last?.type === "text" && req.params.name !== "unreplied") {
+  // Not on the tools that just returned those very messages.
+  if (
+    pending > 0 &&
+    last?.type === "text" &&
+    !["unreplied", "wait_for_messages"].includes(req.params.name)
+  ) {
     last.text += `\n\n[${pending} unreplied WhatsApp message(s) waiting — call unreplied or wait_for_messages]`;
   }
   return result;

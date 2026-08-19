@@ -136,6 +136,16 @@ describe("groups", () => {
     run(dir, "group", "add", "1@g.us");
     expect(readFileSync(config, "utf8")).toBe("# mine\n");
   });
+
+  test("flags may precede the JID; unknown or valueless flags are refused", () => {
+    const dir = freshStateDir();
+    run(dir, "group", "add", "--mention", "1@g.us");
+    expect(access(dir).groups["1@g.us"].requireMention).toBe(true);
+    expect(existsSync(join(dir, "groups", "--mention"))).toBe(false);
+    expect(run(dir, "group", "add", "2@g.us", "--bogus").code).toBe(1);
+    expect(run(dir, "group", "add", "2@g.us", "--allow").code).toBe(1);
+    expect(access(dir).groups["2@g.us"]).toBeUndefined();
+  });
 });
 
 describe("set", () => {
