@@ -211,8 +211,12 @@ function acquireSingletonLock(): void {
         process.exit(2);
       }
     }
-    if (attempt > 0) {
-      // We removed a stale lock and someone else won the re-create race.
+    if (attempt > 0 || readLock() !== raw) {
+      // Either we already removed a stale lock and someone else won the
+      // re-create race, or the lock changed while we were inspecting it
+      // (another instance took the stale lock over during our probe):
+      // deleting it now would remove a live server's lock. They are the
+      // server; we exit.
       process.stderr.write(
         `${LOG_PREFIX}: lost the lock race to another starting server; exiting\n`,
       );
