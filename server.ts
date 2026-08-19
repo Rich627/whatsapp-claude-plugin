@@ -82,6 +82,10 @@ try {
 
 const PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER;
 const STATIC = process.env.WHATSAPP_ACCESS_MODE === "static";
+// The client process that spawned us, when it identifies itself. Claude Code
+// sets CLAUDE_PID; other MCP clients set nothing, which reads as "unknown"
+// and is reported as such rather than guessed at.
+const CLIENT_ID = (process.env.CLAUDE_PID ?? "").trim();
 const ACCOUNT_NAME = process.env.WHATSAPP_ACCOUNT_NAME || "";
 const SERVER_NAME = ACCOUNT_NAME ? `whatsapp-${ACCOUNT_NAME}` : "whatsapp";
 const LOG_PREFIX = ACCOUNT_NAME
@@ -155,7 +159,11 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-function acquireSingletonLock(): void {
+// Who holds the connection when we cannot. `client` is the CLAUDE_PID the
+// holder recorded, "" when started by something that does not set one.
+type LockHolder = { pid: number; client: string };
+
+function acquireSingletonLock(): LockHolder | null {
   let myStart = processStartTime(process.pid);
   if (myStart === undefined) myStart = processStartTime(process.pid); // one retry
   if (myStart === undefined) {
@@ -163,12 +171,16 @@ function acquireSingletonLock(): void {
       `${LOG_PREFIX}: could not read own start time; lock will be written without one\n`,
     );
   }
-  const mine = `${process.pid}\n${myStart ?? ""}\n`;
+  // Line 3 is the client that spawned us, so a refused server and doctor can
+  // name WHOSE connection this is with a string compare instead of a process
+  // query (under Git Bash on Windows a hook's own $PPID is 1, so ancestry is
+  // not available there at all).
+  const mine = `${process.pid}\n${myStart ?? ""}\n${CLIENT_ID}\n`;
   for (let attempt = 0; ; attempt++) {
     // Atomic create: two instances racing here cannot both succeed.
     try {
       writeFileSync(LOCK_FILE, mine, { flag: "wx" });
-      return;
+      return null;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
@@ -187,9 +199,10 @@ function acquireSingletonLock(): void {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
       raw = readLock();
     }
-    const [pidLine = "", startLine = ""] = raw.split("\n");
+    const [pidLine = "", startLine = "", clientLine = ""] = raw.split("\n");
     const otherPid = Number(pidLine.trim());
     const lockedStart = startLine.trim();
+    const otherClient = clientLine.trim();
     if (Number.isFinite(otherPid) && otherPid > 0 && otherPid !== process.pid) {
       const currentStart = processStartTime(otherPid);
       const alive =
@@ -205,10 +218,10 @@ function acquireSingletonLock(): void {
       ) {
         process.stderr.write(
           `${LOG_PREFIX}: another whatsapp server is already running (pid ${otherPid}). ` +
-            `Refusing to start — duplicate instances kick each other off Baileys. ` +
+            `Not connecting — duplicate instances kick each other off Baileys. ` +
             `Lock file: ${LOCK_FILE}\n`,
         );
-        process.exit(2);
+        return { pid: otherPid, client: otherClient };
       }
     }
     if (attempt > 0 || readLock() !== raw) {
@@ -216,24 +229,38 @@ function acquireSingletonLock(): void {
       // re-create race, or the lock changed while we were inspecting it
       // (another instance took the stale lock over during our probe):
       // deleting it now would remove a live server's lock. They are the
-      // server; we exit.
+      // server; we go into conflict mode.
       process.stderr.write(
-        `${LOG_PREFIX}: lost the lock race to another starting server; exiting\n`,
+        `${LOG_PREFIX}: lost the lock race to another starting server\n`,
       );
-      process.exit(2);
+      return { pid: otherPid > 0 ? otherPid : 0, client: otherClient };
     }
     rmSync(LOCK_FILE, { force: true });
   }
 }
 
 function releaseSingletonLock(): void {
+  if (CONFLICT) return; // not ours to release
   try {
     const pidLine = readFileSync(LOCK_FILE, "utf8").split("\n")[0].trim();
     if (Number(pidLine) === process.pid) rmSync(LOCK_FILE, { force: true });
   } catch {}
 }
 
-acquireSingletonLock();
+// Null when we hold the connection. Set when another server has it: we stay
+// up in conflict mode, serve one tool that says so, and never touch Baileys —
+// the invariant is one connection, not one process. Exiting instead would be
+// invisible; no MCP client tells the user why a server died.
+const CONFLICT = acquireSingletonLock();
+const conflictReason = CONFLICT
+  ? `Another WhatsApp server already holds this account's connection (pid ${CONFLICT.pid}${
+      CONFLICT.client
+        ? CONFLICT.client === CLIENT_ID
+          ? ", started by this same client"
+          : `, started by another client (pid ${CONFLICT.client})`
+        : ""
+    }). WhatsApp allows one connection per account, so this session cannot send or receive. To use WhatsApp here, quit the other session, then start this one again.`
+  : "";
 
 process.on("unhandledRejection", (err) => {
   process.stderr.write(`${LOG_PREFIX}: unhandled rejection: ${err}\n`);
@@ -1103,6 +1130,15 @@ const mcp = new Server(
       },
     },
     instructions: [
+      // Conflict first: instructions are one of the few things every MCP
+      // client must put in front of the model, so this is where a refused
+      // server gets to explain itself.
+      ...(CONFLICT
+        ? [
+            `WHATSAPP UNAVAILABLE IN THIS SESSION. ${conflictReason} Tell the user this if they ask about WhatsApp; do not attempt to send messages.`,
+            "",
+          ]
+        : []),
       ...(ACCOUNT_NAME
         ? [
             `This is the "${ACCOUNT_NAME}" WhatsApp account. Messages from this account include account="${ACCOUNT_NAME}" in the meta. When multiple WhatsApp accounts are connected, use the correct account\'s tools to reply — check the channel source or account field to determine which account received the message.`,
@@ -1141,6 +1177,19 @@ const mcp = new Server(
 // Permission relay — forward to all allowlisted DMs.
 // Track permission request message IDs for emoji-based approval
 const permissionMessageMap = new Map<string, string>(); // messageId → requestId
+
+// Was this request id one we asked about and are still waiting on? Claims it
+// if so, so a repeated reply is treated as ordinary chat.
+function claimPermission(requestId: string): boolean {
+  let found = false;
+  for (const [messageId, id] of permissionMessageMap) {
+    if (id === requestId) {
+      permissionMessageMap.delete(messageId);
+      found = true;
+    }
+  }
+  return found;
+}
 
 function formatPermissionPreview(
   tool_name: string,
@@ -2086,9 +2135,13 @@ async function handleMessage(msg: WAMessage): Promise<void> {
   // Ensure group config directory exists
   if (isGroup) ensureGroupDir(remoteJid);
 
-  // Permission reply intercept
+  // Permission reply intercept, only while that request id is outstanding:
+  // the pattern ("yes" + 5 letters) is reachable by ordinary chat, and
+  // swallowing a real message — sender sees a tick, agent never sees the
+  // text — is worse than missing an approval. On clients that never send
+  // permission requests, nothing is listening at all.
   const permMatch = PERMISSION_REPLY_RE.exec(text);
-  if (permMatch) {
+  if (permMatch && claimPermission(permMatch[2]!.toLowerCase())) {
     void mcp.notification({
       method: "notifications/claude/channel/permission",
       params: {
@@ -2622,5 +2675,26 @@ async function connectWhatsApp(): Promise<void> {
   );
 }
 
-process.stderr.write(`${LOG_PREFIX}: starting\n`);
-await connectWhatsApp();
+if (CONFLICT) {
+  // Registered last, so these replace the real handlers. Exposing reply/react
+  // in conflict mode would be worse than exposing nothing: they would accept a
+  // message, fail to send it, and the agent would report it as delivered.
+  mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: "whatsapp_unavailable",
+        description: `WhatsApp is not available in this session. ${conflictReason} No other WhatsApp tool exists here.`,
+        inputSchema: { type: "object", properties: {} },
+      },
+    ],
+  }));
+  mcp.setRequestHandler(CallToolRequestSchema, async () => ({
+    content: [{ type: "text", text: conflictReason }],
+  }));
+  // Baileys is never touched here, so the one-connection invariant holds
+  // exactly as it did when this path called process.exit(2).
+  process.stderr.write(`${LOG_PREFIX}: ${conflictReason}\n`);
+} else {
+  process.stderr.write(`${LOG_PREFIX}: starting\n`);
+  await connectWhatsApp();
+}

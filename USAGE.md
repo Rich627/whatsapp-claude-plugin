@@ -207,7 +207,7 @@ pkill -f "whatsapp.*server"
 
 ## Known limitations
 
-**Inbound message delivery may not work.** Claude Code's channel notification system (`notifications/claude/channel`) has a confirmed client-side bug where inbound messages sent by the MCP server are silently dropped and never appear in the conversation. This affects all channel plugins (WhatsApp, Telegram, etc.) and is tracked across multiple issues ([#37933](https://github.com/anthropics/claude-code/issues/37933), [#36477](https://github.com/anthropics/claude-code/issues/36477), [#37633](https://github.com/anthropics/claude-code/issues/37633)). The server-side implementation is correct — the fix must come from the Claude Code client. No reliable workaround exists as of v2.1.83.
+**Inbound message delivery is Claude Code only.** Messages are pushed into a session with `notifications/claude/channel`, which is a Claude Code extension, not part of MCP. Other MCP clients (Codex CLI, Gemini CLI, Cursor) drop unknown notifications silently, so there the plugin is poll-only: call `catch_up` or `unreplied` to see what arrived. Delivery inside Claude Code was broken by client bugs ([#37933](https://github.com/anthropics/claude-code/issues/37933), [#36477](https://github.com/anthropics/claude-code/issues/36477), [#37633](https://github.com/anthropics/claude-code/issues/37633)) and worked again when last checked on v2.1.235; if messages stop appearing, check those issues before suspecting this plugin.
 
 ## Resetting auth
 
