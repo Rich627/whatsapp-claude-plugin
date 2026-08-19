@@ -15,6 +15,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import makeWASocket, {
@@ -1022,6 +1023,41 @@ function markReplied(chat_id: string): void {
   }
 }
 
+// Clients other than Claude Code cannot be pushed to: MCP has no standard
+// server-to-client channel that reaches the model, and unknown notification
+// methods are dropped silently. So the agent asks, and this parks that ask
+// until a message lands.
+//
+// ponytail: re-reads the log every 2s while waiting, rather than being woken
+// in-process. Simpler, works whoever wrote the line, and costs at most 2s of
+// latency in a chat bridge. Wake on write if that ever matters.
+async function waitForUnreplied(maxMs: number): Promise<MessageLogEntry[]> {
+  const deadline = Date.now() + maxMs;
+  for (;;) {
+    const pending = getUnreplied();
+    if (pending.length > 0) return pending;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return [];
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, Math.min(2000, remaining));
+      timer.unref?.();
+    });
+  }
+}
+
+function formatMessages(entries: MessageLogEntry[]): string {
+  return entries
+    .map((m) => {
+      const parts = [`[${m.ts}] ${m.user} in ${m.group_name ?? m.chat_id}:`];
+      if (m.text) parts.push(m.text);
+      if (m.image_path) parts.push(`(image: ${m.image_path})`);
+      if (m.attachment_kind) parts.push(`(${m.attachment_kind} attachment)`);
+      parts.push(`  chat_id=${m.chat_id} message_id=${m.id}`);
+      return parts.join("\n");
+    })
+    .join("\n\n");
+}
+
 function getUnreplied(): MessageLogEntry[] {
   try {
     if (!existsSync(MESSAGE_LOG)) return [];
@@ -1366,6 +1402,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "wait_for_messages",
+      description:
+        "Wait for the next inbound WhatsApp message, up to 40 seconds. Returns immediately if messages are already unreplied. Use this when you want to stay responsive without polling: call it, handle whatever it returns, call it again. It returns an empty result if nothing arrives in time, which is normal, not an error. (In Claude Code messages are also pushed into the session automatically, so this is mainly for other MCP clients.)",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
       name: "unreplied",
       description:
         "Get messages received but not yet replied to. Call this on session start (after status) to catch up on messages that arrived before this session or were missed due to a restart. Each entry includes chat_id, message_id, user, text, and timestamp.",
@@ -1401,7 +1443,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
-mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+// Wrapped below so every result carries the unreplied count: a client that
+// cannot be pushed to still learns there is traffic, on its next tool call,
+// whatever that call was.
+const handleToolCall = async (req: {
+  params: { name: string; arguments?: unknown };
+}): Promise<CallToolResult> => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>;
   try {
     switch (req.params.name) {
@@ -1664,6 +1711,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return { content: [{ type: "text", text: lines.join("\n") }] };
       }
 
+      case "wait_for_messages": {
+        // 40s, not longer: the reference SDK's default client timeout is 60s
+        // and resetTimeoutOnProgress is off by default, so an over-long wait is
+        // cancelled client-side rather than answered. The margin covers the
+        // re-check tick and any client configured tighter than the default.
+        const arrived = await waitForUnreplied(40_000);
+        const text = arrived.length
+          ? `${arrived.length} unreplied message(s):\n\n${formatMessages(arrived)}`
+          : "No new messages in the last 40 seconds. Call again to keep waiting.";
+        return { content: [{ type: "text", text }] };
+      }
+
       case "unreplied": {
         const filterChat = args.chat_id as string | undefined;
         let unreplied = getUnreplied();
@@ -1674,19 +1733,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             content: [{ type: "text", text: "No unreplied messages." }],
           };
         }
-        const summary = unreplied
-          .map((m) => {
-            const parts = [
-              `[${m.ts}] ${m.user} in ${m.group_name ?? m.chat_id}:`,
-            ];
-            if (m.text) parts.push(m.text);
-            if (m.image_path) parts.push(`(image: ${m.image_path})`);
-            if (m.attachment_kind)
-              parts.push(`(${m.attachment_kind} attachment)`);
-            parts.push(`  chat_id=${m.chat_id} message_id=${m.id}`);
-            return parts.join("\n");
-          })
-          .join("\n\n");
+        const summary = formatMessages(unreplied);
         return {
           content: [
             {
@@ -1775,6 +1822,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       isError: true,
     };
   }
+};
+
+mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const result = await handleToolCall(req);
+  const pending = getUnreplied().length;
+  const last = result.content?.[result.content.length - 1];
+  if (pending > 0 && last?.type === "text" && req.params.name !== "unreplied") {
+    last.text += `\n\n[${pending} unreplied WhatsApp message(s) waiting — call unreplied or wait_for_messages]`;
+  }
+  return result;
 });
 
 // ─── MCP transport ─────────────────────────────────────────────────────
