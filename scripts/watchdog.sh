@@ -122,7 +122,10 @@ hard_restart() {
 
 	msg="WhatsApp agent on $(hostname -s) auto-restarted by watchdog ($reason)."
 	if [ -x "$NOTIFY_HOOK" ]; then
-		"$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
+		"$NOTIFY_HOOK" "$msg" || {
+			hook_rc=$?
+			echo "[$(date -Iseconds)] notify-hook failed (exit $hook_rc)"
+		}
 	elif command -v osascript >/dev/null 2>&1; then
 		osascript -e "display notification \"$msg\" with title \"WhatsApp agent auto-restarted\" sound name \"Funk\"" 2>/dev/null || true
 	fi
@@ -151,7 +154,10 @@ if curl -fsS --max-time 5 -o /dev/null "$NET_PROBE_URL" 2>/dev/null; then
 		msg="WhatsApp agent on $(hostname -s) is back online — outbound connectivity was down for $down_checks consecutive watchdog checks."
 		echo "[$(date -Iseconds)] NET-RECOVERED: $msg"
 		if [ -x "$NOTIFY_HOOK" ]; then
-			"$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
+			"$NOTIFY_HOOK" "$msg" || {
+				hook_rc=$?
+				echo "[$(date -Iseconds)] notify-hook failed (exit $hook_rc)"
+			}
 		elif command -v osascript >/dev/null 2>&1; then
 			osascript -e "display notification \"$msg\" with title \"WhatsApp agent back online\" sound name \"Funk\"" 2>/dev/null || true
 		fi
@@ -179,7 +185,10 @@ else
 			msg="WhatsApp agent on $(hostname -s) has no outbound connectivity ($NET_PROBE_URL unreachable for $net_streak consecutive checks).$detail Nothing will send or arrive until the network is back — the agent is left running."
 			echo "[$(date -Iseconds)] NET-DOWN-ALERT: $msg"
 			if [ -x "$NOTIFY_HOOK" ]; then
-				"$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
+				"$NOTIFY_HOOK" "$msg" || {
+					hook_rc=$?
+					echo "[$(date -Iseconds)] notify-hook failed (exit $hook_rc)"
+				}
 			elif command -v osascript >/dev/null 2>&1; then
 				osascript -e "display notification \"$msg\" with title \"WhatsApp agent offline\" sound name \"Funk\"" 2>/dev/null || true
 			fi
@@ -206,7 +215,10 @@ if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
 			msg="WhatsApp agent on $(hostname -s) is auth-broken (API 401). SSH in and run /login: tmux attach -t $TMUX_SESSION"
 			echo "[$(date -Iseconds)] AUTH-BROKEN: $msg"
 			if [ -x "$NOTIFY_HOOK" ]; then
-				"$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
+				"$NOTIFY_HOOK" "$msg" || {
+					hook_rc=$?
+					echo "[$(date -Iseconds)] notify-hook failed (exit $hook_rc)"
+				}
 			elif command -v osascript >/dev/null 2>&1; then
 				osascript -e "display notification \"$msg\" with title \"WhatsApp agent auth broken\" sound name \"Funk\"" 2>/dev/null || true
 			fi
