@@ -217,7 +217,7 @@ function checkServer(): void {
   } catch {
     /* fall through to malformed */
   }
-  const [pidLine = "", startLine = ""] = raw.split("\n");
+  const [pidLine = "", startLine = "", clientLine = ""] = raw.split("\n");
   const pid = Number(pidLine.trim());
   const lockedStart = startLine.trim();
   if (!Number.isFinite(pid) || pid <= 0) {
@@ -262,11 +262,17 @@ function checkServer(): void {
     );
     return;
   }
-  report(
-    "PASS",
-    "server",
-    `server running (pid ${pid}) — note: it may belong to another Claude Code session on this machine`,
-  );
+  // Line 3 of the lock is the client that started the holder, so this can name
+  // the owner instead of hedging. Absent on locks written before 0.15.0, and
+  // on servers started by a client that does not identify itself.
+  const client = clientLine.trim();
+  const owner =
+    client === ""
+      ? " — started by a client that does not identify itself, or before 0.15.0"
+      : client === (process.env.CLAUDE_PID ?? "").trim()
+        ? " — started by this session"
+        : ` — started by another session or client (pid ${client})`;
+  report("PASS", "server", `server running (pid ${pid})${owner}`);
 }
 
 const VALID_POLICIES = ["pairing", "allowlist", "disabled"];

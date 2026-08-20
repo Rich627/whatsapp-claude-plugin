@@ -21,9 +21,21 @@ function freshStateDir(): string {
 
 // lstart of a live pid, exactly as doctor computes it
 function lstart(pid: number): string {
-  return execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
-    encoding: "utf8",
-  }).trim();
+  // Same probe doctor uses. `ps -o lstart=` does not exist on Windows, so this
+  // helper has to branch too or every live-lock test is red there.
+  const [cmd, args] =
+    process.platform === "win32"
+      ? [
+          `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction Stop | ForEach-Object { $_.CreationDate.ToFileTimeUtc() })`,
+          ],
+        ]
+      : ["ps", ["-p", String(pid), "-o", "lstart="]];
+  return execFileSync(cmd, args, { encoding: "utf8" }).trim();
 }
 
 describe("state-dir", () => {

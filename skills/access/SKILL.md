@@ -199,6 +199,13 @@ Read, set the key, write, confirm.
 
 ---
 
+## Equivalent CLI
+
+`bun scripts/access.ts <same subcommands>` does all of this without Claude Code,
+for users on Codex CLI, Gemini CLI or Cursor. It writes the same access.json, so
+the two are interchangeable. This skill stays the friendlier path: it can ask the
+group personality questions and write a tailored config.md, which the CLI does not.
+
 ## Implementation notes
 
 - **Always** Read the file before Write — the channel server may have added
