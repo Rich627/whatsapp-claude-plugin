@@ -9,10 +9,17 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 
 const SCRIPT = join(import.meta.dir, "install-watchdog.ts");
 const REPO_WATCHDOG = join(import.meta.dir, "watchdog.sh");
+
+// The watchdog is POSIX-only by construction: it drives `crontab`, and
+// watchdog.sh calls launchctl and tmux. On Windows there is nothing real to
+// test, and the stub below cannot work there either (PATH separator is ";",
+// and an extensionless shell script is not spawnable), so skip rather than
+// pretend. Same reasoning as the platform branch in doctor.test.ts.
+const posixOnly = process.platform === "win32" ? describe.skip : describe;
 
 // Fake `crontab` put first on PATH: `-l` prints the store file (exit 1 if
 // absent, like real crontab with no crontab yet), `-` writes stdin to it.
@@ -43,7 +50,7 @@ function runScript(stateDir: string, cronStore: string, arg?: string): string {
       ...process.env,
       WHATSAPP_STATE_DIR: stateDir,
       CRONTAB_STORE: cronStore,
-      PATH: `${stubDir}:${process.env.PATH}`,
+      PATH: `${stubDir}${delimiter}${process.env.PATH}`,
     },
   });
 }
@@ -58,7 +65,7 @@ function freshCronStore(): string {
   return join(mkdtempSync(join(tmpdir(), "cron-store-")), "store");
 }
 
-describe("status", () => {
+posixOnly("status", () => {
   test("nothing installed → INFO for file and cron", () => {
     const out = runScript(freshStateDir(), freshCronStore(), "status");
     expect(out).toContain("[INFO] watchdog-file: not installed");
@@ -106,7 +113,7 @@ describe("status", () => {
   });
 });
 
-describe("install", () => {
+posixOnly("install", () => {
   test("fresh install: file copied executable, cron line appended", () => {
     const dir = freshStateDir();
     const store = freshCronStore();
@@ -187,7 +194,7 @@ describe("install", () => {
   });
 });
 
-describe("uninstall", () => {
+posixOnly("uninstall", () => {
   test("removes only the watchdog line; file and other lines stay", () => {
     const dir = freshStateDir();
     const store = freshCronStore();

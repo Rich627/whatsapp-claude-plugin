@@ -31,13 +31,88 @@ Inside the session, set your number and pair:
 
 A pairing code is printed on first launch. On your phone: WhatsApp → Settings → Linked Devices → Link a Device → **Link with phone number instead** → enter the code. No WhatsApp Business API, Meta developer account, or API key is involved — it links to your regular account.
 
+## Other MCP clients (Codex CLI, Gemini CLI, Cursor)
+
+The server is a plain stdio MCP server, so any MCP client can run it. Two things are Claude Code specific and worth knowing before you start:
+
+- **Inbound messages are not pushed.** Waking a session on an incoming message uses `notifications/claude/channel`, a Claude Code extension. MCP has no standard equivalent that reaches the model, and other clients drop unknown notifications silently. Elsewhere the plugin is poll-based: call `wait_for_messages` (waits up to 40s for the next message) or `catch_up` / `unreplied`. Every tool result also carries a count of unreplied messages, so a client finds out there is traffic on its next call whatever that call was.
+- **Setup is done from a terminal, not a slash command.** `/whatsapp-claude-channel:access` and friends are Claude Code skills. Use `bun scripts/access.ts` instead (see [Access control from a terminal](#access-control-from-a-terminal)).
+
+Register the server with an absolute path — `${CLAUDE_PLUGIN_ROOT}` is substituted by Claude Code only:
+
+**Codex CLI** (`~/.codex/config.toml`)
+
+```toml
+[mcp_servers.whatsapp]
+command = "bun"
+args = ["run", "--cwd", "/absolute/path/to/whatsapp-claude-channel", "start"]
+startup_timeout_sec = 30   # default 10 is tight for a first Baileys connect
+tool_timeout_sec = 120     # default 60; wait_for_messages parks for up to 40s
+```
+
+**Gemini CLI** (`~/.gemini/settings.json`)
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "bun",
+      "args": [
+        "run",
+        "--cwd",
+        "/absolute/path/to/whatsapp-claude-channel",
+        "start"
+      ],
+      "timeout": 600000
+    }
+  }
+}
+```
+
+**Cursor** (`~/.cursor/mcp.json` for all projects, `.cursor/mcp.json` for one)
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "type": "stdio",
+      "command": "bun",
+      "args": [
+        "run",
+        "--cwd",
+        "/absolute/path/to/whatsapp-claude-channel",
+        "start"
+      ]
+    }
+  }
+}
+```
+
+Only one client at a time can hold the WhatsApp connection: WhatsApp allows one linked-device session per account, and two servers would kick each other off. A second server does not fail silently — it stays up and serves a single `whatsapp_unavailable` tool naming the process that holds the connection.
+
+## Access control from a terminal
+
+Everything the access skill does, without Claude Code:
+
+```sh
+bun scripts/access.ts status                 # policy, allowlist, pending codes, groups
+bun scripts/access.ts policy pairing         # open the door
+bun scripts/access.ts pair <code>            # approve someone who messaged you
+bun scripts/access.ts allow <jid>            # add directly
+bun scripts/access.ts remove <jid>
+bun scripts/access.ts group add <groupJid> [--mention] [--allow jid1,jid2]
+bun scripts/access.ts set replyToMode first  # ackReaction, textChunkLimit, chunkMode, mentionPatterns
+```
+
+Approving always needs the specific code, even when only one pairing is waiting: anyone can create a pending entry just by messaging the account, so "approve the pending one" is exactly what a prompt-injected request looks like. For the same reason this is a terminal command and deliberately **not** an MCP tool, so nothing arriving over WhatsApp can reach it.
+
 ## Features
 
 - **Bidirectional messaging.** Send and receive from the session; long replies are chunked to WhatsApp's limits or sent as a document attachment past a configurable threshold.
 - **@-mentions.** `reply` can tag people so they actually get notified — ids are accepted as phone, LID, or full JID, and mentions attach only to the chunk that names them.
 - **Full media support.** Photos, voice notes, video, documents, and stickers, in both directions.
 - **Voice transcription.** Incoming voice notes are transcribed locally via mlx-whisper (see [setup](#voice-transcription-optional)); without the script they arrive as plain attachments.
-- **Access control.** Pairing codes, allowlists, and per-group policies gate every inbound message — strangers never reach your session. Managed via `/whatsapp-claude-channel:access`.
+- **Access control.** Pairing codes, allowlists, and per-group policies gate every inbound message — strangers never reach your session. Managed via `/whatsapp-claude-channel:access` in Claude Code, or `bun scripts/access.ts` anywhere.
 - **Per-group personalities.** Each group gets its own `config.md` with a custom personality and conversation memory.
 - **Permission relay.** Approve or deny Claude's tool requests from WhatsApp with an emoji reaction (👍 / 👎).
 - **Cron tasks.** A `## Cron Jobs` section in a group's `config.md` schedules recurring server-side tasks.
