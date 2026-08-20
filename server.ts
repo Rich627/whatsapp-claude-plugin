@@ -676,12 +676,15 @@ function checkApprovals(): void {
   }
   if (files.length === 0) return;
 
+  // No socket — boot before the first connect, or the gap while a dropped
+  // connection reconnects (`sock` is nulled on connection close). Leave the
+  // handoffs for a later tick: deleting them here silently ate the pairing
+  // confirmation. access.json was already updated by then, so the pairing
+  // looked successful while "Paired!" never went out.
+  if (!sock) return;
+
   for (const senderId of files) {
     const file = join(APPROVED_DIR, senderId);
-    if (!sock) {
-      rmSync(file, { force: true });
-      continue;
-    }
     void sock.sendMessage(senderId, { text: "Paired! Say hi to Claude." }).then(
       () => rmSync(file, { force: true }),
       (err) => {
