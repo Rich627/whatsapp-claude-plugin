@@ -1,4 +1,9 @@
 #!/bin/bash
+# This file deliberately uses plain [ ] / unbraced-$VAR style throughout; the
+# optional shellcheck style rules below would demand the other convention.
+# Never let an autofix restyle it — on 2026-08-18 one such run corrupted a
+# variable name mid-rewrite ("for $down_checks" → "fo${ $down_chec}ks").
+# shellcheck disable=SC2248,SC2249,SC2250,SC2292,SC2310,SC2312
 # WhatsApp agent watchdog — detects stuck Claude sessions and nudges them.
 # If nudging doesn't unstick it within STUCK_STREAK_LIMIT consecutive checks
 # (e.g. the WhatsApp/Baileys connection itself dropped, which a nudge can't
