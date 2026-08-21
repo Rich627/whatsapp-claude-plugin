@@ -32,7 +32,7 @@ import makeWASocket, {
   type BaileysEventMap,
   type proto,
 } from "@whiskeysockets/baileys";
-import { randomBytes } from "crypto";
+import { randomBytes, timingSafeEqual } from "crypto";
 import { execFileSync } from "child_process";
 import {
   readFileSync,
@@ -48,7 +48,7 @@ import {
   existsSync,
 } from "fs";
 import { homedir } from "os";
-import { join, extname, sep, basename } from "path";
+import { join, extname, sep, basename, resolve } from "path";
 import {
   expandAllMention,
   isReservedAllToken,
@@ -62,6 +62,18 @@ import {
   type ContactsMap,
 } from "./scripts/contacts";
 import { looksLikeNumber, maskNumber } from "./scripts/mask";
+import {
+  createServer,
+  connect,
+  type Server as NetServer,
+  type Socket as NetSocket,
+} from "net";
+import {
+  ipcSocketPath,
+  isStaleSocket,
+  LineBuffer,
+  type SocketProbe,
+} from "./scripts/ipc";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -78,6 +90,7 @@ const DM_ACTIVITY_FILE = join(STATE_DIR, "dm-activity.json");
 const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
 const TASKS_FILE = join(STATE_DIR, "tasks.md");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
+const IPC_TOKEN_FILE = join(STATE_DIR, ".ipc-token");
 
 // Load ~/.whatsapp-channel/.env into process.env. Real env wins.
 try {
@@ -289,6 +302,172 @@ const conflictReason = CONFLICT
         : ""
     }). WhatsApp allows one connection per account, so this session cannot send or receive. To use WhatsApp here, quit the other session, then start this one again.`
   : "";
+
+// ─── IPC listener (primary) ────────────────────────────────────────────
+// PRD §11 M1: the primary side of local multi-terminal sync. Opens a local
+// Unix socket / Windows named pipe, generates a fresh auth token, accepts
+// connections, and drops any that don't present that token. No relay, no
+// broadcast, no tracked connection list — those are later tasks (T03/T04).
+
+// PRD §9/§12: the same-user boundary is enforced by a shared secret in a
+// 0600 file (the trust model contacts.json/lid-map.json already use), not by
+// pipe/socket ACLs. Regenerated every time a primary starts listening — a
+// secondary always reads this file fresh right before connecting, so there
+// is nothing to keep stable across restarts, and a leaked token dies with
+// the process. Trailing newline matches .server.lock/access.json
+// convention — a reader must .trim() it.
+function writeIpcToken(): string {
+  const token = randomBytes(32).toString("hex");
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  const tmp = IPC_TOKEN_FILE + ".tmp";
+  writeFileSync(tmp, token + "\n", { mode: 0o600 });
+  chmodSync(tmp, 0o600); // writeFileSync's mode only applies on create; a
+  // leftover .tmp from a crash would otherwise keep its old, possibly looser
+  // permissions. saveAccess (line 381) does not need this; a secret does.
+  renameSync(tmp, IPC_TOKEN_FILE);
+  return token;
+}
+
+// A connection is untrusted until its first message is a valid hello, so an
+// unauthenticated peer must not be able to make us buffer without bound.
+// 4096 bytes is a generous multiple of a real hello (a 64-char hex token
+// plus JSON framing is well under 200 bytes) and small enough that a
+// babbling client dies immediately.
+// ponytail: flat pre-auth cap, no rate limit and no post-auth cap. A
+// token-verified peer is the same OS user; if that stops being true, cap
+// there too.
+const IPC_PRE_AUTH_MAX_BYTES = 4096;
+
+// Constant-time compare. A same-user attacker who can time this can already
+// read the 0600 token file, so === would be defensible — but timingSafeEqual
+// is stdlib, already imported, and three lines. Taking the correct one.
+function ipcTokenMatches(given: unknown, expected: string): boolean {
+  if (typeof given !== "string") return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function handleIpcConnection(socket: NetSocket, token: string): void {
+  // LineBuffer requires string chunks — a raw Buffer can split a multi-byte
+  // character (see scripts/ipc.ts:67-71).
+  socket.setEncoding("utf8");
+  const buf = new LineBuffer();
+  let authed = false;
+  let preAuthBytes = 0;
+  const drop = (why: string) => {
+    process.stderr.write(`${LOG_PREFIX}: ipc: dropped connection (${why})\n`);
+    socket.destroy(); // destroy, not end: fail closed, no half-open socket
+  };
+  // A peer that vanishes mid-write must not take the server down.
+  socket.on("error", () => socket.destroy());
+  socket.on("data", (chunk: string) => {
+    if (!authed) {
+      preAuthBytes += Buffer.byteLength(chunk, "utf8");
+      if (preAuthBytes > IPC_PRE_AUTH_MAX_BYTES) return drop("pre-auth flood");
+    }
+    for (const msg of buf.push(chunk)) {
+      if (!authed) {
+        if (msg.type !== "hello" || !ipcTokenMatches(msg.token, token)) {
+          return drop("bad or missing hello");
+        }
+        authed = true;
+        process.stderr.write(`${LOG_PREFIX}: ipc: secondary connected\n`);
+        continue;
+      }
+      // T02 relays nothing (PRD M1: "accepts connections... logs the rest").
+      // T03 handles `call`; T04 broadcasts `notify`.
+      process.stderr.write(
+        `${LOG_PREFIX}: ipc: ignoring ${msg.type} (relay not implemented yet)\n`,
+      );
+    }
+  });
+}
+
+// ponytail: 1 s. A same-machine socket connect either completes or errors in
+// microseconds; this only bounds a pathological hung listener so startup
+// cannot wedge. Not a PRD value — see .pipeline/spec.md §8.
+const IPC_PROBE_TIMEOUT_MS = 1000;
+
+let ipcServer: NetServer | null = null;
+
+// Thin I/O wrapper: turns a connect attempt into the plain outcome
+// isStaleSocket() decides on. All the logic lives in that pure function.
+function probeIpcSocket(path: string): Promise<SocketProbe> {
+  return new Promise((res) => {
+    const s = connect(path);
+    let settled = false;
+    const done = (p: SocketProbe) => {
+      if (settled) return;
+      settled = true;
+      s.destroy();
+      res(p);
+    };
+    s.setTimeout(IPC_PROBE_TIMEOUT_MS, () =>
+      done({ connected: false, code: "ETIMEDOUT" }),
+    );
+    s.on("connect", () => done({ connected: true }));
+    s.on("error", (err) =>
+      done({ connected: false, code: (err as NodeJS.ErrnoException).code }),
+    );
+  });
+}
+
+// Never throws: a failed IPC listener must not stop this process from being
+// a normal, fully working primary (PRD §6 — the tool list is static and
+// direct execution is unaffected).
+async function startIpcListener(): Promise<void> {
+  try {
+    // resolve(): two terminals can pass the same directory spelled
+    // differently (trailing separator, relative path) and ipcSocketPath
+    // hashes the raw string on Windows, giving two different pipe names.
+    const path = ipcSocketPath(resolve(STATE_DIR));
+    // FR4 is Unix-socket-only: on Windows a dead process's pipe stops
+    // existing, so there is nothing stale to recover from.
+    if (process.platform !== "win32" && existsSync(path)) {
+      if (!isStaleSocket(await probeIpcSocket(path))) {
+        process.stderr.write(
+          `${LOG_PREFIX}: ipc: ${path} is in use; continuing without an IPC listener\n`,
+        );
+        return;
+      }
+      rmSync(path, { force: true });
+    }
+    // Token is written only once listen()'s success callback fires — not
+    // before the bind is attempted. A losing bind (EADDRINUSE-class race;
+    // on win32 this is the ONLY guard, since the stale-socket probe above is
+    // Unix-only) must never overwrite a live primary's token file with one
+    // its listener doesn't know. Until then there is no valid token for a
+    // connection to present, so every connection is dropped.
+    let token: string | null = null;
+    const server = createServer((s) => {
+      if (token === null) {
+        process.stderr.write(
+          `${LOG_PREFIX}: ipc: dropped connection (listener not confirmed up)\n`,
+        );
+        s.destroy();
+        return;
+      }
+      handleIpcConnection(s, token);
+    });
+    server.on("error", (err) => {
+      process.stderr.write(`${LOG_PREFIX}: ipc: listener error: ${err}\n`);
+      ipcServer = null;
+    });
+    server.listen(path, () => {
+      token = writeIpcToken();
+      process.stderr.write(`${LOG_PREFIX}: ipc: listening on ${path}\n`);
+    });
+    server.unref(); // same as every other background handle here (line 702,
+    // line 1905): never the reason an orphan stays alive. Does not stop it
+    // accepting connections.
+    ipcServer = server;
+  } catch (err) {
+    process.stderr.write(
+      `${LOG_PREFIX}: ipc: failed to start listener: ${err}\n`,
+    );
+  }
+}
 
 process.on("unhandledRejection", (err) => {
   process.stderr.write(`${LOG_PREFIX}: unhandled rejection: ${err}\n`);
@@ -2202,6 +2381,18 @@ function shutdown(): void {
   if (shuttingDown) return;
   shuttingDown = true;
   process.stderr.write(`${LOG_PREFIX}: shutting down\n`);
+  // Close the IPC listener BEFORE releasing the singleton lock: releasing
+  // first would open a window where another process can acquire the lock
+  // and start its own listener while this socket/pipe is still bound,
+  // widening the same clobber race startIpcListener() guards against.
+  // Stops accepting and unlinks the Unix socket file. Any open connection is
+  // torn down by the process.exit(0) three lines down, which is what gives a
+  // connected secondary its instant disconnect (PRD §6 tier 1).
+  // ponytail: no explicit socket set to destroy — T04 introduces one for
+  // broadcast, and until then exit does the same job.
+  try {
+    ipcServer?.close();
+  } catch {}
   releaseSingletonLock();
   setTimeout(() => process.exit(0), 2000);
   try {
@@ -3206,5 +3397,6 @@ if (CONFLICT) {
   process.stderr.write(`${LOG_PREFIX}: ${conflictReason}\n`);
 } else {
   process.stderr.write(`${LOG_PREFIX}: starting\n`);
+  await startIpcListener();
   await connectWhatsApp();
 }

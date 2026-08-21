@@ -4,14 +4,15 @@
 // process ("secondary") relays its tool calls through the one that does
 // ("primary") over a local socket/named pipe instead of connecting itself.
 //
-// This module is pure protocol/framing - no socket I/O - so it's
-// unit-testable without a real connection. server.ts owns the actual
-// net.Server/net.Socket wiring.
+// This module is pure protocol/framing and connection decisions - no socket
+// I/O - so it's unit-testable without a real connection. server.ts owns the
+// actual net.Server/net.Socket wiring.
 
 import { createHash } from "node:crypto";
 import { posix } from "node:path";
 
 export type IpcMessage =
+  | { type: "hello"; token: string }
   | { type: "call"; id: string; name: string; args: Record<string, unknown> }
   | { type: "result"; id: string; result: unknown }
   | { type: "notify"; method: string; params: unknown };
@@ -44,7 +45,7 @@ export function encode(msg: IpcMessage): string {
   return JSON.stringify(msg) + "\n";
 }
 
-const IPC_TYPES = new Set(["call", "result", "notify"]);
+const IPC_TYPES = new Set(["hello", "call", "result", "notify"]);
 
 function isIpcMessage(v: unknown): v is IpcMessage {
   return (
@@ -89,4 +90,18 @@ export class LineBuffer {
     }
     return out;
   }
+}
+
+// FR4: a Unix-socket FILE outlives the process that bound it, so its mere
+// existence proves nothing. server.ts probes it with a real connect and
+// passes the outcome here; this decides whether the path is safe to unlink
+// and rebind. Pure, so the decision table is unit-testable without a socket.
+export type SocketProbe = { connected: boolean; code?: string };
+
+export function isStaleSocket(probe: SocketProbe): boolean {
+  if (probe.connected) return false; // someone is listening — never unlink
+  // ECONNREFUSED: the file exists, nobody is accepting — the crashed-primary
+  // leftover FR4 is about. ENOENT: it vanished between our existsSync and
+  // the connect; binding is fine.
+  return probe.code === "ECONNREFUSED" || probe.code === "ENOENT";
 }

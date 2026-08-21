@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { encode, ipcSocketPath, LineBuffer, type IpcMessage } from "./ipc";
+import {
+  encode,
+  ipcSocketPath,
+  isStaleSocket,
+  LineBuffer,
+  type IpcMessage,
+} from "./ipc";
 
 describe("ipcSocketPath", () => {
   test("windows branch returns the exact pipe path", () => {
@@ -49,6 +55,7 @@ describe("ipcSocketPath", () => {
 });
 
 describe("encode", () => {
+  const hello: IpcMessage = { type: "hello", token: "deadbeef" };
   const call: IpcMessage = {
     type: "call",
     id: "1",
@@ -62,8 +69,8 @@ describe("encode", () => {
     params: { connected: true },
   };
 
-  test("round-trips for each of the three message types", () => {
-    for (const msg of [call, result, notify]) {
+  test("round-trips for each of the four message types", () => {
+    for (const msg of [hello, call, result, notify]) {
       expect(JSON.parse(encode(msg))).toEqual(msg);
     }
   });
@@ -134,5 +141,39 @@ describe("LineBuffer", () => {
     const k = Math.floor(encodedB.indexOf("\n") / 2);
     expect(buf.push(encode(a) + encodedB.slice(0, k))).toEqual([a]);
     expect(buf.push(encodedB.slice(k))).toEqual([b]);
+  });
+
+  test("a hello line is recognized and returned", () => {
+    const buf = new LineBuffer();
+    const hello: IpcMessage = { type: "hello", token: "deadbeef" };
+    expect(buf.push(encode(hello))).toEqual([hello]);
+  });
+});
+
+describe("isStaleSocket", () => {
+  test("connected -> false", () => {
+    expect(isStaleSocket({ connected: true })).toBe(false);
+  });
+
+  test("ECONNREFUSED -> true", () => {
+    expect(isStaleSocket({ connected: false, code: "ECONNREFUSED" })).toBe(
+      true,
+    );
+  });
+
+  test("ENOENT -> true", () => {
+    expect(isStaleSocket({ connected: false, code: "ENOENT" })).toBe(true);
+  });
+
+  test("EACCES -> false (fail closed)", () => {
+    expect(isStaleSocket({ connected: false, code: "EACCES" })).toBe(false);
+  });
+
+  test("ETIMEDOUT -> false (fail closed)", () => {
+    expect(isStaleSocket({ connected: false, code: "ETIMEDOUT" })).toBe(false);
+  });
+
+  test("no code -> false (fail closed)", () => {
+    expect(isStaleSocket({ connected: false })).toBe(false);
   });
 });
