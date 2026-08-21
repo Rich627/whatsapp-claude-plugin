@@ -108,7 +108,7 @@ Both fail with a clear error if the group's `roster` flag isn't granted.
 - Ctrl-C cancels cleanly at any point; nothing is written until every question on screen has been answered.
 - A group the wizard adds gets `requireMention: true` (only reply when addressed) — a more cautious default than `group add`'s own CLI default of `false` (reply to everything), deliberately: the wizard is the guided path for a less technical setup, the CLI is for someone already comfortable with explicit flags. Change it after the fact with `group add --mention` or `--no-mention`.
 
-Group/contact names and recency come from caches (`~/.whatsapp-channel/groups-meta.json`, `dm-activity.json`) that only the running server writes — automatically, as WhatsApp reports chat activity, no manual step needed once the account has connected at least once. If it's never connected yet, the wizard has nothing to show; pair it first.
+Group/contact names and recency come from caches (`~/.whatsapp-channel/groups-meta.json`, `dm-activity.json`, `contacts.json`) that only the running server writes — automatically, as WhatsApp reports chat activity, no manual step needed once the account has connected at least once. If it's never connected yet, the wizard has nothing to show; pair it first. `groups-meta.json` is always written; `dm-activity.json` and `contacts.json` follow `WHATSAPP_CACHE_CONTACTS` (see "Names and privacy" above) — with it off (the default), the DM screen has nothing to rank until you turn it on.
 
 It's a terminal command, deliberately not a Claude Code skill: running it yourself, outside any chat, is what makes this true —
 
