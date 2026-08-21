@@ -39,3 +39,58 @@ export function contactName(map: ContactsMap, jid: string): string | undefined {
   const entry = map[jid];
   return entry?.name || entry?.notify;
 }
+
+// A contact cached under its raw @lid key (before Baileys' lid-mapping.update
+// told us the matching phone number) would otherwise be permanently
+// unfindable once server.ts's contactKey() starts resolving that LID to its
+// phone number instead - move the entry to the key contactKey() will
+// actually compute from now on. Whatever's already at the new key wins over
+// the migrating (old-key) entry on any real conflict - there's no reliable
+// way to know which of the two is fresher, so the migrated entry only fills
+// gaps the new key doesn't already have; it never overwrites a value that's
+// already there. Not mergeContact() (its `update` argument always wins),
+// since that's the exact opposite priority this needs.
+export function migrateContactKey(
+  map: ContactsMap,
+  oldKey: string,
+  newKey: string,
+): boolean {
+  if (oldKey === newKey) return false;
+  const stale = map[oldKey];
+  if (!stale) return false;
+  delete map[oldKey];
+  const current = map[newKey] ?? {};
+  map[newKey] = {
+    name: current.name || stale.name,
+    notify: current.notify || stale.notify,
+  };
+  return true;
+}
+
+export type NameResolution =
+  | { ok: true; jid: string }
+  | { ok: false; reason: "not_found" }
+  | { ok: false; reason: "ambiguous"; candidates: string[] };
+
+// NOT the inverse of contactName(): this only matches `.name`, deliberately
+// stricter than contactName()'s name-or-notify display fallback. `.notify`
+// is self-reported by anyone who's ever messaged the account - untrusted -
+// so matching it here would let an attacker set their own display name to a
+// real person's phone number and silently hijack any attempt to mention
+// that number to their own jid instead (no error, since it's a unique
+// match). Display can afford to be permissive; resolving WHO a message
+// actually goes to cannot. Case-insensitive, exact match only, no
+// fuzzy/partial matching - two contacts sharing a saved name is a hard
+// "ambiguous", never a coin-flip pick between them.
+export function resolveByName(map: ContactsMap, name: string): NameResolution {
+  const needle = name.trim().toLowerCase();
+  if (!needle) return { ok: false, reason: "not_found" };
+  const matches: string[] = [];
+  for (const [jid, entry] of Object.entries(map)) {
+    const candidate = (entry.name || "").trim().toLowerCase();
+    if (candidate && candidate === needle) matches.push(jid);
+  }
+  if (matches.length === 0) return { ok: false, reason: "not_found" };
+  if (matches.length > 1) return { ok: false, reason: "ambiguous", candidates: matches };
+  return { ok: true, jid: matches[0] };
+}

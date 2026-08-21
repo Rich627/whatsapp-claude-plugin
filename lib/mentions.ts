@@ -5,16 +5,47 @@
 // exact id it passed in the `mentions` array, so that literal id — not
 // whatever JID we resolve it to internally — is what a later text match must
 // look for.
+import { maskNumber } from "./mask";
+import { resolveByName, type ContactsMap } from "./contacts";
+
+// The array normalizeMentionJids returns can hold the same jid twice under
+// two different `input` spellings (a LID and its phone number for one
+// person, see the test for that case) - deliberately not deduped here,
+// since both spellings must stay independently matchable against text.
+// Any caller building an actual outgoing mentions list from this needs to
+// dedupe at the jid level itself; mentionsForChunk's own [...new Set()]
+// does this at output time, and so does server.ts's document-mode preview
+// path. A future caller that skips that step will get duplicate/aliased
+// jids - this was a real, working guarantee of the pre-refactor API that
+// moving to pairs deliberately traded away for the input-matching fix.
 export type MentionPair = { input: string; jid: string };
 
-// Accept ids in whatever shape the caller has (bare, @-prefixed, LID or
-// phone, full JID) and normalise to a JID, while keeping the original input
-// id next to it so mentionsForChunk can still find "@<id>" as written.
+// Two saved contacts sharing a display name is not something to guess a
+// winner for — the caller must fall back to the real id for that name.
+// Message is built with masked numbers so the ambiguity is resolvable by a
+// human without a raw number ever needing to reach whatever surfaces this
+// error (this is a plain Error, not a special type, because server.ts's
+// tool-call handler already formats any thrown Error into a clean tool
+// failure — no special-casing needed at the call site).
+function ambiguousNameError(name: string, candidates: string[]): Error {
+  const masked = candidates.map((c) => maskNumber(c)).join(", ");
+  return new Error(
+    `"${name}" matches more than one contact (${masked}) — use the number directly, or rename one in your phone.`,
+  );
+}
+
+// Accept ids in whatever shape the caller has (a known contact's name, bare
+// number, @-prefixed, LID or phone, full JID) and normalise to a JID, while
+// keeping the original input next to it so mentionsForChunk can still find
+// "@<input>" as written. Name resolution is tried first: a saved contact's
+// name always wins over treating the same string as a numeric id, since
+// nobody is expected to have a contact named after a valid phone number.
 export function normalizeMentionJids(
   raw: string[],
   lidMap: Record<string, string>,
   jidNormalizedUser: (jid: string) => string,
   jidDecode: (jid: string) => { user: string } | undefined,
+  contactsMap: ContactsMap = {},
 ): MentionPair[] {
   const out: MentionPair[] = [];
   for (const entry of raw) {
@@ -22,6 +53,16 @@ export function normalizeMentionJids(
       .trim()
       .replace(/^@+/, "");
     if (!s) continue;
+
+    const byName = resolveByName(contactsMap, s);
+    if (byName.ok) {
+      out.push({ input: s, jid: byName.jid });
+      continue;
+    }
+    if (byName.reason === "ambiguous") {
+      throw ambiguousNameError(s, byName.candidates);
+    }
+
     let jid: string;
     // A full-JID input's local part can carry a device suffix
     // ("<num>:12@s.whatsapp.net") - reply_to_sender surfaces
@@ -63,20 +104,25 @@ function escapeRegExp(s: string): string {
 
 // A long reply is split into chunks; only attach a mention to the chunk whose
 // text actually references it, so nobody gets pinged once per chunk. Matches
-// against the original input id the caller typed, not the resolved JID —
+// against the original input the caller typed, not the resolved JID —
 // resolution can silently swap a bare number for a cached LID with a
 // different local part, and matching on that instead used to drop the
 // mention from every chunk whenever a mapping happened to be cached. The
-// match requires a digit boundary after the id so a shorter mentioned id
-// that's a text-prefix of a longer one in the same message ("6123" vs
-// "61234567") doesn't falsely attach to the longer one's chunk.
+// match requires a word-character boundary after the input, not just a
+// digit one: that covers a shorter numeric id that's a text-prefix of a
+// longer one ("6123" vs "61234567") *and* a name that's a text-prefix of a
+// longer word ("Akash" vs "Akashi") now that names go through this path too.
+// Case-insensitive: resolveByName() matches a name regardless of casing, so
+// the caller can resolve via "Akash" but write "@akash" mid-sentence
+// without the mismatch silently dropping the mention - a gap that didn't
+// exist before names, since digits have no case.
 export function mentionsForChunk(
   text: string,
   all: MentionPair[],
 ): string[] | undefined {
   if (!all.length) return undefined;
   const hits = all.filter((m) =>
-    new RegExp(`@${escapeRegExp(m.input)}(?!\\d)`).test(text),
+    new RegExp(`@${escapeRegExp(m.input)}(?!\\w)`, "i").test(text),
   );
   return hits.length ? [...new Set(hits.map((m) => m.jid))] : undefined;
 }

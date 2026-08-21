@@ -410,6 +410,15 @@ function recordLidMapping(lid: string, pn: string): void {
     lidMap[nLid] = nPn;
     saveLidMap();
   }
+  // Centralized here, not at each caller: a contact cached under its raw
+  // @lid key (before this resolution was known) needs to move to the
+  // phone key contactKey() will compute from now on, no matter which of
+  // this function's two callers (the passive lid-mapping.update event, or
+  // ensureLidResolved's active fallback) is the one that actually learned
+  // the mapping.
+  if (migrateContactKey(contactsMap, nLid, nPn)) {
+    saveContactsMap();
+  }
 }
 
 function resolveToPhone(jid: string): string {
@@ -1335,7 +1344,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "array",
             items: { type: "string" },
             description:
-              'User ids to @-tag, e.g. ["210363773620264"] — the user_id/lid from an inbound <channel> block (a phone number or full JID also works). You MUST also write the matching "@<id>" into text, using the same id you pass here; the array is what makes WhatsApp render it as a real mention and notify them, the text alone does nothing.',
+              'People to @-tag. Prefer a saved contact\'s name where you know it, e.g. ["Akash"] — a raw number or id never needs to appear anywhere in your own text or reasoning. Falls back to the user_id/lid from an inbound <channel> block (a phone number or full JID also works) for someone with no saved name yet. You MUST also write the matching "@<value>" into text, using the exact same value you pass here (the name, if that\'s what you passed); the array is what makes WhatsApp render it as a real mention and notify them, the text alone does nothing. A name matching more than one saved contact fails the call rather than guessing — use the id for that person instead.',
           },
           files: {
             type: "array",
@@ -1461,6 +1470,7 @@ const handleToolCall = async (req: {
           lidMap,
           jidNormalizedUser,
           jidDecode,
+          contactsMap,
         );
 
         assertAllowedChat(chat_id);
@@ -2535,7 +2545,8 @@ async function connectWhatsApp(): Promise<void> {
 
   sock.ev.on("creds.update", saveCreds);
 
-  // Track LID ↔ phone number mappings for identity resolution
+  // Track LID ↔ phone number mappings for identity resolution.
+  // recordLidMapping also migrates the contacts cache; see its definition.
   sock.ev.on(
     "lid-mapping.update" as any,
     (mapping: { lid: string; pn: string }) => {

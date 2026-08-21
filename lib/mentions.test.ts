@@ -60,6 +60,21 @@ describe("normalizeMentionJids", () => {
     });
   });
 
+  test("full JID with a device suffix: the suffix doesn't end up in the match key", () => {
+    // jidNormalizedUser strips ":5" for `jid`; if `input` kept it, the text
+    // match would look for "@61434505973:5" while the caller wrote plain
+    // "@61434505973" - silently unmatchable.
+    const [pair] = normalizeMentionJids(
+      ["61434505973:5@s.whatsapp.net"],
+      {},
+      jidNormalizedUser,
+    );
+    expect(pair).toEqual({
+      input: "61434505973",
+      jid: "61434505973@s.whatsapp.net",
+    });
+  });
+
   test("a doubled leading @ doesn't produce an empty match key", () => {
     // A single-@ strip left "@61434505973" -> split("@")[0] === "" -> the
     // regex built from that empty input matched almost any "@" in the text.
@@ -87,6 +102,76 @@ describe("normalizeMentionJids", () => {
       { input: "184710990000999", jid: "184710990000999@lid" },
       { input: "61403911675", jid: "184710990000999@lid" },
     ]);
+  });
+
+  test("a known contact's name resolves to their jid, input stays the name", () => {
+    const contactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
+    const [pair] = normalizeMentionJids(
+      ["Akash"],
+      {},
+      jidNormalizedUser,
+      contactsMap,
+    );
+    expect(pair).toEqual({ input: "Akash", jid: "x@s.whatsapp.net" });
+  });
+
+  test("name resolution wins over treating the same string as a numeric id", () => {
+    // Nobody has a contact literally named after a phone number, but if
+    // they did, the name lookup must win - that's the whole point of
+    // preferring names over raw digits.
+    const contactsMap = { "x@s.whatsapp.net": { name: "61434505973" } };
+    const [pair] = normalizeMentionJids(
+      ["61434505973"],
+      {},
+      jidNormalizedUser,
+      contactsMap,
+    );
+    expect(pair.jid).toBe("x@s.whatsapp.net");
+  });
+
+  test("a name not in the contacts cache falls through to the old id-based path", () => {
+    const [pair] = normalizeMentionJids(
+      ["61434505973"],
+      {},
+      jidNormalizedUser,
+      { "y@s.whatsapp.net": { name: "SomeoneElse" } },
+    );
+    expect(pair).toEqual({
+      input: "61434505973",
+      jid: "61434505973@s.whatsapp.net",
+    });
+  });
+
+  test("no contactsMap passed at all: still works, old behaviour unchanged", () => {
+    const [pair] = normalizeMentionJids(["61434505973"], {}, jidNormalizedUser);
+    expect(pair.jid).toBe("61434505973@s.whatsapp.net");
+  });
+
+  test("two contacts sharing a name: throws instead of guessing", () => {
+    const contactsMap = {
+      "a@s.whatsapp.net": { name: "Neha" },
+      "b@s.whatsapp.net": { name: "Neha" },
+    };
+    expect(() =>
+      normalizeMentionJids(["Neha"], {}, jidNormalizedUser, contactsMap),
+    ).toThrow(/matches more than one contact/);
+  });
+
+  test("the ambiguous-name error shows masked numbers, not raw ones", () => {
+    const contactsMap = {
+      "918419935122@s.whatsapp.net": { name: "Neha" },
+      "61405070760@s.whatsapp.net": { name: "Neha" },
+    };
+    try {
+      normalizeMentionJids(["Neha"], {}, jidNormalizedUser, contactsMap);
+      throw new Error("expected normalizeMentionJids to throw");
+    } catch (err) {
+      const msg = (err as Error).message;
+      expect(msg).toContain("•••••5122");
+      expect(msg).toContain("•••••0760");
+      expect(msg).not.toContain("918419935122");
+      expect(msg).not.toContain("61405070760");
+    }
   });
 });
 
@@ -161,5 +246,46 @@ describe("mentionsForChunk", () => {
       pairs,
     );
     expect(result).toEqual(["184710990000999@lid"]);
+  });
+
+  test("a name-based mention matches its @<Name> in text", () => {
+    const contactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
+    const pairs = normalizeMentionJids(
+      ["Akash"],
+      {},
+      jidNormalizedUser,
+      contactsMap,
+    );
+    const result = mentionsForChunk("Hey @Akash, can you check?", pairs);
+    expect(result).toEqual(["x@s.whatsapp.net"]);
+  });
+
+  test("a name that's a text-prefix of a longer word doesn't false-match", () => {
+    // Same class of bug as the numeric-prefix case, now for names: "Akash"
+    // must not match inside "Akashi".
+    const contactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
+    const pairs = normalizeMentionJids(
+      ["Akash"],
+      {},
+      jidNormalizedUser,
+      contactsMap,
+    );
+    const result = mentionsForChunk("Have you met @Akashi?", pairs);
+    expect(result).toBeUndefined();
+  });
+
+  test("casing drift between the resolved name and the text still matches", () => {
+    // resolveByName matches "Akash"/"akash"/"AKASH" identically, so the
+    // text match must not silently require the exact casing the caller
+    // happened to resolve with.
+    const contactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
+    const pairs = normalizeMentionJids(
+      ["Akash"],
+      {},
+      jidNormalizedUser,
+      contactsMap,
+    );
+    const result = mentionsForChunk("cc @akash for visibility", pairs);
+    expect(result).toEqual(["x@s.whatsapp.net"]);
   });
 });
