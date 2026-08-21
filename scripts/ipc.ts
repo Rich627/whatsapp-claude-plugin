@@ -105,3 +105,60 @@ export function isStaleSocket(probe: SocketProbe): boolean {
   // the connect; binding is fine.
   return probe.code === "ECONNREFUSED" || probe.code === "ENOENT";
 }
+
+// The primary answers a valid hello with {"type":"result","id":IPC_HELLO_ID}
+// before any relayed call is answered. Without it a secondary cannot tell
+// "accepted" from "about to be destroyed for a bad token": server.ts's drop()
+// destroys the socket asynchronously, so a call written immediately after a
+// rejected hello is silently lost. Reusing `result` keeps the protocol at
+// four shapes; echoing the hello back instead would put the shared secret on
+// the wire a second time for no gain. Call ids are decimal counters
+// (PendingCalls), so none of them can ever collide with this.
+export const IPC_HELLO_ID = "hello";
+
+// Correlates a relayed call with the primary's eventual result. Pure: the
+// caller owns the socket and hands the id/result pairs in as they arrive.
+// ponytail: no per-call timeout - close/error is the liveness signal. Add
+// one only if a real hang shows up.
+export class PendingCalls {
+  private seq = 0;
+  private pending = new Map<
+    string,
+    { resolve: (v: unknown) => void; reject: (e: Error) => void }
+  >();
+
+  // A call id only has to be unique for the life of one connection - it never
+  // leaves the local socket and is never used for anything security-relevant,
+  // so a counter beats randomBytes here (unlike the token in server.ts).
+  create(): { id: string; result: Promise<unknown> } {
+    const id = String(++this.seq);
+    let entry!: { resolve: (v: unknown) => void; reject: (e: Error) => void };
+    const result = new Promise<unknown>((resolve, reject) => {
+      entry = { resolve, reject };
+    });
+    this.pending.set(id, entry);
+    return { id, result };
+  }
+
+  // Returns false for an id that was never issued or was already settled -
+  // a duplicate or bogus result must be ignorable, never a throw and never a
+  // double-resolve.
+  settle(id: string, result: unknown): boolean {
+    const entry = this.pending.get(id);
+    if (!entry) return false;
+    this.pending.delete(id);
+    entry.resolve(result);
+    return true;
+  }
+
+  // The connection died: every in-flight call rejects with the same reason,
+  // and the tracker is left empty.
+  failAll(err: Error): void {
+    for (const entry of this.pending.values()) entry.reject(err);
+    this.pending.clear();
+  }
+
+  get size(): number {
+    return this.pending.size;
+  }
+}

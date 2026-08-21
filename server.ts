@@ -69,9 +69,12 @@ import {
   type Socket as NetSocket,
 } from "net";
 import {
+  encode,
+  IPC_HELLO_ID,
   ipcSocketPath,
   isStaleSocket,
   LineBuffer,
+  PendingCalls,
   type SocketProbe,
 } from "./scripts/ipc";
 
@@ -372,11 +375,50 @@ function handleIpcConnection(socket: NetSocket, token: string): void {
           return drop("bad or missing hello");
         }
         authed = true;
+        // Tell the secondary it is safe to start relaying. Without this it
+        // cannot distinguish acceptance from a drop() that has not landed yet.
+        socket.write(
+          encode({ type: "result", id: IPC_HELLO_ID, result: "ok" }),
+        );
         process.stderr.write(`${LOG_PREFIX}: ipc: secondary connected\n`);
         continue;
       }
-      // T02 relays nothing (PRD M1: "accepts connections... logs the rest").
-      // T03 handles `call`; T04 broadcasts `notify`.
+      if (msg.type === "call") {
+        // LineBuffer only checks the type tag (scripts/ipc.ts:82-85), so a
+        // truncated call can arrive with no id/name.
+        if (typeof msg.id !== "string" || typeof msg.name !== "string") {
+          process.stderr.write(`${LOG_PREFIX}: ipc: ignoring malformed call\n`);
+          continue;
+        }
+        const { id, name } = msg;
+        const args = (msg.args ?? {}) as Record<string, unknown>;
+        // FR6: the exact same handleToolCall a direct call runs - not a copy,
+        // and deliberately not the unreplied-suffix wrapper (spec §0.1: the
+        // secondary adds that itself from the shared message log, and doing it
+        // here too would append it twice).
+        void handleToolCall({ params: { name, arguments: args } })
+          .then((result) => {
+            if (!socket.destroyed) {
+              socket.write(encode({ type: "result", id, result }));
+            }
+          })
+          .catch((err) => {
+            // handleToolCall catches its own errors; this covers the
+            // unexpected (e.g. getUnreplied-adjacent I/O) so a secondary can
+            // never be left hanging on a call it will never get an answer to.
+            if (socket.destroyed) return;
+            const text = `${name} failed: ${err instanceof Error ? err.message : String(err)}`;
+            socket.write(
+              encode({
+                type: "result",
+                id,
+                result: { content: [{ type: "text", text }], isError: true },
+              }),
+            );
+          });
+        continue;
+      }
+      // T04 broadcasts `notify`; nothing else is expected on this socket.
       process.stderr.write(
         `${LOG_PREFIX}: ipc: ignoring ${msg.type} (relay not implemented yet)\n`,
       );
@@ -475,6 +517,147 @@ process.on("unhandledRejection", (err) => {
 process.on("uncaughtException", (err) => {
   process.stderr.write(`${LOG_PREFIX}: uncaught exception: ${err}\n`);
 });
+
+// ─── IPC relay (secondary) ─────────────────────────────────────────────
+// PRD §11 M2: a process that lost the singleton lock makes ONE attempt to
+// reach the primary's listener and relay its tool calls there instead of
+// serving the whatsapp_unavailable stub. One attempt, at startup, the same
+// shape as acquireSingletonLock()'s single attempt - retry, reconnect and
+// promotion are T05.
+
+type IpcRelay = {
+  call(name: string, args: Record<string, unknown>): Promise<unknown>;
+};
+
+const IPC_CLOSED_MSG = "primary connection closed";
+
+// Fail closed (PRD §9): a missing, unreadable or empty token file is the same
+// outcome as "no primary reachable" - we do not connect without one. Never
+// log the value.
+function readIpcToken(): string | null {
+  try {
+    const token = readFileSync(IPC_TOKEN_FILE, "utf8").trim();
+    return token || null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolves to a relay handle, or null for EVERY failure: no token, nothing
+// listening, connection refused, handshake refused (stale token), handshake
+// timeout. Never throws, never exits - the caller keeps today's stub.
+function connectToPrimary(): Promise<IpcRelay | null> {
+  return new Promise((res) => {
+    const token = readIpcToken();
+    if (!token) {
+      process.stderr.write(
+        `${LOG_PREFIX}: ipc: no usable token; staying in stub mode\n`,
+      );
+      res(null);
+      return;
+    }
+
+    const pending = new PendingCalls();
+    const s = connect(ipcSocketPath(resolve(STATE_DIR)));
+    s.setEncoding("utf8");
+    // Deliberately left ref'd, unlike every other background handle in this
+    // file. This runs before the top-level `await` below settles, and at
+    // that point nothing else in the event loop is ref'd yet (the MCP stdio
+    // transport connects hundreds of lines later) — on this runtime, unref'ing
+    // this socket here can stop the event loop from delivering any further
+    // events on it at all, so the hello ack (or the timeout meant to catch
+    // its absence) never arrives and startup hangs forever. See
+    // .pipeline/review.md for the live reproduction.
+    const buf = new LineBuffer();
+    let settled = false;
+
+    const fail = (why: string) => {
+      if (settled) return;
+      settled = true;
+      process.stderr.write(
+        `${LOG_PREFIX}: ipc: ${why}; staying in stub mode\n`,
+      );
+      s.destroy();
+      res(null);
+    };
+
+    s.setTimeout(IPC_PROBE_TIMEOUT_MS, () => fail("handshake timed out"));
+
+    s.on("connect", () => {
+      s.write(encode({ type: "hello", token }));
+    });
+
+    s.on("error", (err) => {
+      pending.failAll(new Error(IPC_CLOSED_MSG));
+      // T05 retries this
+      fail(`connect failed (${(err as NodeJS.ErrnoException).code ?? err})`);
+    });
+
+    s.on("close", () => {
+      pending.failAll(new Error(IPC_CLOSED_MSG));
+      // T05 retries this
+      fail("primary closed the connection");
+    });
+
+    s.on("data", (chunk: string) => {
+      for (const msg of buf.push(chunk)) {
+        if (msg.type !== "result") continue; // notify is T04 — ignore silently
+        if (msg.id === IPC_HELLO_ID) {
+          if (settled) continue;
+          settled = true;
+          s.setTimeout(0); // idle timer would otherwise fire on a quiet session
+          // connectToPrimary() is only ever invoked from the `CONFLICT ? ...`
+          // call below, so CONFLICT is non-null for the lifetime of this call.
+          process.stderr.write(
+            `${LOG_PREFIX}: ipc: connected to primary (pid ${CONFLICT!.pid})\n`,
+          );
+          res(relay);
+          continue;
+        }
+        pending.settle(msg.id, msg.result);
+      }
+    });
+
+    const relay: IpcRelay = {
+      call(name, args) {
+        if (s.destroyed) return Promise.reject(new Error(IPC_CLOSED_MSG));
+        const { id, result } = pending.create();
+        try {
+          s.write(encode({ type: "call", id, name, args }));
+        } catch (err) {
+          // A write failure on a local pipe means the connection is gone; reject
+          // through the tracker so the promise we just handed out settles.
+          pending.failAll(err instanceof Error ? err : new Error(String(err)));
+        }
+        return result;
+      },
+    };
+  });
+}
+
+const ipcRelay: IpcRelay | null = CONFLICT ? await connectToPrimary() : null;
+
+// The primary is same-user and token-verified, but this is still another
+// process's JSON. A result that is not shaped like a CallToolResult must not
+// reach the MCP client as one.
+function asCallToolResult(v: unknown, name: string): CallToolResult {
+  if (
+    v &&
+    typeof v === "object" &&
+    Array.isArray((v as { content?: unknown }).content)
+  ) {
+    return v as CallToolResult;
+  }
+  return {
+    content: [
+      {
+        type: "text",
+        text: `${name} failed: primary returned an unrecognized result`,
+      },
+    ],
+    isError: true,
+  };
+}
 
 // Permission-reply spec — 5 lowercase letters a-z minus 'l'. Case-insensitive.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
@@ -1611,7 +1794,7 @@ const mcp = new Server(
       // Conflict first: instructions are one of the few things every MCP
       // client must put in front of the model, so this is where a refused
       // server gets to explain itself.
-      ...(CONFLICT
+      ...(CONFLICT && !ipcRelay
         ? [
             `WHATSAPP UNAVAILABLE IN THIS SESSION. ${conflictReason} Tell the user this if they ask about WhatsApp; do not attempt to send messages.`,
             "",
@@ -1906,6 +2089,17 @@ const handleToolCall = async (req: {
 }): Promise<CallToolResult> => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>;
   try {
+    // FR1/FR6: a secondary runs no tool locally - it hands the call to the
+    // primary, which executes it through this same function. One fork, one
+    // execution path. The unreplied suffix is added by our own
+    // CallToolRequestSchema wrapper below, from the shared message log - not
+    // by the primary (see .pipeline/spec.md §0.1).
+    if (ipcRelay) {
+      return asCallToolResult(
+        await ipcRelay.call(req.params.name, args),
+        req.params.name,
+      );
+    }
     switch (req.params.name) {
       case "reply": {
         const chat_id = args.chat_id as string;
@@ -3377,24 +3571,33 @@ async function connectWhatsApp(): Promise<void> {
 }
 
 if (CONFLICT) {
-  // Registered last, so these replace the real handlers. Exposing reply/react
-  // in conflict mode would be worse than exposing nothing: they would accept a
-  // message, fail to send it, and the agent would report it as delivered.
-  mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
-      {
-        name: "whatsapp_unavailable",
-        description: `WhatsApp is not available in this session. ${conflictReason} No other WhatsApp tool exists here.`,
-        inputSchema: { type: "object", properties: {} },
-      },
-    ],
-  }));
-  mcp.setRequestHandler(CallToolRequestSchema, async () => ({
-    content: [{ type: "text", text: conflictReason }],
-  }));
-  // Baileys is never touched here, so the one-connection invariant holds
-  // exactly as it did when this path called process.exit(2).
-  process.stderr.write(`${LOG_PREFIX}: ${conflictReason}\n`);
+  if (ipcRelay) {
+    // The real ListTools/CallTool handlers registered above stay in effect;
+    // handleToolCall's relay branch sends every call to the primary. PRD §6:
+    // the tool list is static, only what happens on a call changes.
+    process.stderr.write(
+      `${LOG_PREFIX}: relaying tool calls to the primary (pid ${CONFLICT.pid})\n`,
+    );
+  } else {
+    // Registered last, so these replace the real handlers. Exposing reply/react
+    // in conflict mode would be worse than exposing nothing: they would accept a
+    // message, fail to send it, and the agent would report it as delivered.
+    mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: [
+        {
+          name: "whatsapp_unavailable",
+          description: `WhatsApp is not available in this session. ${conflictReason} No other WhatsApp tool exists here.`,
+          inputSchema: { type: "object", properties: {} },
+        },
+      ],
+    }));
+    mcp.setRequestHandler(CallToolRequestSchema, async () => ({
+      content: [{ type: "text", text: conflictReason }],
+    }));
+    // Baileys is never touched here, so the one-connection invariant holds
+    // exactly as it did when this path called process.exit(2).
+    process.stderr.write(`${LOG_PREFIX}: ${conflictReason}\n`);
+  }
 } else {
   process.stderr.write(`${LOG_PREFIX}: starting\n`);
   await startIpcListener();

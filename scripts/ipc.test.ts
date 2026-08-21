@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
   encode,
+  IPC_HELLO_ID,
   ipcSocketPath,
   isStaleSocket,
   LineBuffer,
+  PendingCalls,
   type IpcMessage,
 } from "./ipc";
 
@@ -175,5 +177,71 @@ describe("isStaleSocket", () => {
 
   test("no code -> false (fail closed)", () => {
     expect(isStaleSocket({ connected: false })).toBe(false);
+  });
+});
+
+describe("PendingCalls", () => {
+  test("settle with the matching id resolves that call's promise with the exact value", async () => {
+    const pc = new PendingCalls();
+    const { id, result } = pc.create();
+    expect(pc.settle(id, { ok: true, n: 42 })).toBe(true);
+    expect(await result).toEqual({ ok: true, n: 42 });
+  });
+
+  test("two concurrent calls get different ids; settling the second resolves only the second", async () => {
+    const pc = new PendingCalls();
+    const first = pc.create();
+    const second = pc.create();
+    expect(first.id).not.toBe(second.id);
+    expect(pc.settle(second.id, "second")).toBe(true);
+    expect(await second.result).toBe("second");
+    expect(pc.size).toBe(1);
+    first.result.catch(() => {}); // still pending; observed to avoid an unhandled rejection at test end
+  });
+
+  test("settle with an id that was never issued returns false and throws nothing", () => {
+    const pc = new PendingCalls();
+    expect(pc.settle("999", "whatever")).toBe(false);
+  });
+
+  test("a second settle for an already-settled id returns false and does not double-resolve", async () => {
+    const pc = new PendingCalls();
+    const { id, result } = pc.create();
+    expect(pc.settle(id, "first")).toBe(true);
+    expect(await result).toBe("first");
+    expect(pc.settle(id, "second")).toBe(false);
+    expect(await result).toBe("first");
+  });
+
+  test("failAll rejects an in-flight call with the given error and leaves size 0", async () => {
+    const pc = new PendingCalls();
+    const { id, result } = pc.create();
+    // Reject before attaching the matcher, not after: bun:test 1.3.14 hangs
+    // when `expect(pendingPromise).rejects` is attached to a promise that is
+    // still pending and only settles afterward (confirmed in isolation,
+    // unrelated to PendingCalls itself - a bare captured-resolver Promise
+    // reproduces it too). Rejecting first sidesteps it with no change in
+    // what's asserted.
+    pc.failAll(new Error("connection closed"));
+    await expect(result).rejects.toThrow("connection closed");
+    expect(pc.size).toBe(0);
+    void id;
+  });
+
+  test("settle after failAll for that same id returns false", () => {
+    const pc = new PendingCalls();
+    const { id, result } = pc.create();
+    result.catch(() => {});
+    pc.failAll(new Error("gone"));
+    expect(pc.settle(id, "too late")).toBe(false);
+  });
+
+  test("ids never collide with IPC_HELLO_ID", () => {
+    const pc = new PendingCalls();
+    for (let i = 0; i < 5; i++) {
+      const { id, result } = pc.create();
+      result.catch(() => {});
+      expect(id).not.toBe(IPC_HELLO_ID);
+    }
   });
 });
