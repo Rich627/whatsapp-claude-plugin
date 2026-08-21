@@ -364,6 +364,11 @@ function handleIpcConnection(socket: NetSocket, token: string): void {
   };
   // A peer that vanishes mid-write must not take the server down.
   socket.on("error", () => socket.destroy());
+  // Node always emits "close" after destroy(), so this one listener covers
+  // both the error path above and a normal disconnect - no separate
+  // error-path removal needed. A no-op delete() before the socket ever
+  // authed (never added) is harmless.
+  socket.on("close", () => secondarySockets.delete(socket));
   socket.on("data", (chunk: string) => {
     if (!authed) {
       preAuthBytes += Buffer.byteLength(chunk, "utf8");
@@ -380,6 +385,7 @@ function handleIpcConnection(socket: NetSocket, token: string): void {
         socket.write(
           encode({ type: "result", id: IPC_HELLO_ID, result: "ok" }),
         );
+        secondarySockets.add(socket);
         process.stderr.write(`${LOG_PREFIX}: ipc: secondary connected\n`);
         continue;
       }
@@ -418,9 +424,10 @@ function handleIpcConnection(socket: NetSocket, token: string): void {
           });
         continue;
       }
-      // T04 broadcasts `notify`; nothing else is expected on this socket.
+      // A secondary is never expected to send `notify` (that's primary ->
+      // secondary only, via broadcastToSecondaries) or a second `hello`.
       process.stderr.write(
-        `${LOG_PREFIX}: ipc: ignoring ${msg.type} (relay not implemented yet)\n`,
+        `${LOG_PREFIX}: ipc: ignoring unexpected ${msg.type} from secondary\n`,
       );
     }
   });
@@ -432,6 +439,18 @@ function handleIpcConnection(socket: NetSocket, token: string): void {
 const IPC_PROBE_TIMEOUT_MS = 1000;
 
 let ipcServer: NetServer | null = null;
+
+// PRD §11 M3 / FR2: every currently-connected, token-verified secondary,
+// for broadcasting inbound-message notifications to. Populated on a
+// successful hello (handleIpcConnection), pruned on socket close.
+const secondarySockets = new Set<NetSocket>();
+
+function broadcastToSecondaries(method: string, params: unknown): void {
+  const frame = encode({ type: "notify", method, params });
+  for (const s of secondarySockets) {
+    if (!s.destroyed) s.write(frame);
+  }
+}
 
 // Thin I/O wrapper: turns a connect attempt into the plain outcome
 // isStaleSocket() decides on. All the logic lives in that pure function.
@@ -601,7 +620,22 @@ function connectToPrimary(): Promise<IpcRelay | null> {
 
     s.on("data", (chunk: string) => {
       for (const msg of buf.push(chunk)) {
-        if (msg.type !== "result") continue; // notify is T04 — ignore silently
+        if (msg.type === "notify") {
+          // PRD §11 M3 / FR2: re-emit the primary's inbound-message
+          // notification to this secondary's own MCP client, unchanged.
+          void mcp
+            .notification({
+              method: msg.method,
+              params: msg.params as Record<string, unknown>,
+            })
+            .catch((err) => {
+              process.stderr.write(
+                `${LOG_PREFIX}: ipc: failed to re-emit notification: ${err}\n`,
+              );
+            });
+          continue;
+        }
+        if (msg.type !== "result") continue;
         if (msg.id === IPC_HELLO_ID) {
           if (settled) continue;
           settled = true;
@@ -3095,51 +3129,51 @@ async function handleMessage(msg: WAMessage): Promise<void> {
     ...(groupName ? { group_name: groupName } : {}),
   });
 
-  // Emit channel notification
+  // Emit channel notification. Built once and reused for the broadcast
+  // below (PRD §11 M3/FR2) so a secondary's session sees byte-identical
+  // content to the primary's own - never a second, re-derived copy.
+  const notifyParams = {
+    content: contentText,
+    meta: {
+      chat_id: remoteJid,
+      message_id: messageId,
+      user: senderName,
+      user_id: senderJid,
+      user_phone: senderPhone,
+      ts: new Date(timestamp * 1000).toISOString(),
+      ...(ACCOUNT_NAME ? { account: ACCOUNT_NAME } : {}),
+      ...(isGroup
+        ? {
+            chat_type: "group",
+            group_name: groupName,
+            group_config_path: groupConfigPath(remoteJid),
+            group_memory_path: groupMemoryPath(remoteJid),
+          }
+        : {}),
+      ...(imagePath ? { image_path: imagePath } : {}),
+      ...(attachment
+        ? {
+            attachment_kind: attachment.kind,
+            attachment_file_id: attachment.file_id,
+            ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+            ...(attachment.name ? { attachment_name: attachment.name } : {}),
+          }
+        : {}),
+      ...(replyToId ? { reply_to_id: replyToId } : {}),
+      ...(replyToSender ? { reply_to_sender: replyToSender } : {}),
+    },
+  };
   mcp
     .notification({
       method: "notifications/claude/channel",
-      params: {
-        content: contentText,
-        meta: {
-          chat_id: remoteJid,
-          message_id: messageId,
-          user: senderName,
-          user_id: senderJid,
-          user_phone: senderPhone,
-          ts: new Date(timestamp * 1000).toISOString(),
-          ...(ACCOUNT_NAME ? { account: ACCOUNT_NAME } : {}),
-          ...(isGroup
-            ? {
-                chat_type: "group",
-                group_name: groupName,
-                group_config_path: groupConfigPath(remoteJid),
-                group_memory_path: groupMemoryPath(remoteJid),
-              }
-            : {}),
-          ...(imagePath ? { image_path: imagePath } : {}),
-          ...(attachment
-            ? {
-                attachment_kind: attachment.kind,
-                attachment_file_id: attachment.file_id,
-                ...(attachment.mime
-                  ? { attachment_mime: attachment.mime }
-                  : {}),
-                ...(attachment.name
-                  ? { attachment_name: attachment.name }
-                  : {}),
-              }
-            : {}),
-          ...(replyToId ? { reply_to_id: replyToId } : {}),
-          ...(replyToSender ? { reply_to_sender: replyToSender } : {}),
-        },
-      },
+      params: notifyParams,
     })
     .catch((err) => {
       process.stderr.write(
         `${LOG_PREFIX}: failed to deliver inbound to Claude: ${err}\n`,
       );
     });
+  broadcastToSecondaries("notifications/claude/channel", notifyParams);
 }
 
 // ─── Baileys connection with retry ─────────────────────────────────────

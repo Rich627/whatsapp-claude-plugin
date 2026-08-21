@@ -48,8 +48,16 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // A fake primary that speaks the real protocol: acks a matching hello, then
 // answers every `call` with a recognizable CallToolResult so the test can
-// prove the reply actually crossed the socket, round trip.
-function startFakePrimary(dir: string, token: string) {
+// prove the reply actually crossed the socket, round trip. `notifyAfterHello`
+// (T04) additionally pushes one unprompted `notify` frame right after the
+// hello ack, the same way a real primary broadcasts an inbound message to an
+// already-connected secondary - proves the re-emit path without needing a
+// second connection or reshaping this fixture for every caller.
+function startFakePrimary(
+  dir: string,
+  token: string,
+  notifyAfterHello?: { method: string; params: unknown },
+) {
   const path = ipcSocketPath(resolve(dir));
   const srv = createServer((s) => {
     s.setEncoding("utf8");
@@ -65,6 +73,8 @@ function startFakePrimary(dir: string, token: string) {
           }
           authed = true;
           s.write(encode({ type: "result", id: IPC_HELLO_ID, result: "ok" }));
+          if (notifyAfterHello)
+            s.write(encode({ type: "notify", ...notifyAfterHello }));
           continue;
         }
         if (msg.type === "call") {
@@ -166,6 +176,82 @@ describe("ipc relay (secondary)", () => {
       // its result came back through handleToolCall's relay branch - not a
       // local stub answer.
       expect(stdout).toContain("relayed:unreplied");
+    } finally {
+      child.kill();
+      primary.close();
+    }
+  }, 60_000);
+
+  test("a real secondary re-emits a broadcast notify as its own MCP notification (PRD FR2)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wa-relay-notify-"));
+    const token = "b".repeat(64);
+    writeFileSync(join(dir, ".ipc-token"), token + "\n", { mode: 0o600 });
+    writeFileSync(
+      join(dir, ".server.lock"),
+      `${process.pid}\n${ownStartTime()}\n\n`,
+    );
+
+    const notifyParams = {
+      content: "hello from primary",
+      meta: { chat_id: "1234@s.whatsapp.net", message_id: "abc" },
+    };
+    const primary = await startFakePrimary(dir, token, {
+      method: "notifications/claude/channel",
+      params: notifyParams,
+    });
+    const child = spawn("bun", [SERVER], {
+      env: { ...process.env, WHATSAPP_STATE_DIR: dir },
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (d) => (stderr += d));
+
+    try {
+      for (
+        let i = 0;
+        i < 60 && !stderr.includes("ipc: connected to primary");
+        i++
+      ) {
+        await sleep(500);
+      }
+      expect(stderr).toContain("ipc: connected to primary");
+
+      child.stdin.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "t", version: "1" },
+          },
+        }) + "\n",
+      );
+      for (let i = 0; i < 40 && !stdout.includes('"id":1'); i++) {
+        await sleep(250);
+      }
+      expect(stdout).toContain('"id":1');
+
+      // The fake primary pushed its `notify` frame right after the hello ack
+      // (before `initialize` even completes), so by the time the secondary
+      // has surfaced the initialize response it must already have re-emitted
+      // the notification as a real JSON-RPC message on its own stdout.
+      for (
+        let i = 0;
+        i < 40 && !stdout.includes("notifications/claude/channel");
+        i++
+      ) {
+        await sleep(250);
+      }
+      expect(stdout).toContain("notifications/claude/channel");
+      expect(stdout).toContain("hello from primary");
+      expect(stdout).toContain("1234@s.whatsapp.net");
     } finally {
       child.kill();
       primary.close();
