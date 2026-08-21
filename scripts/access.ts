@@ -320,8 +320,12 @@ async function wizard(args: string[]): Promise<void> {
   let configured = 0;
   try {
     for (const [jid, g] of candidates) {
-      process.stdout.write(`\n${g.name}  (${g.memberCount} member(s))\n  ${jid}\n`);
-      const canAct = (await ask("  Can Claude reply here? [y/N] "))
+      process.stdout.write(
+        `\n${g.name}  (${g.memberCount} member(s))\n  ${jid}\n\n` +
+          "  Claude can reply in this group without ever seeing who's in it.\n" +
+          "  Seeing names only matters for \"@all\" mentions.\n\n",
+      );
+      const canAct = (await ask("  Let Claude reply here? [y/N] "))
         .trim()
         .toLowerCase();
       if (canAct !== "y" && canAct !== "yes") {
@@ -329,19 +333,16 @@ async function wizard(args: string[]): Promise<void> {
         continue;
       }
       const wantsRoster = (
-        await ask("  Also let Claude see member names, for @all mentions? [y/N] ")
+        await ask("  Let Claude see names too, for @all? [y/N] ")
       )
         .trim()
         .toLowerCase();
+      const roster = wantsRoster === "y" || wantsRoster === "yes";
       // requireMention defaults to true here (unlike `group add`'s CLI
       // default of false): a group reached through the guided consent flow
       // gets the more cautious default of only responding when addressed,
       // not to every message. Change it later with `group add --mention`.
-      a.groups[jid] = {
-        requireMention: true,
-        allowFrom: [],
-        roster: wantsRoster === "y" || wantsRoster === "yes",
-      };
+      a.groups[jid] = { requireMention: true, allowFrom: [], roster };
       provisionGroupFiles(jid);
       // Saved after EVERY group, not once at the end: this loop can run for
       // a while (a real answer per group), and a mid-session Ctrl-C used to
@@ -350,7 +351,11 @@ async function wizard(args: string[]): Promise<void> {
       // losing the owner's answers.
       save(a);
       configured++;
-      process.stdout.write(`  Added (roster: ${a.groups[jid].roster}).\n`);
+      process.stdout.write(
+        roster
+          ? "  Added. Claude can reply here and see member names, for @all mentions.\n"
+          : "  Added. Claude can reply, but has no visibility into who's in this group.\n",
+      );
     }
   } finally {
     rl.close();
