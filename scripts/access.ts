@@ -302,16 +302,31 @@ function group(args: string[]): void {
   }
   if (sub !== "add") die(`Unknown group command "${sub}".\n\n${USAGE}`);
 
+  // Merge into an existing entry, don't overwrite it: re-adding an
+  // already-configured group to change just one thing (e.g. --roster)
+  // used to silently reset every OTHER flag back to its default
+  // (--mention lost, --allow cleared) since this always wrote a whole new
+  // object. Now an omitted flag keeps whatever was already there; only a
+  // flag actually passed changes anything. --allow "" (empty, but passed)
+  // still explicitly clears the allowlist - omitting --allow entirely is
+  // what preserves it.
+  const existing = a.groups[jid];
   a.groups[jid] = {
-    requireMention: mention,
-    allowFrom: allow?.split(",").map((s) => s.trim()) ?? [],
-    roster,
+    requireMention: mention || (existing?.requireMention ?? false),
+    allowFrom:
+      allow !== undefined
+        ? allow
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : (existing?.allowFrom ?? []),
+    roster: roster || (existing?.roster ?? false),
   };
   save(a);
 
   const config = provisionGroupFiles(jid);
   process.stdout.write(
-    `Added ${jid} (mention required: ${a.groups[jid].requireMention}, roster: ${a.groups[jid].roster}).\nEdit its personality at ${config}\n`,
+    `${existing ? "Updated" : "Added"} ${jid} (mention required: ${a.groups[jid].requireMention}, roster: ${a.groups[jid].roster}).\nEdit its personality at ${config}\n`,
   );
 }
 

@@ -53,6 +53,8 @@ Group JIDs end in `@g.us`. To find one, add the linked device to the group — t
 
 With the default `requireMention: false`, the server responds to every message. Pass `--mention` to require @mention, or `--allow jid1,jid2` to restrict which members can trigger it. Pass `--roster` to also grant roster access (see below) — off by default, same as everything else.
 
+Running `group add` again on an already-configured group **merges**, it doesn't start over: any flag you don't pass this time keeps whatever was already set. Adding `--roster` to a group that already has `--mention` on doesn't reset `--mention` back off — only the flags you actually pass change anything.
+
 ```
 /whatsapp-claude-channel:access group add 120363424405607157@g.us
 /whatsapp-claude-channel:access group add 120363424405607157@g.us --mention

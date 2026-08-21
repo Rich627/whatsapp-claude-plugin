@@ -276,6 +276,45 @@ describe("groups", () => {
     run(dir, "group", "add", "2@g.us");
     expect(access(dir).groups["2@g.us"].roster).toBe(false);
   });
+
+  test("re-adding an already-configured group MERGES, not overwrites: omitted flags are kept", () => {
+    const dir = freshStateDir();
+    run(dir, "group", "add", "1@g.us", "--mention", "--allow", "x@s,y@s");
+    // Only --roster passed this time - --mention and --allow are omitted,
+    // not explicitly turned off, so they must survive untouched.
+    const res = run(dir, "group", "add", "1@g.us", "--roster");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("Updated 1@g.us");
+    expect(access(dir).groups["1@g.us"]).toEqual({
+      requireMention: true,
+      allowFrom: ["x@s", "y@s"],
+      roster: true,
+    });
+  });
+
+  test("a genuinely new group still reports \"Added\", not \"Updated\"", () => {
+    const dir = freshStateDir();
+    const res = run(dir, "group", "add", "1@g.us");
+    expect(res.out).toContain("Added 1@g.us");
+  });
+
+  test("--allow \"\" (passed, empty) explicitly clears the allowlist on re-add", () => {
+    const dir = freshStateDir();
+    run(dir, "group", "add", "1@g.us", "--allow", "x@s,y@s");
+    run(dir, "group", "add", "1@g.us", "--allow", "");
+    expect(access(dir).groups["1@g.us"].allowFrom).toEqual([]);
+  });
+
+  test("passing --mention or --roster again on an already-true flag is a harmless no-op", () => {
+    const dir = freshStateDir();
+    run(dir, "group", "add", "1@g.us", "--mention", "--roster");
+    run(dir, "group", "add", "1@g.us", "--mention", "--roster");
+    expect(access(dir).groups["1@g.us"]).toEqual({
+      requireMention: true,
+      allowFrom: [],
+      roster: true,
+    });
+  });
 });
 
 // The wizard's checkbox prompts are driven by @inquirer/prompts, which

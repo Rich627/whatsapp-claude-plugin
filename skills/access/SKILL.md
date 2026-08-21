@@ -119,12 +119,16 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### `group add <groupJid>` (optional: `--mention`, `--allow jid1,jid2`, `--roster`)
 
 1. Read access.json (create default if missing).
-2. Set `groups[<groupJid>] = { requireMention: hasFlag("--mention"),
-allowFrom: parsedAllowList, roster: hasFlag("--roster") }`.
-   Default is `requireMention: false` — Claude responds to all messages.
-   Pass `--mention` to require @mention before Claude responds.
-   `roster` defaults to `false` — see "Roster access" below before turning
-   it on for a group.
+2. **Merge into any existing `groups[<groupJid>]`, never overwrite it
+   wholesale.** A flag not mentioned by the user this time keeps whatever
+   was already set — only change the field(s) the user actually asked
+   about. E.g. if the group already has `requireMention: true` and the
+   user says "turn on roster for this group," the result is
+   `{ requireMention: true, allowFrom: <unchanged>, roster: true }`, not a
+   fresh object with `requireMention` reset to `false`. For a JID with no
+   existing entry, defaults are `requireMention: false`, `allowFrom: []`,
+   `roster: false`, same as ever.
+   `roster` — see "Roster access" below before turning it on for a group.
 3. Write access.json.
 4. `mkdir -p ~/.whatsapp-channel/groups/<groupJid>`
 5. **Run the interactive Soul setup wizard** — ask the user these
