@@ -5,8 +5,8 @@
 // exact id it passed in the `mentions` array, so that literal id — not
 // whatever JID we resolve it to internally — is what a later text match must
 // look for.
-import { maskNumber } from "./mask";
-import { resolveByName, type ContactsMap } from "./contacts";
+import { maskNumber } from "../scripts/mask";
+import { resolveByName, type ContactsMap } from "../scripts/contacts";
 
 // The array normalizeMentionJids returns can hold the same jid twice under
 // two different `input` spellings (a LID and its phone number for one
@@ -44,7 +44,6 @@ export function normalizeMentionJids(
   raw: string[],
   lidMap: Record<string, string>,
   jidNormalizedUser: (jid: string) => string,
-  jidDecode: (jid: string) => { user: string } | undefined,
   contactsMap: ContactsMap = {},
 ): MentionPair[] {
   const out: MentionPair[] = [];
@@ -64,19 +63,26 @@ export function normalizeMentionJids(
     }
 
     let jid: string;
-    // A full-JID input's local part can carry a device suffix
-    // ("<num>:12@s.whatsapp.net") - reply_to_sender surfaces
-    // contextInfo.participant verbatim, which is exactly this shape. Nobody
-    // types "@<num>:12" in reply text, so the match key strips it the same
-    // way jidDecode().user does, rather than the raw split("@")[0] below.
-    let inputKey: string | undefined;
+    let input: string;
     if (s.includes("@")) {
       jid = jidNormalizedUser(s);
-      inputKey = jidDecode(s)?.user;
+      // Derived from the already-normalized jid's own local part, not
+      // re-parsed from `s` with a second regex - a full JID input still
+      // matches "@<num>" in text, the same as a bare number does, since
+      // nobody writes "@<num>@domain" in a chat message. This must strip
+      // exactly what jidNormalizedUser strips (device suffix AND an
+      // "_agent" suffix, see ranking.ts's normalizeJid), not a hand-rolled
+      // subset - a match key computed by a second, less complete regex
+      // used to silently diverge from jid for an agent-suffixed input,
+      // the same bug class review caught for the device suffix.
+      input = jid.split("@")[0];
     } else {
       // Group participants are LID-addressed, so prefer the LID form
       // whenever we know it — but the caller was told to type "@<s>" (the
       // input id), not "@<jid>", so mentionsForChunk must match on `s`.
+      // Unlike the branch above, `jid` here can resolve to a COMPLETELY
+      // different number (the LID), so input must stay tied to `s` itself,
+      // never derived from jid.
       const asLid = `${s}@lid`;
       if (lidMap[asLid]) {
         jid = asLid;
@@ -86,14 +92,12 @@ export function normalizeMentionJids(
         );
         jid = lidForPhone ?? `${s}@s.whatsapp.net`;
       }
+      input = s;
     }
-    // The match key is always the input's own local part — a full JID
-    // input ("<num>@s.whatsapp.net") still matches "@<num>" in text, the
-    // same as a bare number does, since nobody writes "@<num>@domain" in a
-    // chat message. Not deduped here: two different input spellings that
-    // happen to resolve to the same jid (a LID and its phone number) must
-    // both stay matchable, since the text might use either spelling.
-    out.push({ input: inputKey ?? s.split("@")[0], jid });
+    // Not deduped here: two different input spellings that happen to
+    // resolve to the same jid (a LID and its phone number) must both stay
+    // matchable, since the text might use either spelling.
+    out.push({ input, jid });
   }
   return out;
 }

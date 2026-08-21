@@ -280,6 +280,35 @@ describe("groups", () => {
     expect(access(dir).groups["2@g.us"].roster).toBe(false);
   });
 
+  test("--no-roster explicitly revokes roster on an already-granted group", () => {
+    const dir = freshStateDir();
+    run(dir, "group", "add", "1@g.us", "--roster");
+    const res = run(dir, "group", "add", "1@g.us", "--no-roster");
+    expect(res.code).toBe(0);
+    expect(access(dir).groups["1@g.us"].roster).toBe(false);
+  });
+
+  test("--no-mention explicitly turns off requireMention on an already-set group", () => {
+    const dir = freshStateDir();
+    run(dir, "group", "add", "1@g.us", "--mention");
+    run(dir, "group", "add", "1@g.us", "--no-mention");
+    expect(access(dir).groups["1@g.us"].requireMention).toBe(false);
+  });
+
+  test("passing both --roster and --no-roster together is refused, never silently resolved", () => {
+    const dir = freshStateDir();
+    const res = run(dir, "group", "add", "1@g.us", "--roster", "--no-roster");
+    expect(res.code).toBe(1);
+    // Refused before load()/save() ever ran - nothing written at all.
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
+  });
+
+  test("passing both --mention and --no-mention together is refused", () => {
+    const dir = freshStateDir();
+    const res = run(dir, "group", "add", "1@g.us", "--mention", "--no-mention");
+    expect(res.code).toBe(1);
+  });
+
   test("re-adding an already-configured group MERGES, not overwrites: omitted flags are kept", () => {
     const dir = freshStateDir();
     run(dir, "group", "add", "1@g.us", "--mention", "--allow", "x@s,y@s");

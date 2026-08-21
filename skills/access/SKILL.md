@@ -116,7 +116,7 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 1. Validate `<mode>` is one of `pairing`, `allowlist`, `disabled`.
 2. Read (create default if missing), set `dmPolicy`, write.
 
-### `group add <groupJid>` (optional: `--mention`, `--allow jid1,jid2`, `--roster`)
+### `group add <groupJid>` (optional: `--mention`/`--no-mention`, `--allow jid1,jid2`, `--roster`/`--no-roster`)
 
 1. Read access.json (create default if missing).
 2. **Merge into any existing `groups[<groupJid>]`, never overwrite it
@@ -128,7 +128,11 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
    fresh object with `requireMention` reset to `false`. For a JID with no
    existing entry, defaults are `requireMention: false`, `allowFrom: []`,
    `roster: false`, same as ever.
-   `roster` — see "Roster access" below before turning it on for a group.
+   To explicitly turn `requireMention` or `roster` back OFF (not just
+   leave it unmentioned), the user has to say so - set that field to
+   `false` directly rather than omitting it, since omitting always means
+   "keep whatever it already was." `roster` — see "Roster access" below
+   before turning it on for a group.
 3. Write access.json.
 4. `mkdir -p ~/.whatsapp-channel/groups/<groupJid>`
 5. **Run the interactive Soul setup wizard** — ask the user these

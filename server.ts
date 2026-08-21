@@ -25,7 +25,6 @@ import makeWASocket, {
   downloadMediaMessage,
   getContentType,
   jidNormalizedUser,
-  jidDecode,
   isLidUser,
   type WASocket,
   type WAMessage,
@@ -437,6 +436,9 @@ function recordLidMapping(lid: string, pn: string): void {
   if (migrateContactKey(contactsMap, nLid, nPn)) {
     saveContactsMap();
   }
+  if (migrateDmActivity(nLid, nPn)) {
+    saveDmActivity();
+  }
 }
 
 function resolveToPhone(jid: string): string {
@@ -571,6 +573,24 @@ function saveDmActivity(): void {
   renameSync(tmp, DM_ACTIVITY_FILE);
 }
 
+// A DM's activity can get recorded under its raw @lid key before
+// recordLidMapping ever learns the matching phone number - contactsMap
+// already migrates this way (migrateContactKey); dmActivity needs the same
+// treatment or a stale @lid-keyed entry sits there forever while later
+// writes go to the phone key instead, letting the same person show up
+// twice in the wizard's ranking and letting `remove`'s forget-purge miss
+// the lid-keyed entry entirely. Keeps the more recent of the two
+// timestamps on a real conflict, not just whichever key wins.
+function migrateDmActivity(oldKey: string, newKey: string): boolean {
+  if (oldKey === newKey) return false;
+  const stale = dmActivity[oldKey];
+  if (stale === undefined) return false;
+  delete dmActivity[oldKey];
+  const current = dmActivity[newKey];
+  dmActivity[newKey] = current !== undefined ? Math.max(current, stale) : stale;
+  return true;
+}
+
 // Baileys' chat timestamps are Unix SECONDS (the WhatsApp protobuf
 // convention) and may arrive as a plain number or a protobuf Long -
 // Number() on either already works, the same conversion this file already
@@ -684,6 +704,7 @@ async function refreshGroupsMeta(
         name,
         memberCount,
         archived: existing?.archived ?? false,
+        lastActivityAt: existing?.lastActivityAt,
         updatedAt: Date.now(),
       };
       metaChanged = true;
@@ -1684,7 +1705,6 @@ const handleToolCall = async (req: {
           rawMentions.filter((m) => !isAllToken(m)),
           lidMap,
           jidNormalizedUser,
-          jidDecode,
           contactsMap,
         );
         if (rawMentions.some(isAllToken)) {

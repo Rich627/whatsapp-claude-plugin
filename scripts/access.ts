@@ -116,7 +116,7 @@ const USAGE = `Usage: bun scripts/access.ts <command>
   allow <jid>                     add a JID to the allowlist
   remove <jid>                    remove a JID from the allowlist
   policy <${POLICIES.join("|")}>   set the DM policy
-  group add <groupJid> [--mention] [--allow a,b] [--roster]
+  group add <groupJid> [--mention|--no-mention] [--allow a,b] [--roster|--no-roster]
   group rm <groupJid>             stop responding in a group (files kept)
   wizard [--include-archived]     guided group setup: can-act / can-see-roster,
                                    per group, from names cached by list_groups
@@ -274,8 +274,10 @@ function group(args: string[]): void {
       args,
       options: {
         mention: { type: "boolean" },
+        "no-mention": { type: "boolean" },
         allow: { type: "string" },
         roster: { type: "boolean" },
+        "no-roster": { type: "boolean" },
       },
       allowPositionals: true,
     });
@@ -284,7 +286,18 @@ function group(args: string[]): void {
   }
   const [sub, jidArg] = parsed.positionals;
   const jid = requireArg(jidArg, "group JID");
-  const { mention = false, allow, roster = false } = parsed.values;
+  const {
+    mention = false,
+    "no-mention": noMention = false,
+    allow,
+    roster = false,
+    "no-roster": noRoster = false,
+  } = parsed.values;
+  // parseArgs has no built-in negation, so --mention/--no-mention (and the
+  // roster pair) are two separate flags - passing both at once is
+  // ambiguous, never silently resolved one way.
+  if (mention && noMention) die("Cannot pass both --mention and --no-mention.");
+  if (roster && noRoster) die("Cannot pass both --roster and --no-roster.");
   const a = load();
   if (sub === "rm") {
     if (!a.groups[jid]) die(`Group ${jid} is not configured.`);
@@ -304,10 +317,16 @@ function group(args: string[]): void {
   // object. Now an omitted flag keeps whatever was already there; only a
   // flag actually passed changes anything. --allow "" (empty, but passed)
   // still explicitly clears the allowlist - omitting --allow entirely is
-  // what preserves it.
+  // what preserves it. --no-mention/--no-roster are the explicit way to
+  // turn a flag back off - without them there was no way to revoke roster
+  // access short of `group rm` + a fresh `add` (losing allowFrom too).
   const existing = a.groups[jid];
   a.groups[jid] = {
-    requireMention: mention || (existing?.requireMention ?? false),
+    requireMention: mention
+      ? true
+      : noMention
+        ? false
+        : (existing?.requireMention ?? false),
     allowFrom:
       allow !== undefined
         ? allow
@@ -315,7 +334,7 @@ function group(args: string[]): void {
             .map((s) => s.trim())
             .filter(Boolean)
         : (existing?.allowFrom ?? []),
-    roster: roster || (existing?.roster ?? false),
+    roster: roster ? true : noRoster ? false : (existing?.roster ?? false),
   };
   save(a);
 

@@ -53,13 +53,14 @@ Group JIDs end in `@g.us`. To find one, add the linked device to the group — t
 
 With the default `requireMention: false`, the server responds to every message. Pass `--mention` to require @mention, or `--allow jid1,jid2` to restrict which members can trigger it. Pass `--roster` to also grant roster access (see below) — off by default, same as everything else.
 
-Running `group add` again on an already-configured group **merges**, it doesn't start over: any flag you don't pass this time keeps whatever was already set. Adding `--roster` to a group that already has `--mention` on doesn't reset `--mention` back off — only the flags you actually pass change anything.
+Running `group add` again on an already-configured group **merges**, it doesn't start over: any flag you don't pass this time keeps whatever was already set. Adding `--roster` to a group that already has `--mention` on doesn't reset `--mention` back off — only the flags you actually pass change anything. To explicitly turn `--mention` or `--roster` back off (rather than just never setting them), pass `--no-mention` / `--no-roster` — passing both a flag and its negation at once is refused, not silently resolved one way.
 
 ```
 /whatsapp-claude-channel:access group add 120363424405607157@g.us
 /whatsapp-claude-channel:access group add 120363424405607157@g.us --mention
 /whatsapp-claude-channel:access group add 120363424405607157@g.us --allow 886912345678@s.whatsapp.net
 /whatsapp-claude-channel:access group add 120363424405607157@g.us --roster
+/whatsapp-claude-channel:access group add 120363424405607157@g.us --no-roster
 /whatsapp-claude-channel:access group rm 120363424405607157@g.us
 ```
 
@@ -103,6 +104,7 @@ Both fail with a clear error if the group's `roster` flag isn't granted.
 - **Contacts**: pick which ones can message Claude — added straight to the allowlist, no second question.
 - Archived groups are skipped by default (pass `--include-archived` to include them). Anything already configured, or outside the top 5/10, isn't shown here — add it individually later with `group add`/`allow`, or just ask Claude (it already knows the name from context).
 - Ctrl-C cancels cleanly at any point; nothing is written until every question on screen has been answered.
+- A group the wizard adds gets `requireMention: true` (only reply when addressed) — a more cautious default than `group add`'s own CLI default of `false` (reply to everything), deliberately: the wizard is the guided path for a less technical setup, the CLI is for someone already comfortable with explicit flags. Change it after the fact with `group add --mention` or `--no-mention`.
 
 Group/contact names and recency come from caches (`~/.whatsapp-channel/groups-meta.json`, `dm-activity.json`) that only the running server writes — automatically, as WhatsApp reports chat activity, no manual step needed once the account has connected at least once. If it's never connected yet, the wizard has nothing to show; pair it first.
 
@@ -146,17 +148,17 @@ Configure outbound behavior with `/whatsapp-claude-channel:access set <key> <val
 
 ## Skill reference
 
-| Command                                                              | Effect                                                                                              |
-| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `/whatsapp-claude-channel:access`                                    | Print current state: policy, allowlist, pending pairings, enabled groups.                           |
-| `/whatsapp-claude-channel:access pair a4f91c`                        | Approve pairing code `a4f91c`. Adds the sender to `allowFrom` and sends a confirmation on WhatsApp. |
-| `/whatsapp-claude-channel:access deny a4f91c`                        | Discard a pending code. The sender is not notified.                                                 |
-| `/whatsapp-claude-channel:access allow 886912345678@s.whatsapp.net`  | Add a JID directly.                                                                                 |
-| `/whatsapp-claude-channel:access remove 886912345678@s.whatsapp.net` | Remove from the allowlist.                                                                          |
-| `/whatsapp-claude-channel:access policy allowlist`                   | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`.                                         |
-| `/whatsapp-claude-channel:access group add 120363424405607157@g.us`  | Enable a group. Flags: `--mention`, `--allow jid1,jid2`, `--roster`.                                |
-| `/whatsapp-claude-channel:access group rm 120363424405607157@g.us`   | Disable a group.                                                                                    |
-| `/whatsapp-claude-channel:access set ackReaction 👀`                 | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`.   |
+| Command                                                              | Effect                                                                                                                            |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `/whatsapp-claude-channel:access`                                    | Print current state: policy, allowlist, pending pairings, enabled groups.                                                         |
+| `/whatsapp-claude-channel:access pair a4f91c`                        | Approve pairing code `a4f91c`. Adds the sender to `allowFrom` and sends a confirmation on WhatsApp.                               |
+| `/whatsapp-claude-channel:access deny a4f91c`                        | Discard a pending code. The sender is not notified.                                                                               |
+| `/whatsapp-claude-channel:access allow 886912345678@s.whatsapp.net`  | Add a JID directly.                                                                                                               |
+| `/whatsapp-claude-channel:access remove 886912345678@s.whatsapp.net` | Remove from the allowlist.                                                                                                        |
+| `/whatsapp-claude-channel:access policy allowlist`                   | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`.                                                                       |
+| `/whatsapp-claude-channel:access group add 120363424405607157@g.us`  | Enable a group (merges into an existing entry). Flags: `--mention`/`--no-mention`, `--allow jid1,jid2`, `--roster`/`--no-roster`. |
+| `/whatsapp-claude-channel:access group rm 120363424405607157@g.us`   | Disable a group.                                                                                                                  |
+| `/whatsapp-claude-channel:access set ackReaction 👀`                 | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`.                                 |
 
 ## Config file
 
