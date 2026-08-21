@@ -1,14 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { jidDecode, jidNormalizedUser } from "@whiskeysockets/baileys";
 import { mentionsForChunk, normalizeMentionJids } from "./mentions";
-
-// Minimal stand-in for Baileys' jidNormalizedUser: lowercases and strips the
-// device suffix, which is all these functions rely on.
-const jidNormalizedUser = (jid: string): string =>
-  jid.toLowerCase().replace(/:\d+(?=@)/, "");
 
 describe("normalizeMentionJids", () => {
   test("bare number with no cached LID resolves to the phone JID", () => {
-    const [pair] = normalizeMentionJids(["61434505973"], {}, jidNormalizedUser);
+    const [pair] = normalizeMentionJids(
+      ["61434505973"],
+      {},
+      jidNormalizedUser,
+      jidDecode,
+    );
     expect(pair).toEqual({
       input: "61434505973",
       jid: "61434505973@s.whatsapp.net",
@@ -21,6 +22,7 @@ describe("normalizeMentionJids", () => {
       ["61403911675"],
       lidMap,
       jidNormalizedUser,
+      jidDecode,
     );
     expect(pair).toEqual({
       input: "61403911675",
@@ -33,6 +35,24 @@ describe("normalizeMentionJids", () => {
       ["61434505973@s.whatsapp.net"],
       {},
       jidNormalizedUser,
+      jidDecode,
+    );
+    expect(pair).toEqual({
+      input: "61434505973",
+      jid: "61434505973@s.whatsapp.net",
+    });
+  });
+
+  test("a device-suffixed full JID matches on the bare number, not the device id", () => {
+    // reply_to_sender surfaces contextInfo.participant verbatim, which can
+    // carry a device suffix ("<num>:12@s.whatsapp.net"). Nobody types
+    // "@<num>:12" in reply text, so the match key must strip it the same
+    // way jidDecode().user does.
+    const [pair] = normalizeMentionJids(
+      ["61434505973:12@s.whatsapp.net"],
+      {},
+      jidNormalizedUser,
+      jidDecode,
     );
     expect(pair).toEqual({
       input: "61434505973",
@@ -47,6 +67,7 @@ describe("normalizeMentionJids", () => {
       ["@@61434505973"],
       {},
       jidNormalizedUser,
+      jidDecode,
     );
     expect(pair.input).toBe("61434505973");
   });
@@ -60,6 +81,7 @@ describe("normalizeMentionJids", () => {
       ["184710990000999", "61403911675"],
       lidMap,
       jidNormalizedUser,
+      jidDecode,
     );
     expect(pairs).toEqual([
       { input: "184710990000999", jid: "184710990000999@lid" },
@@ -79,6 +101,7 @@ describe("mentionsForChunk", () => {
       ["61403911675"],
       lidMap,
       jidNormalizedUser,
+      jidDecode,
     );
     const result = mentionsForChunk("hey @61403911675 you're up", pairs);
     expect(result).toEqual(["184710990000999@lid"]);
@@ -87,7 +110,12 @@ describe("mentionsForChunk", () => {
   test("four mixed entries: only the ones referenced in this chunk's text are attached", () => {
     const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
     const raw = ["61434505973", "23058185377", "61405070760", "61403911675"];
-    const pairs = normalizeMentionJids(raw, lidMap, jidNormalizedUser);
+    const pairs = normalizeMentionJids(
+      raw,
+      lidMap,
+      jidNormalizedUser,
+      jidDecode,
+    );
     const text =
       "@61434505973 @23058185377 @61405070760 @61403911675 all four, please";
     const result = mentionsForChunk(text, pairs);
@@ -100,7 +128,12 @@ describe("mentionsForChunk", () => {
   });
 
   test("no match in this chunk's text returns undefined", () => {
-    const pairs = normalizeMentionJids(["61434505973"], {}, jidNormalizedUser);
+    const pairs = normalizeMentionJids(
+      ["61434505973"],
+      {},
+      jidNormalizedUser,
+      jidDecode,
+    );
     expect(mentionsForChunk("no mentions in here", pairs)).toBeUndefined();
   });
 
@@ -109,6 +142,7 @@ describe("mentionsForChunk", () => {
       ["6123", "61234567"],
       {},
       jidNormalizedUser,
+      jidDecode,
     );
     const result = mentionsForChunk("hey @61234567 nice work", pairs);
     expect(result).toEqual(["61234567@s.whatsapp.net"]);
@@ -120,6 +154,7 @@ describe("mentionsForChunk", () => {
       ["184710990000999", "61403911675"],
       lidMap,
       jidNormalizedUser,
+      jidDecode,
     );
     const result = mentionsForChunk(
       "@184710990000999 and @61403911675 are the same person",

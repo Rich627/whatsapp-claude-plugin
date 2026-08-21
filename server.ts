@@ -25,6 +25,7 @@ import makeWASocket, {
   downloadMediaMessage,
   getContentType,
   jidNormalizedUser,
+  jidDecode,
   isLidUser,
   type WASocket,
   type WAMessage,
@@ -49,7 +50,7 @@ import {
 } from "fs";
 import { homedir } from "os";
 import { join, extname, sep, basename } from "path";
-import { normalizeMentionJids, mentionsForChunk } from "./scripts/mentions";
+import { normalizeMentionJids, mentionsForChunk } from "./lib/mentions";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -415,9 +416,10 @@ function resolveToPhone(jid: string): string {
 }
 
 // ─── Outbound mentions ──────────────────────────────────────────────
-// normalizeMentionJids / mentionsForChunk live in ./scripts/mentions.ts so
-// they're unit-testable without pulling in server.ts's connect-on-import
-// side effects (see scripts/mentions.test.ts).
+// normalizeMentionJids / mentionsForChunk live in ./lib/mentions.ts (not
+// scripts/, which is reference scripts users run or copy out directly - see
+// CONTRIBUTING.md) so they're unit-testable without pulling in server.ts's
+// connect-on-import side effects (see lib/mentions.test.ts).
 
 // Our own lidMap is only populated passively, by the `lid-mapping.update`
 // event (see connectWhatsApp). That event does not reliably fire for every
@@ -1429,6 +1431,7 @@ const handleToolCall = async (req: {
           (args.mentions as string[] | undefined) ?? [],
           lidMap,
           jidNormalizedUser,
+          jidDecode,
         );
 
         assertAllowedChat(chat_id);

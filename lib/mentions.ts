@@ -14,6 +14,7 @@ export function normalizeMentionJids(
   raw: string[],
   lidMap: Record<string, string>,
   jidNormalizedUser: (jid: string) => string,
+  jidDecode: (jid: string) => { user: string } | undefined,
 ): MentionPair[] {
   const out: MentionPair[] = [];
   for (const entry of raw) {
@@ -22,8 +23,15 @@ export function normalizeMentionJids(
       .replace(/^@+/, "");
     if (!s) continue;
     let jid: string;
+    // A full-JID input's local part can carry a device suffix
+    // ("<num>:12@s.whatsapp.net") - reply_to_sender surfaces
+    // contextInfo.participant verbatim, which is exactly this shape. Nobody
+    // types "@<num>:12" in reply text, so the match key strips it the same
+    // way jidDecode().user does, rather than the raw split("@")[0] below.
+    let inputKey: string | undefined;
     if (s.includes("@")) {
       jid = jidNormalizedUser(s);
+      inputKey = jidDecode(s)?.user;
     } else {
       // Group participants are LID-addressed, so prefer the LID form
       // whenever we know it — but the caller was told to type "@<s>" (the
@@ -44,7 +52,7 @@ export function normalizeMentionJids(
     // chat message. Not deduped here: two different input spellings that
     // happen to resolve to the same jid (a LID and its phone number) must
     // both stay matchable, since the text might use either spelling.
-    out.push({ input: s.split("@")[0], jid });
+    out.push({ input: inputKey ?? s.split("@")[0], jid });
   }
   return out;
 }
