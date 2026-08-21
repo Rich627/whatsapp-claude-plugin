@@ -76,7 +76,7 @@ After pairing, the policy auto-locks back to `allowlist`.
 
 Each group gets its own personality config at `~/.whatsapp-channel/groups/<groupJid>/config.md`. Edit that file to customize how Claude behaves in each group. Conversation memory is auto-saved to `memory.md` in the same directory.
 
-See [ACCESS.md](./ACCESS.md) for group options (`--mention`, `--allow`).
+See [ACCESS.md](./ACCESS.md) for group options (`--mention`, `--allow`, `--roster`). Reviewing several newly-joined groups at once? Call the `list_groups` tool once, then run `bun scripts/access.ts wizard` in your own terminal for a guided yes/no pass over each one — see [Guided group consent](./ACCESS.md#guided-group-consent-wizard).
 
 ## Daily use
 
@@ -121,14 +121,15 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 
 | Tool                  | Purpose                                                                                                                                               |
 | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `reply`               | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for quote-reply and `files` (absolute paths) for attachments.            |
+| `reply`               | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for quote-reply, `files` (absolute paths) for attachments, and `mentions` (saved contact names preferred over raw numbers; `"all"` mentions every current group member if the group has [roster access](./ACCESS.md#group-roster--all-mentions)). |
 | `react`               | Add an emoji reaction to a message by ID. Any emoji is supported.                                                                                     |
 | `download_attachment` | Download media from a received message. Returns the local file path.                                                                                  |
 | `edit_message`        | Edit a message the account previously sent.                                                                                                           |
 | `status`              | Check connection state and get the pairing code if not yet paired.                                                                                    |
 | `unreplied`           | List received messages not yet replied to.                                                                                                            |
 | `catch_up`            | Post-restart context recovery: recent two-way conversation per chat (last 24h), unreplied counts, and open items from `~/.whatsapp-channel/tasks.md`. |
-| `list_groups`         | List every group the account is in, with JID and allowlist state.                                                                                     |
+| `list_groups`         | List every group the account is in, with JID, allowlist state, and roster-grant state. Also refreshes the local group name cache the access wizard reads. |
+| `group_roster`        | List a group's members by saved name, or a masked number otherwise — never a raw number. Requires [roster access](./ACCESS.md#group-roster--all-mentions) for that group. |
 
 ## Photos & Media
 

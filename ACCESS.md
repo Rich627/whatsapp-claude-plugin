@@ -51,12 +51,13 @@ Groups are off by default. Opt each one in individually.
 
 Group JIDs end in `@g.us`. To find one, add the linked device to the group — the server logs the group JID when it receives a message from an unenabled group.
 
-With the default `requireMention: false`, the server responds to every message. Pass `--mention` to require @mention, or `--allow jid1,jid2` to restrict which members can trigger it.
+With the default `requireMention: false`, the server responds to every message. Pass `--mention` to require @mention, or `--allow jid1,jid2` to restrict which members can trigger it. Pass `--roster` to also grant roster access (see below) — off by default, same as everything else.
 
 ```
 /whatsapp-claude-channel:access group add 120363424405607157@g.us
 /whatsapp-claude-channel:access group add 120363424405607157@g.us --mention
 /whatsapp-claude-channel:access group add 120363424405607157@g.us --allow 886912345678@s.whatsapp.net
+/whatsapp-claude-channel:access group add 120363424405607157@g.us --roster
 /whatsapp-claude-channel:access group rm 120363424405607157@g.us
 ```
 
@@ -74,6 +75,33 @@ Created automatically when a group is added. Edit `config.md` to customize Claud
 ### LID identifiers
 
 Baileys 7 uses LID (Local Identifier) format alongside phone JIDs. The same person may appear as both `16024101202@s.whatsapp.net` and `21737517412478@lid`. The server maintains a mapping at `~/.whatsapp-channel/lid-map.json` and resolves both formats automatically. Both work in allowlists.
+
+## Names and privacy
+
+The server caches saved contact names from WhatsApp's own contact sync (the same list your phone already has) at `~/.whatsapp-channel/contacts.json` — never the `contacts.md` some people keep for their own DM habits, which this plugin never reads. Only a contact's **name** is cached this way, and only a name — self-reported "About"/display text (`.notify`) is kept separately and never trusted for anything security-relevant, since anyone messaging the account can set that to whatever they want, including someone else's real name or number.
+
+**Names may reach the AI model; raw phone numbers should not.** When you ask Claude to reply and mention someone, it can use a saved name (`"Akash"`) instead of a number — that name is what appears in Claude's context. Anywhere a number would otherwise be shown to a human (an ambiguous-name error, `group_roster` for someone with no saved name) it's masked to the last 4 digits (`•••••5122`) before it's built into any string, not filtered afterward.
+
+This is a **best-effort mitigation, not a hard guarantee**: it depends on a saved contact actually being a name and not, say, a phone number typed into the name field, and on `.notify` not being trusted in place of it (checked explicitly for group rosters — see below). If you'd rather no name data ever reaches an AI model at all, don't grant any group `roster` access and use raw JIDs/numbers in `mentions` instead of names.
+
+## Group roster & @all mentions
+
+`group_roster` (an MCP tool) and `"all"` (a reserved value in the `reply` tool's `mentions` array) both require a group's `roster` flag — separate from whether Claude can act in the group at all, so you can let Claude reply in a large group without ever handing it the member list.
+
+- **`group_roster`** lists a group's current members by saved contact name, or a masked number when no name is known. It never shows a raw number, even when a contact's self-reported name happens to look like one.
+- **`"all"` in `mentions`** expands server-side to every current participant, fetched live from WhatsApp group metadata — so it mentions everyone even for members with no saved contact name, and however many there are. A saved contact literally named "All" is unaffected: name resolution always wins over the reserved value.
+
+Both fail with a clear error if the group's `roster` flag isn't granted.
+
+## Guided group consent (wizard)
+
+`bun scripts/access.ts wizard` walks every joined group not yet configured (archived ones skipped by default — pass `--include-archived` to include them), asking two separate yes/no questions per group: can Claude reply here, and can Claude also see member names. It reads group names from a cache (`~/.whatsapp-channel/groups-meta.json`) that only the running server writes — call the `list_groups` tool at least once first to populate it, or the wizard has nothing to show.
+
+It's a terminal command, deliberately not a Claude Code skill: running it yourself, outside any chat, is what makes this true —
+
+> No group or contact data was sent to any AI model during this setup — this ran entirely in your terminal.
+
+The `/whatsapp-claude-channel:access` skill will point you at it if you ask for guided setup there, but will never run it on your behalf.
 
 ## Mention detection
 
@@ -113,7 +141,7 @@ Configure outbound behavior with `/whatsapp-claude-channel:access set <key> <val
 | `/whatsapp-claude-channel:access allow 886912345678@s.whatsapp.net`  | Add a JID directly.                                                                                 |
 | `/whatsapp-claude-channel:access remove 886912345678@s.whatsapp.net` | Remove from the allowlist.                                                                          |
 | `/whatsapp-claude-channel:access policy allowlist`                   | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`.                                         |
-| `/whatsapp-claude-channel:access group add 120363424405607157@g.us`  | Enable a group. Flags: `--no-mention`, `--allow jid1,jid2`.                                         |
+| `/whatsapp-claude-channel:access group add 120363424405607157@g.us`  | Enable a group. Flags: `--mention`, `--allow jid1,jid2`, `--roster`.                                |
 | `/whatsapp-claude-channel:access group rm 120363424405607157@g.us`   | Disable a group.                                                                                    |
 | `/whatsapp-claude-channel:access set ackReaction 👀`                 | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`.   |
 
@@ -136,6 +164,9 @@ Configure outbound behavior with `/whatsapp-claude-channel:access set <key> <val
       "requireMention": true,
       // Restrict triggers to these senders. Empty = any member (subject to requireMention).
       "allowFrom": [],
+      // Grants group_roster and "all" mentions. Separate from acting in the
+      // group at all - see "Group roster & @all mentions" above.
+      "roster": false,
     },
   },
 

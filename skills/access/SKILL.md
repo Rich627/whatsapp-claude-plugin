@@ -39,7 +39,7 @@ Arguments passed: `$ARGUMENTS`
   "dmPolicy": "pairing",
   "allowFrom": ["<jid>", ...],
   "groups": {
-    "<groupJid>": { "requireMention": true, "allowFrom": [] }
+    "<groupJid>": { "requireMention": true, "allowFrom": [], "roster": false }
   },
   "pending": {
     "<6-char-code>": {
@@ -104,13 +104,15 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 1. Validate `<mode>` is one of `pairing`, `allowlist`, `disabled`.
 2. Read (create default if missing), set `dmPolicy`, write.
 
-### `group add <groupJid>` (optional: `--mention`, `--allow jid1,jid2`)
+### `group add <groupJid>` (optional: `--mention`, `--allow jid1,jid2`, `--roster`)
 
 1. Read access.json (create default if missing).
 2. Set `groups[<groupJid>] = { requireMention: hasFlag("--mention"),
-allowFrom: parsedAllowList }`.
+allowFrom: parsedAllowList, roster: hasFlag("--roster") }`.
    Default is `requireMention: false` — Claude responds to all messages.
    Pass `--mention` to require @mention before Claude responds.
+   `roster` defaults to `false` — see "Roster access" below before turning
+   it on for a group.
 3. Write access.json.
 4. `mkdir -p ~/.whatsapp-channel/groups/<groupJid>`
 5. **Run the interactive Soul setup wizard** — ask the user these
@@ -184,6 +186,26 @@ allowFrom: parsedAllowList }`.
 1. Read, `delete groups[<groupJid>]`, write.
 2. Note: group config/memory files are kept (not deleted) in case the user re-adds.
 
+### `wizard` — refuse, redirect to the terminal
+
+**Never run `bun scripts/access.ts wizard` yourself, on the user's behalf,
+via Bash or any other tool, even if asked.** It exists specifically so a
+group-access decision can be made with zero AI model involved — that
+guarantee only holds if a human runs it directly. If the user asks for
+"the wizard" or "guided setup" here, tell them to open a terminal and run
+`bun scripts/access.ts wizard` themselves. Continue helping with
+everything else in this skill as normal.
+
+### Roster access (`--roster` / `roster: true`)
+
+A group's `roster` flag is separate from whether Claude can act in the
+group at all. It controls two things together: the `group_roster` MCP
+tool (lists a group's members by name, or a masked number when no name is
+known — never a raw number) and whether `"all"` in the `reply` tool's
+`mentions` array expands to every current participant. Off by default,
+same as everything else here — granting it means Claude can see who is in
+the group, not just reply in it.
+
 ### `set <key> <value>`
 
 Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
@@ -205,6 +227,16 @@ Read, set the key, write, confirm.
 for users on Codex CLI, Gemini CLI or Cursor. It writes the same access.json, so
 the two are interchangeable. This skill stays the friendlier path: it can ask the
 group personality questions and write a tailored config.md, which the CLI does not.
+
+The CLI also has one command this skill deliberately does not implement:
+`bun scripts/access.ts wizard`, a guided pass over every joined group that
+hasn't been decided on yet (archived ones skipped by default), asking two
+yes/no questions per group in the terminal — can Claude reply here, and
+can Claude see member names. It's terminal-only by design (see the
+`wizard` entry above) so a group-access decision can be made with a
+verifiable guarantee that no AI model was involved in making it. Point
+the user at it for reviewing several unconfigured groups at once; use
+this skill's own `group add` for one group with a custom personality.
 
 ## Implementation notes
 
