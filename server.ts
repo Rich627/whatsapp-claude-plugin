@@ -51,6 +51,7 @@ import {
 import { homedir } from "os";
 import { join, extname, sep, basename } from "path";
 import { normalizeMentionJids, mentionsForChunk } from "./lib/mentions";
+import { mergeContact, type ContactsMap } from "./scripts/contacts";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -61,6 +62,7 @@ const INBOX_DIR = join(STATE_DIR, "inbox");
 const ENV_FILE = join(STATE_DIR, ".env");
 const GROUPS_DIR = join(STATE_DIR, "groups");
 const LID_MAP_FILE = join(STATE_DIR, "lid-map.json");
+const CONTACTS_FILE = join(STATE_DIR, "contacts.json");
 const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
 const TASKS_FILE = join(STATE_DIR, "tasks.md");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
@@ -413,6 +415,33 @@ function recordLidMapping(lid: string, pn: string): void {
 function resolveToPhone(jid: string): string {
   if (!isLidUser(jid)) return jid;
   return lidMap[jidNormalizedUser(jid)] ?? jid;
+}
+
+// ─── Contacts name cache ────────────────────────────────────────────
+// A linked device gets the phone's real contact list synced to it, same as
+// WhatsApp Web - Baileys exposes this as contacts.upsert/contacts.update
+// (see connectWhatsApp). Persisted the same way lidMap is: loaded once on
+// startup, rewritten atomically whenever an event actually changes something.
+
+let contactsMap: ContactsMap = {};
+try {
+  contactsMap = JSON.parse(readFileSync(CONTACTS_FILE, "utf8"));
+} catch {}
+
+function saveContactsMap(): void {
+  const tmp = CONTACTS_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(contactsMap, null, 2) + "\n", {
+    mode: 0o600,
+  });
+  renameSync(tmp, CONTACTS_FILE);
+}
+
+// Same key every other identity lookup in this file uses (resolveToPhone
+// before jidNormalizedUser, see lines above) - a contact Baileys syncs under
+// its @lid form must land under the same key a later phone-resolved lookup
+// would use, or it's silently unfindable there.
+function contactKey(jid: string): string {
+  return jidNormalizedUser(resolveToPhone(jid));
 }
 
 // ─── Outbound mentions ──────────────────────────────────────────────
@@ -2513,6 +2542,38 @@ async function connectWhatsApp(): Promise<void> {
       recordLidMapping(mapping.lid, mapping.pn);
     },
   );
+
+  // Cache saved contact names as WhatsApp syncs them to this linked device.
+  // .name is what the account owner saved on their own phone; .notify is
+  // self-reported by the contact. See recordContact/mergeContact for why
+  // those stay separate instead of collapsing into one trusted field.
+  sock.ev.on("contacts.upsert", (contacts) => {
+    // One batch save after the loop, not one per contact: this event
+    // delivers the whole address book on first sync (hundreds to
+    // thousands of entries), and contactsMap starts empty so nearly every
+    // entry is a "change" - a sync writeFileSync+renameSync per entry
+    // would block on a full-map JSON serialization that many times in a row.
+    let changed = false;
+    for (const c of contacts) {
+      if (c.name || c.notify) {
+        if (mergeContact(contactsMap, contactKey(c.id), { name: c.name, notify: c.notify })) {
+          changed = true;
+        }
+      }
+    }
+    if (changed) saveContactsMap();
+  });
+  sock.ev.on("contacts.update", (updates) => {
+    let changed = false;
+    for (const u of updates) {
+      if (u.id && (u.name || u.notify)) {
+        if (mergeContact(contactsMap, contactKey(u.id), { name: u.name, notify: u.notify })) {
+          changed = true;
+        }
+      }
+    }
+    if (changed) saveContactsMap();
+  });
 
   // ─── Pairing code: request independently of QR event ─────────────────
   // Bun's WebSocket shim may not fire the 'upgrade'/'unexpected-response'
