@@ -550,6 +550,18 @@ type IpcRelay = {
 
 const IPC_CLOSED_MSG = "primary connection closed";
 
+// A notify frame can arrive from the primary before this secondary's own
+// mcp.connect() has run (the primary broadcasts as soon as a secondary's
+// hello ack completes, which is well before this process finishes booting).
+// Server.notification() throws "Not connected" until then, so anything
+// received early must queue instead of being dropped silently.
+let mcpReady = false;
+const PENDING_NOTIFICATIONS_CAP = 200; // ponytail: flat cap, drop oldest first
+const pendingSecondaryNotifications: Array<{
+  method: string;
+  params: Record<string, unknown>;
+}> = [];
+
 // Fail closed (PRD §9): a missing, unreadable or empty token file is the same
 // outcome as "no primary reachable" - we do not connect without one. Never
 // log the value.
@@ -623,16 +635,21 @@ function connectToPrimary(): Promise<IpcRelay | null> {
         if (msg.type === "notify") {
           // PRD §11 M3 / FR2: re-emit the primary's inbound-message
           // notification to this secondary's own MCP client, unchanged.
-          void mcp
-            .notification({
-              method: msg.method,
-              params: msg.params as Record<string, unknown>,
-            })
-            .catch((err) => {
-              process.stderr.write(
-                `${LOG_PREFIX}: ipc: failed to re-emit notification: ${err}\n`,
-              );
-            });
+          const params = msg.params as Record<string, unknown>;
+          if (!mcpReady) {
+            if (
+              pendingSecondaryNotifications.length >= PENDING_NOTIFICATIONS_CAP
+            ) {
+              pendingSecondaryNotifications.shift();
+            }
+            pendingSecondaryNotifications.push({ method: msg.method, params });
+            continue;
+          }
+          void mcp.notification({ method: msg.method, params }).catch((err) => {
+            process.stderr.write(
+              `${LOG_PREFIX}: ipc: failed to re-emit notification: ${err}\n`,
+            );
+          });
           continue;
         }
         if (msg.type !== "result") continue;
@@ -2601,6 +2618,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 // ─── MCP transport ─────────────────────────────────────────────────────
 
 await mcp.connect(new StdioServerTransport());
+mcpReady = true;
+for (const n of pendingSecondaryNotifications.splice(0)) {
+  void mcp.notification(n).catch((err) => {
+    process.stderr.write(
+      `${LOG_PREFIX}: ipc: failed to re-emit queued notification: ${err}\n`,
+    );
+  });
+}
 
 // ─── Shutdown ──────────────────────────────────────────────────────────
 
