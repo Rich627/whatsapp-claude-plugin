@@ -28,7 +28,14 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { createInterface } from "node:readline";
+import { checkbox } from "@inquirer/prompts";
+import { forgetContact, type ContactsMap } from "./contacts";
+import {
+  contactKeyFor,
+  rankDms,
+  rankGroups,
+  type GroupMeta,
+} from "./ranking";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -36,6 +43,9 @@ const ACCESS_FILE = join(STATE_DIR, "access.json");
 const APPROVED_DIR = join(STATE_DIR, "approved");
 const GROUPS_DIR = join(STATE_DIR, "groups");
 const GROUPS_META_FILE = join(STATE_DIR, "groups-meta.json");
+const DM_ACTIVITY_FILE = join(STATE_DIR, "dm-activity.json");
+const CONTACTS_FILE = join(STATE_DIR, "contacts.json");
+const LID_MAP_FILE = join(STATE_DIR, "lid-map.json");
 
 const POLICIES = ["pairing", "allowlist", "disabled"];
 const SET_KEYS = [
@@ -50,12 +60,6 @@ type GroupPolicy = {
   requireMention: boolean;
   allowFrom: string[];
   roster?: boolean;
-};
-type GroupMeta = {
-  name: string;
-  memberCount: number;
-  archived: boolean;
-  updatedAt: number;
 };
 type PendingEntry = { senderId: string; chatId: string; expiresAt: number };
 type Access = {
@@ -129,6 +133,55 @@ function loadGroupsMeta(): Record<string, GroupMeta> {
   if (!existsSync(GROUPS_META_FILE)) return {};
   try {
     return JSON.parse(readFileSync(GROUPS_META_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function loadDmActivity(): Record<string, number> {
+  if (!existsSync(DM_ACTIVITY_FILE)) return {};
+  try {
+    return JSON.parse(readFileSync(DM_ACTIVITY_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveDmActivity(activity: Record<string, number>): void {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  const tmp = DM_ACTIVITY_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(activity, null, 2) + "\n", {
+    mode: 0o600,
+  });
+  renameSync(tmp, DM_ACTIVITY_FILE);
+}
+
+function loadContacts(): ContactsMap {
+  if (!existsSync(CONTACTS_FILE)) return {};
+  try {
+    return JSON.parse(readFileSync(CONTACTS_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveContacts(map: ContactsMap): void {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  const tmp = CONTACTS_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(map, null, 2) + "\n", { mode: 0o600 });
+  renameSync(tmp, CONTACTS_FILE);
+}
+
+// This script has no live WhatsApp connection (see the file header) and
+// deliberately doesn't import Baileys just for its JID string utilities -
+// mirrors server.ts's resolveToPhone/contactKey exactly (same
+// resolve-then-normalize order), reading the same lid-map.json server.ts
+// writes, so a key computed here always matches the one contacts.json is
+// actually keyed under.
+function loadLidMap(): Record<string, string> {
+  if (!existsSync(LID_MAP_FILE)) return {};
+  try {
+    return JSON.parse(readFileSync(LID_MAP_FILE, "utf8"));
   } catch {
     return {};
   }
@@ -272,99 +325,101 @@ function highlight(text: string): string {
   return `\x1b[1;38;5;208m${text}\x1b[0m`;
 }
 
-// Guided setup for groups the account has joined but never decided about.
+const GROUP_CANDIDATE_LIMIT = 5;
+const DM_CANDIDATE_LIMIT = 10;
+
+// Guided setup for the account's most recently active groups and contacts
+// that haven't been decided on yet - top 5 / top 10 by recency, the same
+// way WhatsApp's own app orders its chat list, so the review stays to one
+// screen instead of every group/contact ever seen. Anything beyond that is
+// meant to be added one at a time later (`group add`/`allow`, or just
+// asking Claude - it already has the name from context), not reviewed here.
+//
 // Terminal, not chat: this is what makes "no data went to an AI" literally
 // true (no model runs during the decision), and it works for any client
-// driving this plugin, not just Claude Code - see HANDOFF.md for why this
-// was the deliberate choice over a conversational flow.
-//
-// Reads names from groups-meta.json, which THIS script never writes - only
-// the connected server (server.ts, via the list_groups tool) can see real
-// group names, since only it holds the live WhatsApp connection.
+// driving this plugin, not just Claude Code. Reads from groups-meta.json,
+// dm-activity.json and contacts.json, none of which this script ever
+// writes to on its own - only the connected server (server.ts) populates
+// them, since only it holds the live WhatsApp connection.
 async function wizard(args: string[]): Promise<void> {
   const includeArchived = args.includes("--include-archived");
-  const meta = loadGroupsMeta();
-  if (Object.keys(meta).length === 0) {
-    die(
-      "No group data cached yet. Call the list_groups tool from a connected session first (it warms this cache), then re-run the wizard.",
-    );
-  }
   const a = load();
-  const candidates = Object.entries(meta)
-    .filter(([jid]) => !(jid in a.groups))
-    .filter(([, g]) => includeArchived || !g.archived)
-    .sort(([, x], [, y]) => x.name.localeCompare(y.name));
+  const lidMap = loadLidMap();
 
-  if (candidates.length === 0) {
-    process.stdout.write(
-      "Every known group is already configured, or archived and skipped by default.\n" +
-        "Use 'group add'/'group rm' to change an existing group, or pass --include-archived.\n",
-    );
-    return;
-  }
-
-  process.stdout.write(
-    `${candidates.length} group(s) to review. Answer y/n; anything else skips a group for now.\n`,
+  const groupCandidates = rankGroups(
+    loadGroupsMeta(),
+    new Set(Object.keys(a.groups)),
+    includeArchived,
+    GROUP_CANDIDATE_LIMIT,
   );
-  // Not rl.question() (readline/promises): repeated calls on it hang on
-  // piped/non-TTY stdin under Bun (confirmed - the second call never
-  // resolves even with more input waiting to be read). The async iterator
-  // form doesn't have that problem and works the same interactively.
-  const rl = createInterface({ input: process.stdin });
-  const lines = rl[Symbol.asyncIterator]();
-  async function ask(prompt: string): Promise<string> {
-    process.stdout.write(prompt);
-    const { value, done } = await lines.next();
-    return done ? "" : value;
-  }
-  let configured = 0;
-  try {
-    for (const [jid, g] of candidates) {
-      process.stdout.write(
-        `\n${g.name}  (${g.memberCount} member(s))\n  ${jid}\n\n` +
-          "  Claude can reply in this group without ever seeing who's in it.\n" +
-          "  Seeing names only matters for \"@all\" mentions.\n\n",
-      );
-      const canAct = (await ask("  Let Claude reply here? [y/N] "))
-        .trim()
-        .toLowerCase();
-      if (canAct !== "y" && canAct !== "yes") {
-        process.stdout.write("  Skipped.\n");
-        continue;
-      }
-      const wantsRoster = (
-        await ask("  Let Claude see names too, for @all? [y/N] ")
-      )
-        .trim()
-        .toLowerCase();
-      const roster = wantsRoster === "y" || wantsRoster === "yes";
-      // requireMention defaults to true here (unlike `group add`'s CLI
-      // default of false): a group reached through the guided consent flow
-      // gets the more cautious default of only responding when addressed,
-      // not to every message. Change it later with `group add --mention`.
-      a.groups[jid] = { requireMention: true, allowFrom: [], roster };
-      provisionGroupFiles(jid);
-      // Saved after EVERY group, not once at the end: this loop can run for
-      // a while (a real answer per group), and a mid-session Ctrl-C used to
-      // silently discard every already-"Added" answer since nothing had
-      // been written yet. One extra disk write per group is cheap next to
-      // losing the owner's answers.
-      save(a);
-      configured++;
-      process.stdout.write(
-        roster
-          ? "  Added. Claude can reply here and see member names, for @all mentions.\n"
-          : "  Added. Claude can reply, but has no visibility into who's in this group.\n",
-      );
-    }
-  } finally {
-    rl.close();
+  const dmCandidates = rankDms(
+    loadDmActivity(),
+    loadContacts(),
+    a.allowFrom,
+    lidMap,
+    DM_CANDIDATE_LIMIT,
+  );
+
+  if (groupCandidates.length === 0 && dmCandidates.length === 0) {
+    die(
+      "Nothing to review - either no group/contact activity is cached yet " +
+        "(pair the account and let it connect at least once first), or " +
+        "everything currently known is already configured.",
+    );
   }
 
+  let actGroups: string[] = [];
+  let rosterGroups: string[] = [];
+  let allowDms: string[] = [];
+  try {
+    if (groupCandidates.length > 0) {
+      actGroups = await checkbox({
+        message: "Which groups can Claude reply in?",
+        choices: groupCandidates.map((c) => ({ name: c.label, value: c.jid })),
+      });
+      if (actGroups.length > 0) {
+        rosterGroups = await checkbox({
+          message:
+            'Of those, which can Claude also see member names in (for "all" mentions)?',
+          choices: groupCandidates
+            .filter((c) => actGroups.includes(c.jid))
+            .map((c) => ({ name: c.label, value: c.jid })),
+        });
+      }
+    }
+    if (dmCandidates.length > 0) {
+      allowDms = await checkbox({
+        message: "Which contacts can message Claude?",
+        choices: dmCandidates.map((c) => ({ name: c.label, value: c.jid })),
+      });
+    }
+  } catch (err) {
+    // @inquirer/prompts throws this specific error on Ctrl-C/Ctrl-D -
+    // nothing has been written yet at this point (save() only happens
+    // below, after every question is answered), so there's nothing to
+    // roll back, just a clean message instead of a raw stack trace.
+    if (err instanceof Error && err.name === "ExitPromptError") {
+      process.stdout.write("\nCancelled - nothing was changed.\n");
+      return;
+    }
+    throw err;
+  }
+
+  for (const jid of actGroups) {
+    a.groups[jid] = {
+      requireMention: true,
+      allowFrom: [],
+      roster: rosterGroups.includes(jid),
+    };
+    provisionGroupFiles(jid);
+  }
+  for (const jid of allowDms) {
+    if (!a.allowFrom.includes(jid)) a.allowFrom.push(jid);
+  }
+  if (actGroups.length > 0 || allowDms.length > 0) save(a);
+
   process.stdout.write(
-    configured > 0
-      ? `\n${configured} group(s) configured.\n`
-      : "\nNo groups configured.\n",
+    `\n${actGroups.length} group(s), ${allowDms.length} contact(s) configured.\n`,
   );
   process.stdout.write(`\n${highlight(PRIVACY_DISCLOSURE)}\n`);
 }
@@ -434,7 +489,29 @@ switch (command) {
     if (!a.allowFrom.includes(jid)) die(`${jid} is not on the allowlist.`);
     a.allowFrom = a.allowFrom.filter((j) => j !== jid);
     save(a);
-    process.stdout.write(`Removed ${jid}.\n`);
+    // Explicit removal, not a mere decline - also forget the cached name
+    // (never the lid-map.json routing entry; see forgetContact's own
+    // comment for why). If they're still in a shared group with roster
+    // access, they'll show up there as a masked number from now on - not
+    // a bug, the honest consequence of choosing to forget someone this
+    // plugin was never going to remove from a group or block on WhatsApp.
+    const key = contactKeyFor(loadLidMap(), jid);
+    const contacts = loadContacts();
+    const forgot = forgetContact(contacts, key);
+    if (forgot) saveContacts(contacts);
+    // Also drop their entry in the recency cache the wizard ranks by -
+    // their raw phone-resolved JID is the key that file is stored under,
+    // so leaving it behind would keep the exact thing "forget" is meant to
+    // clear out of local storage.
+    const activity = loadDmActivity();
+    const forgotActivity = key in activity;
+    if (forgotActivity) {
+      delete activity[key];
+      saveDmActivity(activity);
+    }
+    process.stdout.write(
+      `Removed ${jid}.${forgot || forgotActivity ? " Forgot their cached name too." : ""}\n`,
+    );
     break;
   }
   case "policy": {

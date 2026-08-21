@@ -44,14 +44,41 @@ function runWithInput(
   }
 }
 
+function writeContacts(
+  dir: string,
+  contacts: Record<string, { name?: string; notify?: string }>,
+): void {
+  writeFileSync(join(dir, "contacts.json"), JSON.stringify(contacts, null, 2));
+}
+
+function readContacts(
+  dir: string,
+): Record<string, { name?: string; notify?: string }> {
+  return JSON.parse(readFileSync(join(dir, "contacts.json"), "utf8"));
+}
+
+function writeLidMap(dir: string, map: Record<string, string>): void {
+  writeFileSync(join(dir, "lid-map.json"), JSON.stringify(map, null, 2));
+}
+
 function writeGroupsMeta(
   dir: string,
   meta: Record<
     string,
-    { name: string; memberCount: number; archived: boolean; updatedAt: number }
+    {
+      name: string;
+      memberCount: number;
+      archived: boolean;
+      lastActivityAt?: number;
+      updatedAt: number;
+    }
   >,
 ): void {
   writeFileSync(join(dir, "groups-meta.json"), JSON.stringify(meta, null, 2));
+}
+
+function writeDmActivity(dir: string, activity: Record<string, number>): void {
+  writeFileSync(join(dir, "dm-activity.json"), JSON.stringify(activity, null, 2));
 }
 
 const access = (dir: string) =>
@@ -85,6 +112,71 @@ describe("allowlist", () => {
   test("removing someone who is not listed fails loudly", () => {
     const dir = freshStateDir();
     expect(run(dir, "remove", "nobody@s.whatsapp.net").code).toBe(1);
+  });
+
+  test("removing a contact also forgets their cached name, not just the allowlist entry", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    writeContacts(dir, { "1@s.whatsapp.net": { name: "Akash" } });
+    const res = run(dir, "remove", "1@s.whatsapp.net");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("Forgot their cached name too.");
+    expect(readContacts(dir)["1@s.whatsapp.net"]).toBeUndefined();
+  });
+
+  test("removing a contact with no cached name still succeeds, no false claim of forgetting", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    const res = run(dir, "remove", "1@s.whatsapp.net");
+    expect(res.code).toBe(0);
+    expect(res.out).not.toContain("Forgot");
+  });
+
+  test("removing via a LID resolves through lid-map.json to forget the right contacts.json key", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "184710990000999@lid");
+    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
+    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
+    const res = run(dir, "remove", "184710990000999@lid");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("Forgot their cached name too.");
+    expect(readContacts(dir)["61403911675@s.whatsapp.net"]).toBeUndefined();
+  });
+
+  test("removal never touches lid-map.json itself", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "184710990000999@lid");
+    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
+    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
+    run(dir, "remove", "184710990000999@lid");
+    const lidMap = JSON.parse(readFileSync(join(dir, "lid-map.json"), "utf8"));
+    expect(lidMap["184710990000999@lid"]).toBe("61403911675@s.whatsapp.net");
+  });
+
+  test("removing a contact also purges their entry in the wizard's recency cache", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    writeDmActivity(dir, {
+      "1@s.whatsapp.net": 5000,
+      "2@s.whatsapp.net": 3000,
+    });
+    const res = run(dir, "remove", "1@s.whatsapp.net");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("Forgot their cached name too.");
+    const activity = JSON.parse(
+      readFileSync(join(dir, "dm-activity.json"), "utf8"),
+    );
+    expect(activity["1@s.whatsapp.net"]).toBeUndefined();
+    // Only the removed contact's own entry goes - everyone else's stays.
+    expect(activity["2@s.whatsapp.net"]).toBe(3000);
+  });
+
+  test("removing a contact with no recency entry cached still succeeds cleanly", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    const res = run(dir, "remove", "1@s.whatsapp.net");
+    expect(res.code).toBe(0);
+    expect(res.out).not.toContain("Forgot");
   });
 });
 
@@ -186,15 +278,28 @@ describe("groups", () => {
   });
 });
 
+// The wizard's checkbox prompts are driven by @inquirer/prompts, which
+// takes raw keystrokes: " " (space) toggles the highlighted item, "\n"
+// submits, "\x03" is Ctrl-C. A chain of MULTIPLE checkbox() calls in one
+// process is unreliable over piped/non-TTY stdin - a known Inquirer/Node
+// issue (stream ownership gets lost between prompts when piping; it works
+// fine interactively, which is the only place this glue actually runs -
+// see SBoudrias/Inquirer.js#767 and #414). So every test here is
+// constructed to trigger AT MOST ONE checkbox() call: either there's only
+// one category of candidate (groups xor DMs), or the group selection is
+// left empty (which skips the second, roster, checkbox entirely - see
+// wizard()'s own `if (actGroups.length > 0)` guard). Ordering, filtering
+// and masking logic itself is covered exhaustively and reliably in
+// ranking.test.ts instead, since none of that needs a live prompt.
 describe("wizard", () => {
-  test("no groups-meta.json cached yet: refuses with a clear message", () => {
+  test("no group or DM activity cached at all: refuses with a clear message", () => {
     const dir = freshStateDir();
     const res = run(dir, "wizard");
     expect(res.code).toBe(1);
-    expect(res.out).toContain("No group data cached yet");
+    expect(res.out).toContain("Nothing to review");
   });
 
-  test("archived groups are skipped by default; already-configured groups are skipped too", () => {
+  test("archived groups skipped by default; already-configured groups skipped too: nothing left", () => {
     const dir = freshStateDir();
     writeGroupsMeta(dir, {
       "1@g.us": { name: "Active", memberCount: 3, archived: false, updatedAt: 0 },
@@ -202,92 +307,89 @@ describe("wizard", () => {
     });
     run(dir, "group", "add", "1@g.us"); // already configured
     const res = run(dir, "wizard");
-    expect(res.code).toBe(0);
-    expect(res.out).toContain("Every known group is already configured");
+    expect(res.code).toBe(1);
+    expect(res.out).toContain("Nothing to review");
     expect(access(dir).groups["2@g.us"]).toBeUndefined();
   });
 
-  test("y then n grants act-only access (roster stays false)", () => {
+  test("groups only, select none: nothing configured, access.json never created", () => {
     const dir = freshStateDir();
     writeGroupsMeta(dir, {
       "1@g.us": { name: "Family", memberCount: 4, archived: false, updatedAt: 0 },
     });
-    const res = runWithInput(dir, "y\nn\n", "wizard");
+    const res = runWithInput(dir, "\n", "wizard"); // enter immediately, 0 selected
     expect(res.code).toBe(0);
-    expect(access(dir).groups["1@g.us"]).toEqual({
-      requireMention: true,
-      allowFrom: [],
-      roster: false,
-    });
-    expect(existsSync(join(dir, "groups", "1@g.us", "config.md"))).toBe(true);
-  });
-
-  test("y then y grants both act and roster access", () => {
-    const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "1@g.us": { name: "Family", memberCount: 4, archived: false, updatedAt: 0 },
-    });
-    const res = runWithInput(dir, "y\ny\n", "wizard");
-    expect(res.code).toBe(0);
-    expect(access(dir).groups["1@g.us"].roster).toBe(true);
-  });
-
-  test("n (or anything else) skips a group with no roster prompt asked, and writes nothing", () => {
-    const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "1@g.us": { name: "Family", memberCount: 4, archived: false, updatedAt: 0 },
-    });
-    const res = runWithInput(dir, "n\n", "wizard");
-    expect(res.code).toBe(0);
-    expect(res.out).toContain("Skipped.");
-    expect(res.out).toContain("No groups configured.");
-    // Nothing changed, so access.json is never even created.
+    expect(res.out).toContain("0 group(s), 0 contact(s) configured.");
     expect(existsSync(join(dir, "access.json"))).toBe(false);
   });
 
-  test("two live candidates in one run: skip the first, configure the second", () => {
-    // Regression coverage for the loop actually iterating more than once -
-    // the earlier "already configured" test filters both candidates out
-    // before the loop runs at all, so it never exercised this.
-    const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "1@g.us": { name: "Alpha", memberCount: 2, archived: false, updatedAt: 0 },
-      "2@g.us": { name: "Beta", memberCount: 5, archived: false, updatedAt: 0 },
-    });
-    // Sorted by name: Alpha first (skip with "n"), then Beta (y, y).
-    const res = runWithInput(dir, "n\ny\ny\n", "wizard");
-    expect(res.code).toBe(0);
-    const a = access(dir);
-    expect(a.groups["1@g.us"]).toBeUndefined();
-    expect(a.groups["2@g.us"]).toEqual({
-      requireMention: true,
-      allowFrom: [],
-      roster: true,
-    });
-    expect(res.out).toContain("1 group(s) configured.");
-  });
-
-  test("--include-archived reviews archived groups too", () => {
+  test("--include-archived surfaces an archived group as a candidate", () => {
     const dir = freshStateDir();
     writeGroupsMeta(dir, {
       "1@g.us": { name: "Old Chat", memberCount: 2, archived: true, updatedAt: 0 },
     });
-    const res = runWithInput(dir, "y\nn\n", "wizard", "--include-archived");
+    // Without the flag there'd be nothing to review at all (see the test
+    // above this one) - with it, the group is offered, even though this
+    // run selects none of it.
+    const res = runWithInput(dir, "\n", "wizard", "--include-archived");
     expect(res.code).toBe(0);
-    expect(access(dir).groups["1@g.us"]).toBeDefined();
+    expect(res.out).toContain("Old Chat");
+    // Nothing was selected, so nothing was written at all.
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
   });
 
-  test("the closing privacy line is always printed, in plain text when not a TTY", () => {
+  test("DMs only, select none: nothing configured, access.json never created", () => {
+    const dir = freshStateDir();
+    writeDmActivity(dir, { "1@s.whatsapp.net": 1000 });
+    const res = runWithInput(dir, "\n", "wizard");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("0 group(s), 0 contact(s) configured.");
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
+  });
+
+  test("DMs only, select the one candidate: added to the allowlist", () => {
+    const dir = freshStateDir();
+    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 1000 });
+    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
+    const res = runWithInput(dir, " \n", "wizard"); // space selects, enter submits
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("0 group(s), 1 contact(s) configured.");
+    expect(access(dir).allowFrom).toEqual(["61403911675@s.whatsapp.net"]);
+  });
+
+  test("DM candidate label shows the saved name, never the raw number", () => {
+    const dir = freshStateDir();
+    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 1000 });
+    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
+    const res = runWithInput(dir, "\n", "wizard");
+    expect(res.out).toContain("Rohan");
+    expect(res.out).not.toContain("61403911675");
+  });
+
+  test("Ctrl-C cancels cleanly: nothing written, no raw stack trace", () => {
     const dir = freshStateDir();
     writeGroupsMeta(dir, {
       "1@g.us": { name: "Family", memberCount: 4, archived: false, updatedAt: 0 },
     });
-    const res = runWithInput(dir, "n\n", "wizard");
+    const res = runWithInput(dir, "\x03", "wizard");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("Cancelled - nothing was changed.");
+    expect(res.out).not.toContain("ExitPromptError");
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
+  });
+
+  test("the closing privacy line is always printed, in plain text (not the amber highlight) when not a TTY", () => {
+    const dir = freshStateDir();
+    writeDmActivity(dir, { "1@s.whatsapp.net": 1000 });
+    const res = runWithInput(dir, "\n", "wizard");
     expect(res.out).toContain(
       "No group or contact data was sent to any AI model during this setup",
     );
-    // execFileSync's pipes are never a TTY, so no ANSI escape should appear.
-    expect(res.out).not.toContain("\x1b[");
+    // execFileSync's pipes are never a TTY, so highlight() must not wrap
+    // the disclosure line in the bold-amber escape - inquirer's OWN prompt
+    // rendering does use ANSI regardless of TTY, so this checks the specific
+    // color code highlight() would add, not "no ANSI anywhere in the output".
+    expect(res.out).not.toContain("\x1b[1;38;5;208m");
   });
 });
 
