@@ -17,7 +17,11 @@ describe("normalizeMentionJids", () => {
 
   test("bare number with a cached LID resolves to the LID JID", () => {
     const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
-    const [pair] = normalizeMentionJids(["61403911675"], lidMap, jidNormalizedUser);
+    const [pair] = normalizeMentionJids(
+      ["61403911675"],
+      lidMap,
+      jidNormalizedUser,
+    );
     expect(pair).toEqual({
       input: "61403911675",
       jid: "184710990000999@lid",
@@ -71,19 +75,18 @@ describe("mentionsForChunk", () => {
     // resolves it to a different local part (the LID), but the caller
     // was told to (and did) type "@<phone-number>" in the text.
     const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
-    const pairs = normalizeMentionJids(["61403911675"], lidMap, jidNormalizedUser);
+    const pairs = normalizeMentionJids(
+      ["61403911675"],
+      lidMap,
+      jidNormalizedUser,
+    );
     const result = mentionsForChunk("hey @61403911675 you're up", pairs);
     expect(result).toEqual(["184710990000999@lid"]);
   });
 
   test("four mixed entries: only the ones referenced in this chunk's text are attached", () => {
     const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
-    const raw = [
-      "61434505973",
-      "23058185377",
-      "61405070760",
-      "61403911675",
-    ];
+    const raw = ["61434505973", "23058185377", "61405070760", "61403911675"];
     const pairs = normalizeMentionJids(raw, lidMap, jidNormalizedUser);
     const text =
       "@61434505973 @23058185377 @61405070760 @61403911675 all four, please";
@@ -102,7 +105,11 @@ describe("mentionsForChunk", () => {
   });
 
   test("a shorter mentioned id that prefixes a longer one doesn't false-match", () => {
-    const pairs = normalizeMentionJids(["6123", "61234567"], {}, jidNormalizedUser);
+    const pairs = normalizeMentionJids(
+      ["6123", "61234567"],
+      {},
+      jidNormalizedUser,
+    );
     const result = mentionsForChunk("hey @61234567 nice work", pairs);
     expect(result).toEqual(["61234567@s.whatsapp.net"]);
   });
