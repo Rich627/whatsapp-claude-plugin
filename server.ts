@@ -75,6 +75,7 @@ const GROUPS_DIR = join(STATE_DIR, "groups");
 const LID_MAP_FILE = join(STATE_DIR, "lid-map.json");
 const CONTACTS_FILE = join(STATE_DIR, "contacts.json");
 const GROUPS_META_FILE = join(STATE_DIR, "groups-meta.json");
+const DM_ACTIVITY_FILE = join(STATE_DIR, "dm-activity.json");
 const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
 const TASKS_FILE = join(STATE_DIR, "tasks.md");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
@@ -531,6 +532,11 @@ type GroupMeta = {
   name: string;
   memberCount: number;
   archived: boolean;
+  // Epoch ms of the group's last activity (WhatsApp's own conversationTimestamp),
+  // for ranking the access wizard's "top 5 by recency" - same field the
+  // WhatsApp app itself sorts its chat list by. Absent until at least one
+  // chats.upsert/update has been seen for this group.
+  lastActivityAt?: number;
   updatedAt: number;
 };
 
@@ -547,6 +553,37 @@ function saveGroupsMeta(): void {
   renameSync(tmp, GROUPS_META_FILE);
 }
 
+// DM (non-group) chat activity, keyed the same phone-resolved way
+// contacts.json is (contactKey()) so a wizard lookup can reuse the same
+// key for both the timestamp and the saved name with no extra resolution.
+// Only a timestamp - a DM has no name/archived concept of its own the way
+// a group does (names live in contactsMap already).
+let dmActivity: Record<string, number> = {};
+try {
+  dmActivity = JSON.parse(readFileSync(DM_ACTIVITY_FILE, "utf8"));
+} catch {}
+
+function saveDmActivity(): void {
+  const tmp = DM_ACTIVITY_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(dmActivity, null, 2) + "\n", {
+    mode: 0o600,
+  });
+  renameSync(tmp, DM_ACTIVITY_FILE);
+}
+
+// Baileys' chat timestamps are Unix SECONDS (the WhatsApp protobuf
+// convention) and may arrive as a plain number or a protobuf Long -
+// Number() on either already works, the same conversion this file already
+// uses for msg.messageTimestamp. Converted to epoch ms here to match every
+// other timestamp this codebase stores (Date.now()-based).
+function toEpochMs(
+  ts: number | { toNumber(): number } | null | undefined,
+): number | undefined {
+  if (ts === null || ts === undefined) return undefined;
+  const seconds = typeof ts === "number" ? ts : ts.toNumber();
+  return seconds * 1000;
+}
+
 // Only groups carry an access decision in this project - a DM's archived
 // state has no equivalent meaning here, so non-group chat ids are ignored.
 function applyChatArchive(
@@ -560,10 +597,43 @@ function applyChatArchive(
   groupsMeta[id] = {
     name: existing?.name ?? groupNameCache[id] ?? id,
     memberCount: existing?.memberCount ?? 0,
+    lastActivityAt: existing?.lastActivityAt,
     archived,
     updatedAt: Date.now(),
   };
   return true;
+}
+
+// Records last-activity time for any chat - a group's entry in groupsMeta
+// (ranks the access wizard's top-5) or a DM's entry in dmActivity (top-10).
+// Returns which cache actually changed, so the batched chats.upsert/update
+// listener (many chats in one event, especially on first sync) saves once
+// per event instead of once per chat.
+function applyChatActivity(
+  id: string | null | undefined,
+  conversationTimestamp: number | { toNumber(): number } | null | undefined,
+): { groups: boolean; dms: boolean } {
+  const activityMs = toEpochMs(conversationTimestamp);
+  if (!id || activityMs === undefined) return { groups: false, dms: false };
+  if (id.endsWith("@g.us")) {
+    const existing = groupsMeta[id];
+    if (existing?.lastActivityAt === activityMs) return { groups: false, dms: false };
+    groupsMeta[id] = {
+      name: existing?.name ?? groupNameCache[id] ?? id,
+      memberCount: existing?.memberCount ?? 0,
+      archived: existing?.archived ?? false,
+      lastActivityAt: activityMs,
+      updatedAt: Date.now(),
+    };
+    return { groups: true, dms: false };
+  }
+  if (id.endsWith("@s.whatsapp.net") || id.endsWith("@lid")) {
+    const key = contactKey(id);
+    if (dmActivity[key] === activityMs) return { groups: false, dms: false };
+    dmActivity[key] = activityMs;
+    return { groups: false, dms: true };
+  }
+  return { groups: false, dms: false };
 }
 
 let groupsMetaRefreshedAt = 0;
@@ -2776,22 +2846,35 @@ async function connectWhatsApp(): Promise<void> {
     if (changed) saveContactsMap();
   });
 
-  // Archived state for groups only, feeding the on-disk groups-meta cache
-  // (see applyChatArchive) - the terminal access wizard excludes archived
-  // groups from its default listing, and this is the only signal for that.
+  // Archived state for groups (see applyChatArchive) and last-activity time
+  // for both groups and DMs (see applyChatActivity), feeding the on-disk
+  // groups-meta and dm-activity caches - the terminal access wizard uses
+  // archived to exclude groups from its default listing, and activity to
+  // rank its "top 5 groups / top 10 contacts" screen the same way the
+  // WhatsApp app itself orders its own chat list.
   sock.ev.on("chats.upsert", (chats) => {
-    let changed = false;
+    let groupsChanged = false;
+    let dmsChanged = false;
     for (const c of chats) {
-      if (applyChatArchive(c.id, c.archived)) changed = true;
+      if (applyChatArchive(c.id, c.archived)) groupsChanged = true;
+      const activity = applyChatActivity(c.id, c.conversationTimestamp);
+      if (activity.groups) groupsChanged = true;
+      if (activity.dms) dmsChanged = true;
     }
-    if (changed) saveGroupsMeta();
+    if (groupsChanged) saveGroupsMeta();
+    if (dmsChanged) saveDmActivity();
   });
   sock.ev.on("chats.update", (updates) => {
-    let changed = false;
+    let groupsChanged = false;
+    let dmsChanged = false;
     for (const u of updates) {
-      if (applyChatArchive(u.id, u.archived)) changed = true;
+      if (applyChatArchive(u.id, u.archived)) groupsChanged = true;
+      const activity = applyChatActivity(u.id, u.conversationTimestamp);
+      if (activity.groups) groupsChanged = true;
+      if (activity.dms) dmsChanged = true;
     }
-    if (changed) saveGroupsMeta();
+    if (groupsChanged) saveGroupsMeta();
+    if (dmsChanged) saveDmActivity();
   });
 
   // ─── Pairing code: request independently of QR event ─────────────────

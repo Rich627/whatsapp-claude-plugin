@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   contactName,
+  forgetContact,
   mergeContact,
   migrateContactKey,
   resolveByName,
@@ -143,6 +144,29 @@ describe("migrateContactKey", () => {
     const map: ContactsMap = { x: { name: "Akash" } };
     expect(migrateContactKey(map, "x", "x")).toBe(false);
     expect(map.x).toEqual({ name: "Akash" });
+  });
+});
+
+describe("forgetContact", () => {
+  test("deletes an existing entry and reports true", () => {
+    const map: ContactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
+    expect(forgetContact(map, "x@s.whatsapp.net")).toBe(true);
+    expect(map["x@s.whatsapp.net"]).toBeUndefined();
+  });
+
+  test("no entry at that key: no-op, reports false", () => {
+    const map: ContactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
+    expect(forgetContact(map, "y@s.whatsapp.net")).toBe(false);
+    expect(map["x@s.whatsapp.net"]).toEqual({ name: "Akash" });
+  });
+
+  test("only removes the targeted key, leaves the rest of the map alone", () => {
+    const map: ContactsMap = {
+      "x@s.whatsapp.net": { name: "Akash" },
+      "y@s.whatsapp.net": { name: "Neha" },
+    };
+    forgetContact(map, "x@s.whatsapp.net");
+    expect(map).toEqual({ "y@s.whatsapp.net": { name: "Neha" } });
   });
 });
 

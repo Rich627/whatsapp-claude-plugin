@@ -67,6 +67,27 @@ export function migrateContactKey(
   return true;
 }
 
+// Removes a contact's cached name entirely - used when access is
+// explicitly REVOKED, never when someone is simply never granted it in
+// the first place (declining to select someone during onboarding was
+// never a decision to forget them - their name just stays passively
+// cached, the same as anything else WhatsApp's own sync already sent).
+//
+// Deliberately does NOT touch lid-map.json. That file is pure routing
+// (LID <-> phone correlation), never shown to a human or an AI anywhere in
+// this codebase, and needed for correct message/mention matching if this
+// person is still an active participant in a group the account can still
+// see. Only the display-relevant name is what "forgetting" someone means -
+// blocking them or removing them from a shared group isn't something this
+// plugin does, so their WhatsApp-side presence there is unaffected either
+// way; this only controls what gets shown for them going forward (a
+// masked number instead of a name, same as any other unknown participant).
+export function forgetContact(map: ContactsMap, jid: string): boolean {
+  if (!(jid in map)) return false;
+  delete map[jid];
+  return true;
+}
+
 export type NameResolution =
   | { ok: true; jid: string }
   | { ok: false; reason: "not_found" }
