@@ -36,6 +36,17 @@ describe("normalizeMentionJids", () => {
     });
   });
 
+  test("a doubled leading @ doesn't produce an empty match key", () => {
+    // A single-@ strip left "@61434505973" -> split("@")[0] === "" -> the
+    // regex built from that empty input matched almost any "@" in the text.
+    const [pair] = normalizeMentionJids(
+      ["@@61434505973"],
+      {},
+      jidNormalizedUser,
+    );
+    expect(pair.input).toBe("61434505973");
+  });
+
   test("two input spellings resolving to the same jid both survive", () => {
     // A LID and its phone number for the same person, passed as two
     // separate mentions entries: neither input should be silently dropped,

@@ -19,7 +19,7 @@ export function normalizeMentionJids(
   for (const entry of raw) {
     const s = String(entry ?? "")
       .trim()
-      .replace(/^@/, "");
+      .replace(/^@+/, "");
     if (!s) continue;
     let jid: string;
     if (s.includes("@")) {
