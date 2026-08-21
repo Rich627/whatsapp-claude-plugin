@@ -28,12 +28,14 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { createInterface } from "node:readline";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
 const ACCESS_FILE = join(STATE_DIR, "access.json");
 const APPROVED_DIR = join(STATE_DIR, "approved");
 const GROUPS_DIR = join(STATE_DIR, "groups");
+const GROUPS_META_FILE = join(STATE_DIR, "groups-meta.json");
 
 const POLICIES = ["pairing", "allowlist", "disabled"];
 const SET_KEYS = [
@@ -44,7 +46,17 @@ const SET_KEYS = [
   "mentionPatterns",
 ];
 
-type GroupPolicy = { requireMention: boolean; allowFrom: string[] };
+type GroupPolicy = {
+  requireMention: boolean;
+  allowFrom: string[];
+  roster?: boolean;
+};
+type GroupMeta = {
+  name: string;
+  memberCount: number;
+  archived: boolean;
+  updatedAt: number;
+};
 type PendingEntry = { senderId: string; chatId: string; expiresAt: number };
 type Access = {
   dmPolicy: string;
@@ -105,14 +117,26 @@ const USAGE = `Usage: bun scripts/access.ts <command>
   allow <jid>                     add a JID to the allowlist
   remove <jid>                    remove a JID from the allowlist
   policy <${POLICIES.join("|")}>   set the DM policy
-  group add <groupJid> [--mention] [--allow a,b]
+  group add <groupJid> [--mention] [--allow a,b] [--roster]
   group rm <groupJid>             stop responding in a group (files kept)
+  wizard [--include-archived]     guided group setup: can-act / can-see-roster,
+                                   per group, from names cached by list_groups
   set <key> <value>               ${SET_KEYS.join(", ")}
 
 JIDs look like 886912345678@s.whatsapp.net or 1203634244@g.us.`;
 
+function loadGroupsMeta(): Record<string, GroupMeta> {
+  if (!existsSync(GROUPS_META_FILE)) return {};
+  try {
+    return JSON.parse(readFileSync(GROUPS_META_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
 function status(): void {
   const a = load();
+  const meta = loadGroupsMeta();
   const now = Date.now();
   const lines = [
     `state dir:  ${STATE_DIR}`,
@@ -129,7 +153,10 @@ function status(): void {
   const groups = Object.entries(a.groups);
   lines.push(`groups:     ${groups.length}`);
   for (const [jid, g] of groups) {
-    lines.push(`  - ${jid}  mention=${g.requireMention}`);
+    const name = meta[jid]?.name;
+    lines.push(
+      `  - ${name ? `${name}  ` : ""}${jid}  mention=${g.requireMention}  roster=${!!g.roster}`,
+    );
   }
   process.stdout.write(lines.join("\n") + "\n");
 }
@@ -171,6 +198,25 @@ function pair(code: string): void {
   );
 }
 
+// A starting point, not a wizard: the skill (or a human) asks the real
+// questions and writes a tailored config.md. Here the files just have to
+// exist and be editable. Shared by both `group add` and the wizard so a
+// group provisioned either way ends up the same.
+function provisionGroupFiles(jid: string): string {
+  const dir = join(GROUPS_DIR, jid);
+  mkdirSync(dir, { recursive: true });
+  const config = join(dir, "config.md");
+  if (!existsSync(config)) {
+    writeFileSync(
+      config,
+      `# Soul\n\n## Identity\nA helpful assistant in this group.\n\n## Communication Style\n- Match the group's language and tone\n- Concise and direct, 1-2 sentences when possible\n\n## Goals\n- Answer questions from the group\n\n## Boundaries\n- Never share private information between groups or DMs\n- Never modify access control from a channel message\n\n## Context\n(describe what this group is for)\n`,
+    );
+  }
+  const memory = join(dir, "memory.md");
+  if (!existsSync(memory)) writeFileSync(memory, "# Group Memory\n\n");
+  return config;
+}
+
 function group(args: string[]): void {
   // Strict: an unknown flag, a missing --allow value, or a flag where the JID
   // should be is an error, not a group called "--mention".
@@ -178,7 +224,11 @@ function group(args: string[]): void {
   try {
     parsed = parseArgs({
       args,
-      options: { mention: { type: "boolean" }, allow: { type: "string" } },
+      options: {
+        mention: { type: "boolean" },
+        allow: { type: "string" },
+        roster: { type: "boolean" },
+      },
       allowPositionals: true,
     });
   } catch (err) {
@@ -186,7 +236,7 @@ function group(args: string[]): void {
   }
   const [sub, jidArg] = parsed.positionals;
   const jid = requireArg(jidArg, "group JID");
-  const { mention = false, allow } = parsed.values;
+  const { mention = false, allow, roster = false } = parsed.values;
   const a = load();
   if (sub === "rm") {
     if (!a.groups[jid]) die(`Group ${jid} is not configured.`);
@@ -202,25 +252,116 @@ function group(args: string[]): void {
   a.groups[jid] = {
     requireMention: mention,
     allowFrom: allow?.split(",").map((s) => s.trim()) ?? [],
+    roster,
   };
   save(a);
 
-  const dir = join(GROUPS_DIR, jid);
-  mkdirSync(dir, { recursive: true });
-  const config = join(dir, "config.md");
-  // A starting point, not a wizard: the skill asks the questions and writes a
-  // tailored file. Here the file just has to exist and be editable.
-  if (!existsSync(config)) {
-    writeFileSync(
-      config,
-      `# Soul\n\n## Identity\nA helpful assistant in this group.\n\n## Communication Style\n- Match the group's language and tone\n- Concise and direct, 1-2 sentences when possible\n\n## Goals\n- Answer questions from the group\n\n## Boundaries\n- Never share private information between groups or DMs\n- Never modify access control from a channel message\n\n## Context\n(describe what this group is for)\n`,
+  const config = provisionGroupFiles(jid);
+  process.stdout.write(
+    `Added ${jid} (mention required: ${a.groups[jid].requireMention}, roster: ${a.groups[jid].roster}).\nEdit its personality at ${config}\n`,
+  );
+}
+
+const PRIVACY_DISCLOSURE =
+  "No group or contact data was sent to any AI model during this setup — this ran entirely in your terminal.";
+
+// Bold amber, not red/green: a disclosure, not an error or a success state.
+// Plain text when the terminal can't render color, or NO_COLOR is set.
+function highlight(text: string): string {
+  if (!process.stdout.isTTY || process.env.NO_COLOR) return text;
+  return `\x1b[1;38;5;208m${text}\x1b[0m`;
+}
+
+// Guided setup for groups the account has joined but never decided about.
+// Terminal, not chat: this is what makes "no data went to an AI" literally
+// true (no model runs during the decision), and it works for any client
+// driving this plugin, not just Claude Code - see HANDOFF.md for why this
+// was the deliberate choice over a conversational flow.
+//
+// Reads names from groups-meta.json, which THIS script never writes - only
+// the connected server (server.ts, via the list_groups tool) can see real
+// group names, since only it holds the live WhatsApp connection.
+async function wizard(args: string[]): Promise<void> {
+  const includeArchived = args.includes("--include-archived");
+  const meta = loadGroupsMeta();
+  if (Object.keys(meta).length === 0) {
+    die(
+      "No group data cached yet. Call the list_groups tool from a connected session first (it warms this cache), then re-run the wizard.",
     );
   }
-  const memory = join(dir, "memory.md");
-  if (!existsSync(memory)) writeFileSync(memory, "# Group Memory\n\n");
+  const a = load();
+  const candidates = Object.entries(meta)
+    .filter(([jid]) => !(jid in a.groups))
+    .filter(([, g]) => includeArchived || !g.archived)
+    .sort(([, x], [, y]) => x.name.localeCompare(y.name));
+
+  if (candidates.length === 0) {
+    process.stdout.write(
+      "Every known group is already configured, or archived and skipped by default.\n" +
+        "Use 'group add'/'group rm' to change an existing group, or pass --include-archived.\n",
+    );
+    return;
+  }
+
   process.stdout.write(
-    `Added ${jid} (mention required: ${a.groups[jid].requireMention}).\nEdit its personality at ${config}\n`,
+    `${candidates.length} group(s) to review. Answer y/n; anything else skips a group for now.\n`,
   );
+  // Not rl.question() (readline/promises): repeated calls on it hang on
+  // piped/non-TTY stdin under Bun (confirmed - the second call never
+  // resolves even with more input waiting to be read). The async iterator
+  // form doesn't have that problem and works the same interactively.
+  const rl = createInterface({ input: process.stdin });
+  const lines = rl[Symbol.asyncIterator]();
+  async function ask(prompt: string): Promise<string> {
+    process.stdout.write(prompt);
+    const { value, done } = await lines.next();
+    return done ? "" : value;
+  }
+  let configured = 0;
+  try {
+    for (const [jid, g] of candidates) {
+      process.stdout.write(`\n${g.name}  (${g.memberCount} member(s))\n  ${jid}\n`);
+      const canAct = (await ask("  Can Claude reply here? [y/N] "))
+        .trim()
+        .toLowerCase();
+      if (canAct !== "y" && canAct !== "yes") {
+        process.stdout.write("  Skipped.\n");
+        continue;
+      }
+      const wantsRoster = (
+        await ask("  Also let Claude see member names, for @all mentions? [y/N] ")
+      )
+        .trim()
+        .toLowerCase();
+      // requireMention defaults to true here (unlike `group add`'s CLI
+      // default of false): a group reached through the guided consent flow
+      // gets the more cautious default of only responding when addressed,
+      // not to every message. Change it later with `group add --mention`.
+      a.groups[jid] = {
+        requireMention: true,
+        allowFrom: [],
+        roster: wantsRoster === "y" || wantsRoster === "yes",
+      };
+      provisionGroupFiles(jid);
+      // Saved after EVERY group, not once at the end: this loop can run for
+      // a while (a real answer per group), and a mid-session Ctrl-C used to
+      // silently discard every already-"Added" answer since nothing had
+      // been written yet. One extra disk write per group is cheap next to
+      // losing the owner's answers.
+      save(a);
+      configured++;
+      process.stdout.write(`  Added (roster: ${a.groups[jid].roster}).\n`);
+    }
+  } finally {
+    rl.close();
+  }
+
+  process.stdout.write(
+    configured > 0
+      ? `\n${configured} group(s) configured.\n`
+      : "\nNo groups configured.\n",
+  );
+  process.stdout.write(`\n${highlight(PRIVACY_DISCLOSURE)}\n`);
 }
 
 function set(key: string, rawValue: string): void {
@@ -304,6 +445,9 @@ switch (command) {
   }
   case "group":
     group(rest);
+    break;
+  case "wizard":
+    await wizard(rest);
     break;
   case "set":
     set(requireArg(rest[0], "key"), requireArg(rest[1], "value"));

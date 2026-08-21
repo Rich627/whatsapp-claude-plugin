@@ -25,6 +25,35 @@ function run(dir: string, ...args: string[]): { out: string; code: number } {
   }
 }
 
+/** Like run(), but feeds `stdin` to the process - for the wizard's prompts. */
+function runWithInput(
+  dir: string,
+  stdin: string,
+  ...args: string[]
+): { out: string; code: number } {
+  try {
+    const out = execFileSync("bun", [CLI, ...args], {
+      encoding: "utf8",
+      env: { ...process.env, WHATSAPP_STATE_DIR: dir },
+      input: stdin,
+    });
+    return { out, code: 0 };
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string; status?: number };
+    return { out: (e.stdout ?? "") + (e.stderr ?? ""), code: e.status ?? 1 };
+  }
+}
+
+function writeGroupsMeta(
+  dir: string,
+  meta: Record<
+    string,
+    { name: string; memberCount: number; archived: boolean; updatedAt: number }
+  >,
+): void {
+  writeFileSync(join(dir, "groups-meta.json"), JSON.stringify(meta, null, 2));
+}
+
 const access = (dir: string) =>
   JSON.parse(readFileSync(join(dir, "access.json"), "utf8"));
 
@@ -118,6 +147,7 @@ describe("groups", () => {
     expect(access(dir).groups["1@g.us"]).toEqual({
       requireMention: true,
       allowFrom: ["x@s", "y@s"],
+      roster: false,
     });
     const config = join(dir, "groups", "1@g.us", "config.md");
     expect(existsSync(config)).toBe(true);
@@ -145,6 +175,119 @@ describe("groups", () => {
     expect(run(dir, "group", "add", "2@g.us", "--bogus").code).toBe(1);
     expect(run(dir, "group", "add", "2@g.us", "--allow").code).toBe(1);
     expect(access(dir).groups["2@g.us"]).toBeUndefined();
+  });
+
+  test("--roster grants roster access; omitting it defaults to false", () => {
+    const dir = freshStateDir();
+    run(dir, "group", "add", "1@g.us", "--roster");
+    expect(access(dir).groups["1@g.us"].roster).toBe(true);
+    run(dir, "group", "add", "2@g.us");
+    expect(access(dir).groups["2@g.us"].roster).toBe(false);
+  });
+});
+
+describe("wizard", () => {
+  test("no groups-meta.json cached yet: refuses with a clear message", () => {
+    const dir = freshStateDir();
+    const res = run(dir, "wizard");
+    expect(res.code).toBe(1);
+    expect(res.out).toContain("No group data cached yet");
+  });
+
+  test("archived groups are skipped by default; already-configured groups are skipped too", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": { name: "Active", memberCount: 3, archived: false, updatedAt: 0 },
+      "2@g.us": { name: "Archived", memberCount: 2, archived: true, updatedAt: 0 },
+    });
+    run(dir, "group", "add", "1@g.us"); // already configured
+    const res = run(dir, "wizard");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("Every known group is already configured");
+    expect(access(dir).groups["2@g.us"]).toBeUndefined();
+  });
+
+  test("y then n grants act-only access (roster stays false)", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": { name: "Family", memberCount: 4, archived: false, updatedAt: 0 },
+    });
+    const res = runWithInput(dir, "y\nn\n", "wizard");
+    expect(res.code).toBe(0);
+    expect(access(dir).groups["1@g.us"]).toEqual({
+      requireMention: true,
+      allowFrom: [],
+      roster: false,
+    });
+    expect(existsSync(join(dir, "groups", "1@g.us", "config.md"))).toBe(true);
+  });
+
+  test("y then y grants both act and roster access", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": { name: "Family", memberCount: 4, archived: false, updatedAt: 0 },
+    });
+    const res = runWithInput(dir, "y\ny\n", "wizard");
+    expect(res.code).toBe(0);
+    expect(access(dir).groups["1@g.us"].roster).toBe(true);
+  });
+
+  test("n (or anything else) skips a group with no roster prompt asked, and writes nothing", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": { name: "Family", memberCount: 4, archived: false, updatedAt: 0 },
+    });
+    const res = runWithInput(dir, "n\n", "wizard");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("Skipped.");
+    expect(res.out).toContain("No groups configured.");
+    // Nothing changed, so access.json is never even created.
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
+  });
+
+  test("two live candidates in one run: skip the first, configure the second", () => {
+    // Regression coverage for the loop actually iterating more than once -
+    // the earlier "already configured" test filters both candidates out
+    // before the loop runs at all, so it never exercised this.
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": { name: "Alpha", memberCount: 2, archived: false, updatedAt: 0 },
+      "2@g.us": { name: "Beta", memberCount: 5, archived: false, updatedAt: 0 },
+    });
+    // Sorted by name: Alpha first (skip with "n"), then Beta (y, y).
+    const res = runWithInput(dir, "n\ny\ny\n", "wizard");
+    expect(res.code).toBe(0);
+    const a = access(dir);
+    expect(a.groups["1@g.us"]).toBeUndefined();
+    expect(a.groups["2@g.us"]).toEqual({
+      requireMention: true,
+      allowFrom: [],
+      roster: true,
+    });
+    expect(res.out).toContain("1 group(s) configured.");
+  });
+
+  test("--include-archived reviews archived groups too", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": { name: "Old Chat", memberCount: 2, archived: true, updatedAt: 0 },
+    });
+    const res = runWithInput(dir, "y\nn\n", "wizard", "--include-archived");
+    expect(res.code).toBe(0);
+    expect(access(dir).groups["1@g.us"]).toBeDefined();
+  });
+
+  test("the closing privacy line is always printed, in plain text when not a TTY", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": { name: "Family", memberCount: 4, archived: false, updatedAt: 0 },
+    });
+    const res = runWithInput(dir, "n\n", "wizard");
+    expect(res.out).toContain(
+      "No group or contact data was sent to any AI model during this setup",
+    );
+    // execFileSync's pipes are never a TTY, so no ANSI escape should appear.
+    expect(res.out).not.toContain("\x1b[");
   });
 });
 

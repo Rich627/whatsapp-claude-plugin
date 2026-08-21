@@ -61,4 +61,16 @@ describe("looksLikeNumber", () => {
     expect(looksLikeNumber("")).toBe(false);
     expect(looksLikeNumber("   ")).toBe(false);
   });
+
+  test("a number embedded in other text is still caught, not just a pure number", () => {
+    // A .notify like "call 0403911675" is not ITSELF just a number, but it
+    // still leaks the embedded one - the whole point of this check.
+    expect(looksLikeNumber("call 0403911675")).toBe(true);
+    expect(looksLikeNumber("WhatsApp: 0403 911 675")).toBe(true);
+  });
+
+  test("a short embedded digit run (under 6 digits) is not flagged", () => {
+    expect(looksLikeNumber("Room 42, 3rd floor")).toBe(false);
+    expect(looksLikeNumber("Agent 007")).toBe(false);
+  });
 });

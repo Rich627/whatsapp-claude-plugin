@@ -22,6 +22,14 @@ export function maskNumber(input: string): string {
 // number to a caller that thought it was getting a name. A caller with
 // that guarantee to keep should treat a number-shaped result as no name
 // at all and mask it instead.
+//
+// Checks for a number-shaped run ANYWHERE in the string, not just when the
+// whole thing is one - a `.notify` like "call 0403911675" or "WhatsApp:
+// 0403 911 675" still leaks the embedded number if only a whole-string
+// match were checked. A run needs at least 6 real digits to count: long
+// enough to be a phone-number fragment, short enough that "Room 42" or
+// "Team7" don't false-positive.
 export function looksLikeNumber(s: string): boolean {
-  return /^\+?[\d\s()-]{4,}$/.test(s.trim());
+  const runs = s.match(/\d[\d\s()-]{3,}\d/g) ?? [];
+  return runs.some((run) => (run.match(/\d/g)?.length ?? 0) >= 6);
 }
