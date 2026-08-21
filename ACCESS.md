@@ -95,7 +95,7 @@ Both fail with a clear error if the group's `roster` flag isn't granted.
 
 ## Guided group consent (wizard)
 
-`bun scripts/access.ts wizard` walks every joined group not yet configured (archived ones skipped by default — pass `--include-archived` to include them), asking two separate yes/no questions per group: can Claude reply here, and can Claude also see member names. It reads group names from a cache (`~/.whatsapp-channel/groups-meta.json`) that only the running server writes — call the `list_groups` tool at least once first to populate it, or the wizard has nothing to show.
+`bun scripts/access.ts wizard` walks every joined group not yet configured (archived ones skipped by default — pass `--include-archived` to include them), asking two separate yes/no questions per group: can Claude reply here, and can Claude also see member names. It reads group names from a cache (`~/.whatsapp-channel/groups-meta.json`) that only the running server writes — automatically, once, the moment WhatsApp connects (the same way it already auto-syncs your saved contact names), and again every time the `list_groups` tool runs. If the server has never connected at all yet, the wizard has nothing to show; pair it first.
 
 It's a terminal command, deliberately not a Claude Code skill: running it yourself, outside any chat, is what makes this true —
 

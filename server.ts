@@ -566,6 +566,58 @@ function applyChatArchive(
   return true;
 }
 
+let groupsMetaRefreshedAt = 0;
+const GROUPS_META_CONNECT_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+
+// Fetches every group this account is currently in and updates the name
+// cache and the persisted groups-meta snapshot - shared by list_groups
+// (which also builds the display text from the result, and always wants a
+// real fetch - an explicit call is asking for current state) and
+// connectWhatsApp (which calls this on every successful connect purely to
+// warm the cache, the same way contacts.upsert already warms the
+// contact-name cache automatically, no user action required). Archived
+// state is left untouched here - it's only ever set by the
+// chats.upsert/chats.update listeners.
+//
+// `skipIfRecent` exists only for the connect call site: a flaky-network
+// period can cycle disconnect/reconnect many times in a few minutes, and
+// without this a full group-list fetch (a real query against WhatsApp's
+// servers, not free) would refire on every single one for data that
+// almost never changes between reconnects seconds apart. list_groups
+// never passes it, so an explicit call is always a real fetch.
+async function refreshGroupsMeta(
+  activeSock: NonNullable<typeof sock>,
+  { skipIfRecent = false }: { skipIfRecent?: boolean } = {},
+) {
+  if (
+    skipIfRecent &&
+    Date.now() - groupsMetaRefreshedAt < GROUPS_META_CONNECT_COOLDOWN_MS
+  ) {
+    return [];
+  }
+  const meta = await activeSock.groupFetchAllParticipating();
+  groupsMetaRefreshedAt = Date.now();
+  const groups = Object.values(meta);
+  let metaChanged = false;
+  for (const g of groups) {
+    const name = g.subject || "(no name)";
+    if (g.subject) groupNameCache[g.id] = g.subject;
+    const existing = groupsMeta[g.id];
+    const memberCount = g.participants?.length ?? 0;
+    if (!existing || existing.name !== name || existing.memberCount !== memberCount) {
+      groupsMeta[g.id] = {
+        name,
+        memberCount,
+        archived: existing?.archived ?? false,
+        updatedAt: Date.now(),
+      };
+      metaChanged = true;
+    }
+  }
+  if (metaChanged) saveGroupsMeta();
+  return groups;
+}
+
 async function resolveGroupName(groupJid: string): Promise<string> {
   if (groupNameCache[groupJid]) return groupNameCache[groupJid];
   try {
@@ -1897,8 +1949,7 @@ const handleToolCall = async (req: {
       case "list_groups": {
         if (!sock) throw new Error("WhatsApp not connected");
         const access = loadAccess();
-        const meta = await sock.groupFetchAllParticipating();
-        const groups = Object.values(meta);
+        const groups = await refreshGroupsMeta(sock);
         if (groups.length === 0) {
           return {
             content: [
@@ -1907,33 +1958,13 @@ const handleToolCall = async (req: {
           };
         }
         groups.sort((a, b) => (a.subject ?? "").localeCompare(b.subject ?? ""));
-        let metaChanged = false;
         const lines = groups.map((g) => {
           const allowed = g.id in access.groups;
           const roster = !!access.groups[g.id]?.roster;
           const name = g.subject || "(no name)";
-          if (g.subject) groupNameCache[g.id] = g.subject; // warm the cache while we have it
-
-          // Persist the snapshot the standalone access wizard reads (it has
-          // no live connection of its own to fetch this itself) - archived
-          // state is left untouched here, it's only ever set by the
-          // chats.upsert/chats.update listeners in connectWhatsApp.
-          const existing = groupsMeta[g.id];
-          const memberCount = g.participants?.length ?? 0;
-          if (!existing || existing.name !== name || existing.memberCount !== memberCount) {
-            groupsMeta[g.id] = {
-              name,
-              memberCount,
-              archived: existing?.archived ?? false,
-              updatedAt: Date.now(),
-            };
-            metaChanged = true;
-          }
-
           const flags = `${allowed ? "✓" : "+"}${roster ? "R" : ""}`;
           return `${flags} ${name}\n    ${g.id}${allowed ? "" : "  (NOT allowlisted)"}`;
         });
-        if (metaChanged) saveGroupsMeta();
         const legend =
           "✓ = allowlisted   + = joined but not allowlisted   R = roster access granted (add/change via /whatsapp-claude-channel:access)";
         return {
@@ -2869,6 +2900,24 @@ async function connectWhatsApp(): Promise<void> {
           },
         })
         .catch(() => {});
+
+      // Warm the groups-meta cache on every connect, same as contacts.upsert
+      // already warms the contact-name cache automatically - so the
+      // terminal access wizard has real group names to show without
+      // needing list_groups called manually first. Best-effort: a failure
+      // here must never break the connection itself, and it doesn't block
+      // startup (fire-and-forget, not awaited). Fire-and-forget also means
+      // this can theoretically resolve after a later reconnect has already
+      // replaced `sock` - since it's the same account either way, the
+      // worst case is writing slightly-stale-but-still-correct data, and
+      // the next successful fetch (past the cooldown below) overwrites it
+      // regardless. skipIfRecent keeps a flaky-network reconnect storm from
+      // re-fetching the full group list on every single reconnect.
+      refreshGroupsMeta(sock!, { skipIfRecent: true }).catch((err) => {
+        process.stderr.write(
+          `${LOG_PREFIX}: failed to warm groups-meta cache on connect: ${err}\n`,
+        );
+      });
     }
 
     if (connection === "close") {

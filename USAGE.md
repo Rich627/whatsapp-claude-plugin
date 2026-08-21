@@ -76,7 +76,7 @@ After pairing, the policy auto-locks back to `allowlist`.
 
 Each group gets its own personality config at `~/.whatsapp-channel/groups/<groupJid>/config.md`. Edit that file to customize how Claude behaves in each group. Conversation memory is auto-saved to `memory.md` in the same directory.
 
-See [ACCESS.md](./ACCESS.md) for group options (`--mention`, `--allow`, `--roster`). Reviewing several newly-joined groups at once? Call the `list_groups` tool once, then run `bun scripts/access.ts wizard` in your own terminal for a guided yes/no pass over each one — see [Guided group consent](./ACCESS.md#guided-group-consent-wizard).
+See [ACCESS.md](./ACCESS.md) for group options (`--mention`, `--allow`, `--roster`). Reviewing several groups at once? Run `bun scripts/access.ts wizard` in your own terminal for a guided yes/no pass over each one you haven't decided on yet — see [Guided group consent](./ACCESS.md#guided-group-consent-wizard).
 
 ## Daily use
 
