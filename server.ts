@@ -50,8 +50,19 @@ import {
 } from "fs";
 import { homedir } from "os";
 import { join, extname, sep, basename } from "path";
-import { normalizeMentionJids, mentionsForChunk } from "./lib/mentions";
-import { mergeContact, type ContactsMap } from "./scripts/contacts";
+import {
+  expandAllMention,
+  isReservedAllToken,
+  normalizeMentionJids,
+  mentionsForChunk,
+} from "./lib/mentions";
+import {
+  contactName,
+  mergeContact,
+  migrateContactKey,
+  type ContactsMap,
+} from "./scripts/contacts";
+import { looksLikeNumber, maskNumber } from "./scripts/mask";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -63,6 +74,7 @@ const ENV_FILE = join(STATE_DIR, ".env");
 const GROUPS_DIR = join(STATE_DIR, "groups");
 const LID_MAP_FILE = join(STATE_DIR, "lid-map.json");
 const CONTACTS_FILE = join(STATE_DIR, "contacts.json");
+const GROUPS_META_FILE = join(STATE_DIR, "groups-meta.json");
 const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
 const TASKS_FILE = join(STATE_DIR, "tasks.md");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
@@ -290,6 +302,11 @@ type PendingEntry = {
 type GroupPolicy = {
   requireMention: boolean;
   allowFrom: string[];
+  // Separate from "can act here": lets Claude reply in a large group
+  // without ever being handed its member list. Read defensively
+  // (`?? false`/`!!`) everywhere - a policy written before this field
+  // existed has no `roster` key at all, not an explicit false.
+  roster?: boolean;
 };
 
 type Access = {
@@ -501,6 +518,53 @@ function isAllowedJid(jid: string, allowList: string[]): boolean {
 // ─── Group name cache ─────────────────────────────────────────────────
 
 const groupNameCache: Record<string, string> = {};
+
+// ─── Group metadata cache (persisted) ──────────────────────────────────
+// scripts/access.ts's wizard runs as a standalone terminal command with no
+// WhatsApp connection of its own - only this server process has one. This
+// on-disk snapshot (name, member count, archived flag) is how the wizard
+// sees real group names without needing a live socket. Written whenever
+// list_groups runs (name/count) and whenever an archived state changes
+// (chats.upsert/chats.update, see connectWhatsApp) - never by the wizard
+// itself, which only reads it.
+type GroupMeta = {
+  name: string;
+  memberCount: number;
+  archived: boolean;
+  updatedAt: number;
+};
+
+let groupsMeta: Record<string, GroupMeta> = {};
+try {
+  groupsMeta = JSON.parse(readFileSync(GROUPS_META_FILE, "utf8"));
+} catch {}
+
+function saveGroupsMeta(): void {
+  const tmp = GROUPS_META_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(groupsMeta, null, 2) + "\n", {
+    mode: 0o600,
+  });
+  renameSync(tmp, GROUPS_META_FILE);
+}
+
+// Only groups carry an access decision in this project - a DM's archived
+// state has no equivalent meaning here, so non-group chat ids are ignored.
+function applyChatArchive(
+  id: string | null | undefined,
+  archived: boolean | null | undefined,
+): boolean {
+  if (!id || !id.endsWith("@g.us")) return false;
+  if (archived === undefined || archived === null) return false;
+  const existing = groupsMeta[id];
+  if (existing?.archived === archived) return false;
+  groupsMeta[id] = {
+    name: existing?.name ?? groupNameCache[id] ?? id,
+    memberCount: existing?.memberCount ?? 0,
+    archived,
+    updatedAt: Date.now(),
+  };
+  return true;
+}
 
 async function resolveGroupName(groupJid: string): Promise<string> {
   if (groupNameCache[groupJid]) return groupNameCache[groupJid];
@@ -1344,7 +1408,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "array",
             items: { type: "string" },
             description:
-              'People to @-tag. Prefer a saved contact\'s name where you know it, e.g. ["Akash"] — a raw number or id never needs to appear anywhere in your own text or reasoning. Falls back to the user_id/lid from an inbound <channel> block (a phone number or full JID also works) for someone with no saved name yet. You MUST also write the matching "@<value>" into text, using the exact same value you pass here (the name, if that\'s what you passed); the array is what makes WhatsApp render it as a real mention and notify them, the text alone does nothing. A name matching more than one saved contact fails the call rather than guessing — use the id for that person instead.',
+              'People to @-tag. Prefer a saved contact\'s name where you know it, e.g. ["Akash"] — a raw number or id never needs to appear anywhere in your own text or reasoning. Falls back to the user_id/lid from an inbound <channel> block (a phone number or full JID also works) for someone with no saved name yet. In a group where roster access is granted, use the single value "all" to tag every current member — this expands server-side from live group membership, so it works even for members with no saved contact name and no matter how many there are. You MUST also write the matching "@<value>" into text, using the exact same value you pass here (the name, or "all", if that\'s what you passed); the array is what makes WhatsApp render it as a real mention and notify them, the text alone does nothing. A name matching more than one saved contact fails the call rather than guessing — use the id for that person instead.',
           },
           files: {
             type: "array",
@@ -1442,10 +1506,25 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_groups",
       description:
-        "List every WhatsApp group this account is currently a member of, with each group's name and JID, and whether it's already allowlisted. Use this to find the JID of a newly-joined group so it can be added via the /whatsapp-claude-channel:access skill — no need to guess the JID from logs. Read-only: does not change access.",
+        "List every WhatsApp group this account is currently a member of, with each group's name and JID, whether it's already allowlisted, and whether roster access (member names, needed for @all) is granted. Use this to find the JID of a newly-joined group so it can be added via the /whatsapp-claude-channel:access skill — no need to guess the JID from logs. Read-only: does not change access. Also refreshes the on-disk group name/count cache the terminal access wizard (bun scripts/access.ts wizard) reads from.",
       inputSchema: {
         type: "object",
         properties: {},
+      },
+    },
+    {
+      name: "group_roster",
+      description:
+        "List an allowlisted group's members, by name where a saved contact name is known, or a masked number otherwise — never a raw phone number. Only works when roster access has been explicitly granted for that group (bun scripts/access.ts wizard, or \"group add --roster\"); fails with a clear error otherwise. Use this before an @all mention, or to answer who is in a chat.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: {
+            type: "string",
+            description: "The group's JID, from list_groups.",
+          },
+        },
+        required: ["chat_id"],
       },
     },
   ],
@@ -1465,16 +1544,39 @@ const handleToolCall = async (req: {
         const text = args.text as string;
         const reply_to = args.reply_to as string | undefined;
         const files = (args.files as string[] | undefined) ?? [];
+        const rawMentions = (args.mentions as string[] | undefined) ?? [];
+        const isAllToken = (m: string) => isReservedAllToken(m, contactsMap);
+
+        // Checked before any mention work: "all" triggers a live
+        // groupMetadata() fetch below, and that must never run for a chat
+        // this call isn't even allowed to send to.
+        assertAllowedChat(chat_id);
+        if (!sock) throw new Error("WhatsApp not connected");
+
         const mentionJids = normalizeMentionJids(
-          (args.mentions as string[] | undefined) ?? [],
+          rawMentions.filter((m) => !isAllToken(m)),
           lidMap,
           jidNormalizedUser,
           jidDecode,
           contactsMap,
         );
-
-        assertAllowedChat(chat_id);
-        if (!sock) throw new Error("WhatsApp not connected");
+        if (rawMentions.some(isAllToken)) {
+          if (!chat_id.endsWith("@g.us")) {
+            throw new Error('"all" is only valid for a group chat\'s mentions');
+          }
+          if (!loadAccess().groups[chat_id]?.roster) {
+            throw new Error(
+              '"all" needs roster access for this group — run "bun scripts/access.ts wizard" (or "group add --roster") to grant it',
+            );
+          }
+          const roster = await sock.groupMetadata(chat_id);
+          mentionJids.push(
+            ...expandAllMention(
+              roster.participants.map((p) => p.id),
+              jidNormalizedUser,
+            ),
+          );
+        }
 
         for (const f of files) {
           assertSendable(f);
@@ -1805,19 +1907,76 @@ const handleToolCall = async (req: {
           };
         }
         groups.sort((a, b) => (a.subject ?? "").localeCompare(b.subject ?? ""));
+        let metaChanged = false;
         const lines = groups.map((g) => {
           const allowed = g.id in access.groups;
+          const roster = !!access.groups[g.id]?.roster;
           const name = g.subject || "(no name)";
           if (g.subject) groupNameCache[g.id] = g.subject; // warm the cache while we have it
-          return `${allowed ? "✓" : "+"} ${name}\n    ${g.id}${allowed ? "" : "  (NOT allowlisted)"}`;
+
+          // Persist the snapshot the standalone access wizard reads (it has
+          // no live connection of its own to fetch this itself) - archived
+          // state is left untouched here, it's only ever set by the
+          // chats.upsert/chats.update listeners in connectWhatsApp.
+          const existing = groupsMeta[g.id];
+          const memberCount = g.participants?.length ?? 0;
+          if (!existing || existing.name !== name || existing.memberCount !== memberCount) {
+            groupsMeta[g.id] = {
+              name,
+              memberCount,
+              archived: existing?.archived ?? false,
+              updatedAt: Date.now(),
+            };
+            metaChanged = true;
+          }
+
+          const flags = `${allowed ? "✓" : "+"}${roster ? "R" : ""}`;
+          return `${flags} ${name}\n    ${g.id}${allowed ? "" : "  (NOT allowlisted)"}`;
         });
+        if (metaChanged) saveGroupsMeta();
         const legend =
-          "✓ = allowlisted   + = joined but not allowlisted (add via /whatsapp-claude-channel:access)";
+          "✓ = allowlisted   + = joined but not allowlisted   R = roster access granted (add/change via /whatsapp-claude-channel:access)";
         return {
           content: [
             {
               type: "text",
               text: `${groups.length} group(s):\n\n${lines.join("\n")}\n\n${legend}`,
+            },
+          ],
+        };
+      }
+
+      case "group_roster": {
+        const chat_id = args.chat_id as string;
+        if (!sock) throw new Error("WhatsApp not connected");
+        const access = loadAccess();
+        const policy = access.groups[chat_id];
+        if (!policy) {
+          throw new Error(`chat ${chat_id} is not an allowlisted group`);
+        }
+        if (!policy.roster) {
+          throw new Error(
+            'roster access is not granted for this group — run "bun scripts/access.ts wizard" (or "group add --roster") to grant it',
+          );
+        }
+        const meta = await sock.groupMetadata(chat_id);
+        const lines = meta.participants.map((p) => {
+          const name = contactName(contactsMap, contactKey(p.id));
+          // .notify (self-reported) commonly defaults to the person's own
+          // number for anyone who never set a custom display name -
+          // contactName()'s permissive name-or-notify fallback would hand
+          // that back as if it were a real name. This tool's whole point is
+          // never showing a raw number, so treat a number-shaped result the
+          // same as no name at all.
+          return name && !looksLikeNumber(name)
+            ? name
+            : maskNumber(resolveToPhone(p.id));
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${lines.length} member(s) of ${meta.subject || chat_id}:\n${lines.join("\n")}`,
             },
           ],
         };
@@ -2584,6 +2743,24 @@ async function connectWhatsApp(): Promise<void> {
       }
     }
     if (changed) saveContactsMap();
+  });
+
+  // Archived state for groups only, feeding the on-disk groups-meta cache
+  // (see applyChatArchive) - the terminal access wizard excludes archived
+  // groups from its default listing, and this is the only signal for that.
+  sock.ev.on("chats.upsert", (chats) => {
+    let changed = false;
+    for (const c of chats) {
+      if (applyChatArchive(c.id, c.archived)) changed = true;
+    }
+    if (changed) saveGroupsMeta();
+  });
+  sock.ev.on("chats.update", (updates) => {
+    let changed = false;
+    for (const u of updates) {
+      if (applyChatArchive(u.id, u.archived)) changed = true;
+    }
+    if (changed) saveGroupsMeta();
   });
 
   // ─── Pairing code: request independently of QR event ─────────────────

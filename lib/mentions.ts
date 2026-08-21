@@ -98,6 +98,34 @@ export function normalizeMentionJids(
   return out;
 }
 
+// server.ts's `reply` handler treats a mentions-array entry of "all" as the
+// reserved every-participant token (see expandAllMention below) UNLESS a
+// real saved contact is literally named "All" - name resolution always
+// wins over a reserved keyword, the same precedence normalizeMentionJids
+// already gives a saved name over treating it as a numeric id.
+export function isReservedAllToken(
+  entry: string,
+  contactsMap: ContactsMap,
+): boolean {
+  const s = entry.trim().replace(/^@+/, "");
+  if (s.toLowerCase() !== "all") return false;
+  return !resolveByName(contactsMap, s).ok;
+}
+
+// "@all" expands to every group participant's own jid, all sharing the
+// same input ("all") so mentionsForChunk's ordinary text-match handles it
+// like any other mention: one "@all" in the text attaches every expanded
+// pair to that chunk. Building the pairs here (not inline in server.ts)
+// keeps this step unit-testable without a live Baileys socket - the
+// sock.groupMetadata() fetch and the roster-access permission check stay
+// in server.ts, the only place that can make either of them.
+export function expandAllMention(
+  participantIds: string[],
+  jidNormalizedUser: (jid: string) => string,
+): MentionPair[] {
+  return participantIds.map((id) => ({ input: "all", jid: jidNormalizedUser(id) }));
+}
+
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

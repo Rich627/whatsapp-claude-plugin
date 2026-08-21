@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { jidDecode, jidNormalizedUser } from "@whiskeysockets/baileys";
-import { mentionsForChunk, normalizeMentionJids } from "./mentions";
+import {
+  expandAllMention,
+  isReservedAllToken,
+  mentionsForChunk,
+  normalizeMentionJids,
+} from "./mentions";
 
 describe("normalizeMentionJids", () => {
   test("bare number with no cached LID resolves to the phone JID", () => {
@@ -172,6 +177,72 @@ describe("normalizeMentionJids", () => {
       expect(msg).not.toContain("918419935122");
       expect(msg).not.toContain("61405070760");
     }
+  });
+});
+
+describe("isReservedAllToken", () => {
+  test("\"all\" with no saved contact of that name is the reserved token", () => {
+    expect(isReservedAllToken("all", {})).toBe(true);
+  });
+
+  test("case-insensitive and @-stripped, same as any other mention entry", () => {
+    expect(isReservedAllToken("@ALL", {})).toBe(true);
+    expect(isReservedAllToken(" All ", {})).toBe(true);
+  });
+
+  test("a real contact literally named \"All\" wins over the reserved token", () => {
+    const contactsMap = { "x@s.whatsapp.net": { name: "All" } };
+    expect(isReservedAllToken("all", contactsMap)).toBe(false);
+  });
+
+  test("any other entry is never the reserved token", () => {
+    expect(isReservedAllToken("Akash", {})).toBe(false);
+    expect(isReservedAllToken("61434505973", {})).toBe(false);
+  });
+});
+
+describe("expandAllMention", () => {
+  test("every participant gets a pair, all sharing input \"all\"", () => {
+    const pairs = expandAllMention(
+      ["61434505973@s.whatsapp.net", "184710990000999@lid"],
+      jidNormalizedUser,
+    );
+    expect(pairs).toEqual([
+      { input: "all", jid: "61434505973@s.whatsapp.net" },
+      { input: "all", jid: "184710990000999@lid" },
+    ]);
+  });
+
+  test("a device suffix is normalized away, same as any other jid input", () => {
+    const pairs = expandAllMention(
+      ["61434505973:5@s.whatsapp.net"],
+      jidNormalizedUser,
+    );
+    expect(pairs).toEqual([{ input: "all", jid: "61434505973@s.whatsapp.net" }]);
+  });
+
+  test("no participants: empty array, not an error", () => {
+    expect(expandAllMention([], jidNormalizedUser)).toEqual([]);
+  });
+
+  test("mentionsForChunk attaches every expanded pair when the text says @all", () => {
+    const pairs = expandAllMention(
+      ["a@s.whatsapp.net", "b@s.whatsapp.net", "c@lid"],
+      jidNormalizedUser,
+    );
+    const result = mentionsForChunk("hey @all, meeting moved up", pairs);
+    expect(result).toEqual(["a@s.whatsapp.net", "b@s.whatsapp.net", "c@lid"]);
+  });
+
+  test("mentionsForChunk does not false-match \"@all\" inside a longer word", () => {
+    const pairs = expandAllMention(["a@s.whatsapp.net"], jidNormalizedUser);
+    const result = mentionsForChunk("please allocate more time", pairs);
+    expect(result).toBeUndefined();
+  });
+
+  test("a chunk that doesn't mention @all attaches nothing", () => {
+    const pairs = expandAllMention(["a@s.whatsapp.net"], jidNormalizedUser);
+    expect(mentionsForChunk("no group mention in here", pairs)).toBeUndefined();
   });
 });
 

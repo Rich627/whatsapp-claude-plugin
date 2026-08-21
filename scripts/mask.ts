@@ -13,3 +13,15 @@ export function maskNumber(input: string): string {
   if (digits.length <= 4) return "•".repeat(5);
   return "•".repeat(5) + digits.slice(-4);
 }
+
+// A "name" that's actually just a phone number in disguise defeats any
+// caller that must never show a raw number: WhatsApp's own self-reported
+// `.notify` commonly defaults to exactly this for anyone who hasn't set a
+// custom display name, so contactName()'s permissive name-or-notify
+// fallback (fine for convenience labeling elsewhere) can hand back a real
+// number to a caller that thought it was getting a name. A caller with
+// that guarantee to keep should treat a number-shaped result as no name
+// at all and mask it instead.
+export function looksLikeNumber(s: string): boolean {
+  return /^\+?[\d\s()-]{4,}$/.test(s.trim());
+}
