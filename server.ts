@@ -617,7 +617,8 @@ function applyChatActivity(
   if (!id || activityMs === undefined) return { groups: false, dms: false };
   if (id.endsWith("@g.us")) {
     const existing = groupsMeta[id];
-    if (existing?.lastActivityAt === activityMs) return { groups: false, dms: false };
+    if (existing?.lastActivityAt === activityMs)
+      return { groups: false, dms: false };
     groupsMeta[id] = {
       name: existing?.name ?? groupNameCache[id] ?? id,
       memberCount: existing?.memberCount ?? 0,
@@ -674,7 +675,11 @@ async function refreshGroupsMeta(
     if (g.subject) groupNameCache[g.id] = g.subject;
     const existing = groupsMeta[g.id];
     const memberCount = g.participants?.length ?? 0;
-    if (!existing || existing.name !== name || existing.memberCount !== memberCount) {
+    if (
+      !existing ||
+      existing.name !== name ||
+      existing.memberCount !== memberCount
+    ) {
       groupsMeta[g.id] = {
         name,
         memberCount,
@@ -1637,7 +1642,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "group_roster",
       description:
-        "List an allowlisted group's members, by name where a saved contact name is known, or a masked number otherwise — never a raw phone number. Only works when roster access has been explicitly granted for that group (bun scripts/access.ts wizard, or \"group add --roster\"); fails with a clear error otherwise. Use this before an @all mention, or to answer who is in a chat.",
+        'List an allowlisted group\'s members, by name where a saved contact name is known, or a masked number otherwise — never a raw phone number. Only works when roster access has been explicitly granted for that group (bun scripts/access.ts wizard, or "group add --roster"); fails with a clear error otherwise. Use this before an @all mention, or to answer who is in a chat.',
       inputSchema: {
         type: "object",
         properties: {
@@ -2827,7 +2832,12 @@ async function connectWhatsApp(): Promise<void> {
     let changed = false;
     for (const c of contacts) {
       if (c.name || c.notify) {
-        if (mergeContact(contactsMap, contactKey(c.id), { name: c.name, notify: c.notify })) {
+        if (
+          mergeContact(contactsMap, contactKey(c.id), {
+            name: c.name,
+            notify: c.notify,
+          })
+        ) {
           changed = true;
         }
       }
@@ -2838,7 +2848,12 @@ async function connectWhatsApp(): Promise<void> {
     let changed = false;
     for (const u of updates) {
       if (u.id && (u.name || u.notify)) {
-        if (mergeContact(contactsMap, contactKey(u.id), { name: u.name, notify: u.notify })) {
+        if (
+          mergeContact(contactsMap, contactKey(u.id), {
+            name: u.name,
+            notify: u.notify,
+          })
+        ) {
           changed = true;
         }
       }

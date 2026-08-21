@@ -181,7 +181,7 @@ describe("normalizeMentionJids", () => {
 });
 
 describe("isReservedAllToken", () => {
-  test("\"all\" with no saved contact of that name is the reserved token", () => {
+  test('"all" with no saved contact of that name is the reserved token', () => {
     expect(isReservedAllToken("all", {})).toBe(true);
   });
 
@@ -190,7 +190,7 @@ describe("isReservedAllToken", () => {
     expect(isReservedAllToken(" All ", {})).toBe(true);
   });
 
-  test("a real contact literally named \"All\" wins over the reserved token", () => {
+  test('a real contact literally named "All" wins over the reserved token', () => {
     const contactsMap = { "x@s.whatsapp.net": { name: "All" } };
     expect(isReservedAllToken("all", contactsMap)).toBe(false);
   });
@@ -202,7 +202,7 @@ describe("isReservedAllToken", () => {
 });
 
 describe("expandAllMention", () => {
-  test("every participant gets a pair, all sharing input \"all\"", () => {
+  test('every participant gets a pair, all sharing input "all"', () => {
     const pairs = expandAllMention(
       ["61434505973@s.whatsapp.net", "184710990000999@lid"],
       jidNormalizedUser,
@@ -218,7 +218,9 @@ describe("expandAllMention", () => {
       ["61434505973:5@s.whatsapp.net"],
       jidNormalizedUser,
     );
-    expect(pairs).toEqual([{ input: "all", jid: "61434505973@s.whatsapp.net" }]);
+    expect(pairs).toEqual([
+      { input: "all", jid: "61434505973@s.whatsapp.net" },
+    ]);
   });
 
   test("no participants: empty array, not an error", () => {
@@ -234,7 +236,7 @@ describe("expandAllMention", () => {
     expect(result).toEqual(["a@s.whatsapp.net", "b@s.whatsapp.net", "c@lid"]);
   });
 
-  test("mentionsForChunk does not false-match \"@all\" inside a longer word", () => {
+  test('mentionsForChunk does not false-match "@all" inside a longer word', () => {
     const pairs = expandAllMention(["a@s.whatsapp.net"], jidNormalizedUser);
     const result = mentionsForChunk("please allocate more time", pairs);
     expect(result).toBeUndefined();

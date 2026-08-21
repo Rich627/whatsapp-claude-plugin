@@ -61,9 +61,7 @@ describe("normalizeJid", () => {
   });
 
   test("normalizes the legacy @c.us domain to @s.whatsapp.net", () => {
-    expect(normalizeJid("61403911675@c.us")).toBe(
-      "61403911675@s.whatsapp.net",
-    );
+    expect(normalizeJid("61403911675@c.us")).toBe("61403911675@s.whatsapp.net");
   });
 
   test("agent suffix and device suffix together both get stripped", () => {
@@ -107,7 +105,11 @@ describe("rankGroups", () => {
       "recent@g.us": group({ name: "Recent", lastActivityAt: 50 }),
     };
     const result = rankGroups(meta, new Set(), false, 5);
-    expect(result.map((c) => c.jid)).toEqual(["recent@g.us", "a@g.us", "b@g.us"]);
+    expect(result.map((c) => c.jid)).toEqual([
+      "recent@g.us",
+      "a@g.us",
+      "b@g.us",
+    ]);
   });
 
   test("already-configured groups are excluded", () => {

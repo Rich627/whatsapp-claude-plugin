@@ -78,7 +78,10 @@ function writeGroupsMeta(
 }
 
 function writeDmActivity(dir: string, activity: Record<string, number>): void {
-  writeFileSync(join(dir, "dm-activity.json"), JSON.stringify(activity, null, 2));
+  writeFileSync(
+    join(dir, "dm-activity.json"),
+    JSON.stringify(activity, null, 2),
+  );
 }
 
 const access = (dir: string) =>
@@ -292,13 +295,13 @@ describe("groups", () => {
     });
   });
 
-  test("a genuinely new group still reports \"Added\", not \"Updated\"", () => {
+  test('a genuinely new group still reports "Added", not "Updated"', () => {
     const dir = freshStateDir();
     const res = run(dir, "group", "add", "1@g.us");
     expect(res.out).toContain("Added 1@g.us");
   });
 
-  test("--allow \"\" (passed, empty) explicitly clears the allowlist on re-add", () => {
+  test('--allow "" (passed, empty) explicitly clears the allowlist on re-add', () => {
     const dir = freshStateDir();
     run(dir, "group", "add", "1@g.us", "--allow", "x@s,y@s");
     run(dir, "group", "add", "1@g.us", "--allow", "");
@@ -341,8 +344,18 @@ describe("wizard", () => {
   test("archived groups skipped by default; already-configured groups skipped too: nothing left", () => {
     const dir = freshStateDir();
     writeGroupsMeta(dir, {
-      "1@g.us": { name: "Active", memberCount: 3, archived: false, updatedAt: 0 },
-      "2@g.us": { name: "Archived", memberCount: 2, archived: true, updatedAt: 0 },
+      "1@g.us": {
+        name: "Active",
+        memberCount: 3,
+        archived: false,
+        updatedAt: 0,
+      },
+      "2@g.us": {
+        name: "Archived",
+        memberCount: 2,
+        archived: true,
+        updatedAt: 0,
+      },
     });
     run(dir, "group", "add", "1@g.us"); // already configured
     const res = run(dir, "wizard");
@@ -354,7 +367,12 @@ describe("wizard", () => {
   test("groups only, select none: nothing configured, access.json never created", () => {
     const dir = freshStateDir();
     writeGroupsMeta(dir, {
-      "1@g.us": { name: "Family", memberCount: 4, archived: false, updatedAt: 0 },
+      "1@g.us": {
+        name: "Family",
+        memberCount: 4,
+        archived: false,
+        updatedAt: 0,
+      },
     });
     const res = runWithInput(dir, "\n", "wizard"); // enter immediately, 0 selected
     expect(res.code).toBe(0);
@@ -365,7 +383,12 @@ describe("wizard", () => {
   test("--include-archived surfaces an archived group as a candidate", () => {
     const dir = freshStateDir();
     writeGroupsMeta(dir, {
-      "1@g.us": { name: "Old Chat", memberCount: 2, archived: true, updatedAt: 0 },
+      "1@g.us": {
+        name: "Old Chat",
+        memberCount: 2,
+        archived: true,
+        updatedAt: 0,
+      },
     });
     // Without the flag there'd be nothing to review at all (see the test
     // above this one) - with it, the group is offered, even though this
@@ -408,7 +431,12 @@ describe("wizard", () => {
   test("Ctrl-C cancels cleanly: nothing written, no raw stack trace", () => {
     const dir = freshStateDir();
     writeGroupsMeta(dir, {
-      "1@g.us": { name: "Family", memberCount: 4, archived: false, updatedAt: 0 },
+      "1@g.us": {
+        name: "Family",
+        memberCount: 4,
+        archived: false,
+        updatedAt: 0,
+      },
     });
     const res = runWithInput(dir, "\x03", "wizard");
     expect(res.code).toBe(0);

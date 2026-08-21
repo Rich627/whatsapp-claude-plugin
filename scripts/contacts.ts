@@ -112,6 +112,7 @@ export function resolveByName(map: ContactsMap, name: string): NameResolution {
     if (candidate && candidate === needle) matches.push(jid);
   }
   if (matches.length === 0) return { ok: false, reason: "not_found" };
-  if (matches.length > 1) return { ok: false, reason: "ambiguous", candidates: matches };
+  if (matches.length > 1)
+    return { ok: false, reason: "ambiguous", candidates: matches };
   return { ok: true, jid: matches[0] };
 }

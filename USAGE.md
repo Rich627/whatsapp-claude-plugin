@@ -119,17 +119,17 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 
 ## Tools exposed to the assistant
 
-| Tool                  | Purpose                                                                                                                                               |
-| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `reply`               | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for quote-reply, `files` (absolute paths) for attachments, and `mentions` (saved contact names preferred over raw numbers; `"all"` mentions every current group member if the group has [roster access](./ACCESS.md#group-roster--all-mentions)). |
-| `react`               | Add an emoji reaction to a message by ID. Any emoji is supported.                                                                                     |
-| `download_attachment` | Download media from a received message. Returns the local file path.                                                                                  |
-| `edit_message`        | Edit a message the account previously sent.                                                                                                           |
-| `status`              | Check connection state and get the pairing code if not yet paired.                                                                                    |
-| `unreplied`           | List received messages not yet replied to.                                                                                                            |
-| `catch_up`            | Post-restart context recovery: recent two-way conversation per chat (last 24h), unreplied counts, and open items from `~/.whatsapp-channel/tasks.md`. |
-| `list_groups`         | List every group the account is in, with JID, allowlist state, and roster-grant state. Also refreshes the local group name cache the access wizard reads. |
-| `group_roster`        | List a group's members by saved name, or a masked number otherwise — never a raw number. Requires [roster access](./ACCESS.md#group-roster--all-mentions) for that group. |
+| Tool                  | Purpose                                                                                                                                                                                                               |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `reply`               | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (quote-reply), `files` (attachments), and `mentions` (names over raw numbers; `"all"` needs [roster access](./ACCESS.md#group-roster--all-mentions)). |
+| `react`               | Add an emoji reaction to a message by ID. Any emoji is supported.                                                                                                                                                     |
+| `download_attachment` | Download media from a received message. Returns the local file path.                                                                                                                                                  |
+| `edit_message`        | Edit a message the account previously sent.                                                                                                                                                                           |
+| `status`              | Check connection state and get the pairing code if not yet paired.                                                                                                                                                    |
+| `unreplied`           | List received messages not yet replied to.                                                                                                                                                                            |
+| `catch_up`            | Post-restart context recovery: recent two-way conversation per chat (last 24h), unreplied counts, and open items from `~/.whatsapp-channel/tasks.md`.                                                                 |
+| `list_groups`         | List every group the account is in, with JID, allowlist state, and roster-grant state. Also refreshes the local group name cache the access wizard reads.                                                             |
+| `group_roster`        | List a group's members by saved name, or a masked number — never raw. Requires [roster access](./ACCESS.md#group-roster--all-mentions).                                                                               |
 
 ## Photos & Media
 

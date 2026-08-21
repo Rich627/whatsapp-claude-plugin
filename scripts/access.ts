@@ -30,12 +30,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { checkbox } from "@inquirer/prompts";
 import { forgetContact, type ContactsMap } from "./contacts";
-import {
-  contactKeyFor,
-  rankDms,
-  rankGroups,
-  type GroupMeta,
-} from "./ranking";
+import { contactKeyFor, rankDms, rankGroups, type GroupMeta } from "./ranking";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");

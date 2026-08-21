@@ -106,11 +106,7 @@ describe("migrateContactKey", () => {
       "184710990000999@lid": { name: "Rohan" },
       "61403911675@s.whatsapp.net": { notify: "rohan_98" },
     };
-    migrateContactKey(
-      map,
-      "184710990000999@lid",
-      "61403911675@s.whatsapp.net",
-    );
+    migrateContactKey(map, "184710990000999@lid", "61403911675@s.whatsapp.net");
     expect(map["61403911675@s.whatsapp.net"]).toEqual({
       name: "Rohan",
       notify: "rohan_98",
@@ -125,11 +121,7 @@ describe("migrateContactKey", () => {
       "184710990000999@lid": { name: "Old Nickname" },
       "61403911675@s.whatsapp.net": { name: "Rohan K (current)" },
     };
-    migrateContactKey(
-      map,
-      "184710990000999@lid",
-      "61403911675@s.whatsapp.net",
-    );
+    migrateContactKey(map, "184710990000999@lid", "61403911675@s.whatsapp.net");
     expect(map["61403911675@s.whatsapp.net"]).toEqual({
       name: "Rohan K (current)",
     });

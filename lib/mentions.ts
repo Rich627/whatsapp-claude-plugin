@@ -123,7 +123,10 @@ export function expandAllMention(
   participantIds: string[],
   jidNormalizedUser: (jid: string) => string,
 ): MentionPair[] {
-  return participantIds.map((id) => ({ input: "all", jid: jidNormalizedUser(id) }));
+  return participantIds.map((id) => ({
+    input: "all",
+    jid: jidNormalizedUser(id),
+  }));
 }
 
 function escapeRegExp(s: string): string {
