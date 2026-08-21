@@ -205,6 +205,32 @@ describe("rankDms", () => {
     ]);
   });
 
+  test("a notify-only label is marked unverified and paired with the masked number, not shown plain like a saved name", () => {
+    // .notify is self-reported by anyone who's ever messaged the account -
+    // an attacker naming themselves "Mum" must not read identically to a
+    // contact the owner actually saved (see ranking.ts's rankDms comment).
+    const activity = { "61403911675@s.whatsapp.net": 100 };
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { notify: "Mum" },
+    };
+    const result = rankDms(activity, contacts, [], {}, 10);
+    expect(result).toEqual([
+      {
+        jid: "61403911675@s.whatsapp.net",
+        label: "Mum (unverified) - •••••1675",
+      },
+    ]);
+  });
+
+  test("a saved .name always wins over .notify and is shown plain", () => {
+    const activity = { "x@s.whatsapp.net": 100 };
+    const contacts: ContactsMap = {
+      "x@s.whatsapp.net": { name: "Akash", notify: "some other name" },
+    };
+    const result = rankDms(activity, contacts, [], {}, 10);
+    expect(result).toEqual([{ jid: "x@s.whatsapp.net", label: "Akash" }]);
+  });
+
   test("respects the limit", () => {
     const activity = {
       "a@s.whatsapp.net": 1,

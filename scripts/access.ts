@@ -115,6 +115,8 @@ const USAGE = `Usage: bun scripts/access.ts <command>
   deny <code>                     drop a pending pairing
   allow <jid>                     add a JID to the allowlist
   remove <jid>                    remove a JID from the allowlist
+  forget <jid>                    purge a cached name/activity entry, even
+                                   for a JID never allowlisted (see remove)
   policy <${POLICIES.join("|")}>   set the DM policy
   group add <groupJid> [--mention|--no-mention] [--allow a,b] [--roster|--no-roster]
   group rm <groupJid>             stop responding in a group (files kept)
@@ -435,22 +437,54 @@ async function wizard(args: string[]): Promise<void> {
   }
 
   for (const jid of actGroups) {
-    a.groups[jid] = {
-      requireMention: true,
-      allowFrom: [],
-      roster: rosterGroups.includes(jid),
-    };
     provisionGroupFiles(jid);
   }
-  for (const jid of allowDms) {
-    if (!a.allowFrom.includes(jid)) a.allowFrom.push(jid);
+  // Re-load rather than reuse `a`: the checkbox prompts above block on the
+  // user for an unbounded time, and the server can write access.json in
+  // that window (a pairing approval appended to allowFrom, a pending code
+  // created or pruned). Writing back the pre-prompt snapshot would silently
+  // revert that write - unlike the one-shot commands, where the load-to-save
+  // gap is a few ms, this gap is however long the user takes to answer.
+  if (actGroups.length > 0 || allowDms.length > 0) {
+    const fresh = load();
+    for (const jid of actGroups) {
+      fresh.groups[jid] = {
+        requireMention: true,
+        allowFrom: [],
+        roster: rosterGroups.includes(jid),
+      };
+    }
+    for (const jid of allowDms) {
+      if (!fresh.allowFrom.includes(jid)) fresh.allowFrom.push(jid);
+    }
+    save(fresh);
   }
-  if (actGroups.length > 0 || allowDms.length > 0) save(a);
 
   process.stdout.write(
     `\n${actGroups.length} group(s), ${allowDms.length} contact(s) configured.\n`,
   );
   process.stdout.write(`\n${highlight(PRIVACY_DISCLOSURE)}\n`);
+}
+
+// Shared by `remove` (which also drops the allowlist entry) and `forget`
+// (which purges the cache alone, for someone never allowlisted in the
+// first place). Never touches lid-map.json - see forgetContact's own
+// comment for why. If they're still in a shared group with roster access,
+// they'll show up there as a masked number from now on - not a bug, the
+// honest consequence of choosing to forget someone this plugin was never
+// going to remove from a group or block on WhatsApp.
+function forgetCachedIdentity(jid: string): boolean {
+  const key = contactKeyFor(loadLidMap(), jid);
+  const contacts = loadContacts();
+  const forgot = forgetContact(contacts, key);
+  if (forgot) saveContacts(contacts);
+  const activity = loadDmActivity();
+  const forgotActivity = key in activity;
+  if (forgotActivity) {
+    delete activity[key];
+    saveDmActivity(activity);
+  }
+  return forgot || forgotActivity;
 }
 
 function set(key: string, rawValue: string): void {
@@ -518,29 +552,25 @@ switch (command) {
     if (!a.allowFrom.includes(jid)) die(`${jid} is not on the allowlist.`);
     a.allowFrom = a.allowFrom.filter((j) => j !== jid);
     save(a);
-    // Explicit removal, not a mere decline - also forget the cached name
-    // (never the lid-map.json routing entry; see forgetContact's own
-    // comment for why). If they're still in a shared group with roster
-    // access, they'll show up there as a masked number from now on - not
-    // a bug, the honest consequence of choosing to forget someone this
-    // plugin was never going to remove from a group or block on WhatsApp.
-    const key = contactKeyFor(loadLidMap(), jid);
-    const contacts = loadContacts();
-    const forgot = forgetContact(contacts, key);
-    if (forgot) saveContacts(contacts);
-    // Also drop their entry in the recency cache the wizard ranks by -
-    // their raw phone-resolved JID is the key that file is stored under,
-    // so leaving it behind would keep the exact thing "forget" is meant to
-    // clear out of local storage.
-    const activity = loadDmActivity();
-    const forgotActivity = key in activity;
-    if (forgotActivity) {
-      delete activity[key];
-      saveDmActivity(activity);
-    }
+    const forgot = forgetCachedIdentity(jid);
     process.stdout.write(
-      `Removed ${jid}.${forgot || forgotActivity ? " Forgot their cached name too." : ""}\n`,
+      `Removed ${jid}.${forgot ? " Forgot their cached name too." : ""}\n`,
     );
+    break;
+  }
+  case "forget": {
+    // A stranger's name/activity gets cached the moment they DM once -
+    // contacts.upsert/chats.upsert fire from Baileys before any allowlist
+    // check runs (see server.ts) - so someone who was NEVER allowlisted has
+    // no access.json entry for `remove` to find, and `remove` refuses to
+    // run at all for them (see the allowFrom check above). This purges the
+    // cache directly with no allowlist requirement, so a stranger's cached
+    // name/activity can always be cleared even though they were never
+    // granted (or denied) anything to remove.
+    const jid = requireArg(rest[0], "JID");
+    const forgot = forgetCachedIdentity(jid);
+    if (!forgot) die(`Nothing cached for ${jid}.`);
+    process.stdout.write(`Forgot ${jid}'s cached name and activity.\n`);
     break;
   }
   case "policy": {

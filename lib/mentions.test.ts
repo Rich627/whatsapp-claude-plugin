@@ -164,6 +164,30 @@ describe("normalizeMentionJids", () => {
     expect(pair.jid).toBe("x@s.whatsapp.net");
   });
 
+  test("a resolved name prefers the LID form when known, same as the numeric path", () => {
+    // Group participants are LID-addressed; a name resolved straight from
+    // contacts.json used to ship the phone-form jid verbatim, which
+    // silently fails to attach/notify in a LID-addressed group.
+    const contactsMap = { "61403911675@s.whatsapp.net": { name: "Akash" } };
+    const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
+    const [pair] = normalizeMentionJids(
+      ["Akash"],
+      lidMap,
+      jidNormalizedUser,
+      contactsMap,
+    );
+    expect(pair).toEqual({ input: "Akash", jid: "184710990000999@lid" });
+  });
+
+  test("a name-shaped id that matches no contact throws, rather than shipping a nonsense jid", () => {
+    // Previously fell through to the numeric/LID path and shipped
+    // '"Someone Else"@s.whatsapp.net' - not a real jid, so WhatsApp
+    // silently fails to notify while the tool call still reports success.
+    expect(() =>
+      normalizeMentionJids(["Someone Else"], {}, jidNormalizedUser, {}),
+    ).toThrow(/doesn't match any saved contact/);
+  });
+
   test("a name not in the contacts cache falls through to the old id-based path", () => {
     const [pair] = normalizeMentionJids(
       ["61434505973"],

@@ -99,6 +99,17 @@ try {
 
 const PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER;
 const STATIC = process.env.WHATSAPP_ACCESS_MODE === "static";
+// Off by default: contacts.json/dm-activity.json cache the display name and
+// last-activity time of EVERYONE the account has ever seen, including a
+// sender the access gate rejected (contacts.upsert/chats.upsert fire from
+// Baileys before any allowlist check runs) - so unlike access.json (which
+// only ever holds jids the owner explicitly allowed), this is plaintext
+// persistence the owner may not expect for someone they never approved.
+// STATIC mode already disables all local config writes (see saveAccess) -
+// this cache follows the same rule, never just WHATSAPP_CACHE_CONTACTS
+// alone, so a static deployment can't be made to write local state by
+// setting one env var but not the other.
+const CACHE_CONTACTS = !STATIC && process.env.WHATSAPP_CACHE_CONTACTS === "1";
 // The client process that spawned us, when it identifies itself. Claude Code
 // sets CLAUDE_PID; other MCP clients set nothing, which reads as "unknown"
 // and is reported as such rather than guessed at.
@@ -433,9 +444,11 @@ function recordLidMapping(lid: string, pn: string): void {
   // this function's two callers (the passive lid-mapping.update event, or
   // ensureLidResolved's active fallback) is the one that actually learned
   // the mapping.
+  reloadContactsMap();
   if (migrateContactKey(contactsMap, nLid, nPn)) {
     saveContactsMap();
   }
+  reloadDmActivity();
   if (migrateDmActivity(nLid, nPn)) {
     saveDmActivity();
   }
@@ -458,11 +471,29 @@ try {
 } catch {}
 
 function saveContactsMap(): void {
+  if (!CACHE_CONTACTS) return;
   const tmp = CONTACTS_FILE + ".tmp";
   writeFileSync(tmp, JSON.stringify(contactsMap, null, 2) + "\n", {
     mode: 0o600,
   });
   renameSync(tmp, CONTACTS_FILE);
+}
+
+// scripts/access.ts's `remove` runs as a separate process and can delete a
+// contact's cached name from this same file while the server is up - the
+// in-memory contactsMap has no way to learn that on its own. Without this,
+// the next contacts.upsert/update or LID migration would merge its update
+// into the stale in-memory copy (which still has the forgotten entry) and
+// write that whole map back out, silently resurrecting exactly what
+// forgetContact() was just asked to remove. Called immediately before every
+// mutate-then-save path below, so what's on disk is always this process's
+// own last write OR an external edit - never lost either way, since a
+// mutation is always followed by an immediate synchronous save (no event
+// can interleave and lose an in-memory-only change).
+function reloadContactsMap(): void {
+  try {
+    contactsMap = JSON.parse(readFileSync(CONTACTS_FILE, "utf8"));
+  } catch {}
 }
 
 // Same key every other identity lookup in this file uses (resolveToPhone
@@ -566,11 +597,21 @@ try {
 } catch {}
 
 function saveDmActivity(): void {
+  if (!CACHE_CONTACTS) return;
   const tmp = DM_ACTIVITY_FILE + ".tmp";
   writeFileSync(tmp, JSON.stringify(dmActivity, null, 2) + "\n", {
     mode: 0o600,
   });
   renameSync(tmp, DM_ACTIVITY_FILE);
+}
+
+// Same reasoning as reloadContactsMap() above - scripts/access.ts's
+// `remove` also drops the removed jid's dm-activity.json entry, and this
+// in-memory copy needs to learn that before its next mutate-then-save.
+function reloadDmActivity(): void {
+  try {
+    dmActivity = JSON.parse(readFileSync(DM_ACTIVITY_FILE, "utf8"));
+  } catch {}
 }
 
 // A DM's activity can get recorded under its raw @lid key before
@@ -2087,16 +2128,28 @@ const handleToolCall = async (req: {
         }
         const meta = await sock.groupMetadata(chat_id);
         const lines = meta.participants.map((p) => {
-          const name = contactName(contactsMap, contactKey(p.id));
+          // resolveToPhone(p.id) only resolves through OUR OWN passively-
+          // populated lidMap (see its own comment) - a participant we've
+          // never exchanged a lid-mapping.update event with (never spoken)
+          // falls back to the raw LID jid unresolved, so both the name
+          // lookup and the mask below would key/show the LID's own digits
+          // instead of the phone number. groupMetadata() already returns
+          // each participant's phoneNumber directly (Baileys resolves this
+          // as part of the roster fetch itself, no event needed) - prefer
+          // that, and feed it back into lidMap so later lookups elsewhere
+          // (allowlist matching, other tools) benefit too, not just this one.
+          if (p.phoneNumber && isLidUser(p.id)) {
+            recordLidMapping(p.id, p.phoneNumber);
+          }
+          const phone = p.phoneNumber ?? resolveToPhone(p.id);
+          const name = contactName(contactsMap, contactKey(phone));
           // .notify (self-reported) commonly defaults to the person's own
           // number for anyone who never set a custom display name -
           // contactName()'s permissive name-or-notify fallback would hand
           // that back as if it were a real name. This tool's whole point is
           // never showing a raw number, so treat a number-shaped result the
           // same as no name at all.
-          return name && !looksLikeNumber(name)
-            ? name
-            : maskNumber(resolveToPhone(p.id));
+          return name && !looksLikeNumber(name) ? name : maskNumber(phone);
         });
         return {
           content: [
@@ -2849,6 +2902,7 @@ async function connectWhatsApp(): Promise<void> {
     // thousands of entries), and contactsMap starts empty so nearly every
     // entry is a "change" - a sync writeFileSync+renameSync per entry
     // would block on a full-map JSON serialization that many times in a row.
+    reloadContactsMap();
     let changed = false;
     for (const c of contacts) {
       if (c.name || c.notify) {
@@ -2865,6 +2919,7 @@ async function connectWhatsApp(): Promise<void> {
     if (changed) saveContactsMap();
   });
   sock.ev.on("contacts.update", (updates) => {
+    reloadContactsMap();
     let changed = false;
     for (const u of updates) {
       if (u.id && (u.name || u.notify)) {
@@ -2888,6 +2943,7 @@ async function connectWhatsApp(): Promise<void> {
   // rank its "top 5 groups / top 10 contacts" screen the same way the
   // WhatsApp app itself orders its own chat list.
   sock.ev.on("chats.upsert", (chats) => {
+    reloadDmActivity();
     let groupsChanged = false;
     let dmsChanged = false;
     for (const c of chats) {
@@ -2900,6 +2956,7 @@ async function connectWhatsApp(): Promise<void> {
     if (dmsChanged) saveDmActivity();
   });
   sock.ev.on("chats.update", (updates) => {
+    reloadDmActivity();
     let groupsChanged = false;
     let dmsChanged = false;
     for (const u of updates) {

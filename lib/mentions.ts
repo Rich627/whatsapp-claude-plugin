@@ -34,6 +34,19 @@ function ambiguousNameError(name: string, candidates: string[]): Error {
   );
 }
 
+// A phone-form jid's LID form, when lid-mapping.update has already told us
+// one. WhatsApp's `mentions` array must carry the LID identity for a
+// mention to actually attach/notify in a LID-addressed group - a name
+// resolved straight from contacts.json (keyed under its phone-form jid, see
+// server.ts's contactKey) used to skip this entirely, rendering "@Name" as
+// inert text with no error and no notification even though the numeric
+// path right below already handled the same case correctly.
+function preferLid(jid: string, lidMap: Record<string, string>): string {
+  if (jid.endsWith("@lid")) return jid;
+  const lidKey = Object.keys(lidMap).find((k) => lidMap[k] === jid);
+  return lidKey ?? jid;
+}
+
 // Accept ids in whatever shape the caller has (a known contact's name, bare
 // number, @-prefixed, LID or phone, full JID) and normalise to a JID, while
 // keeping the original input next to it so mentionsForChunk can still find
@@ -55,11 +68,22 @@ export function normalizeMentionJids(
 
     const byName = resolveByName(contactsMap, s);
     if (byName.ok) {
-      out.push({ input: s, jid: byName.jid });
+      out.push({ input: s, jid: preferLid(byName.jid, lidMap) });
       continue;
     }
     if (byName.reason === "ambiguous") {
       throw ambiguousNameError(s, byName.candidates);
+    }
+    // resolveByName found nothing, and this isn't shaped like a number or a
+    // JID either - it can only have been a name attempt (a typo, or a
+    // self-reported name group_roster shows but resolveByName deliberately
+    // never trusts, see its own comment). Falling through used to ship
+    // "<name>@s.whatsapp.net" - a nonsense jid WhatsApp silently fails to
+    // notify, with the tool call still reporting success.
+    if (!s.includes("@") && !/^\d+$/.test(s)) {
+      throw new Error(
+        `"${s}" doesn't match any saved contact — use the number directly, or save it as a contact name.`,
+      );
     }
 
     let jid: string;
@@ -84,14 +108,7 @@ export function normalizeMentionJids(
       // different number (the LID), so input must stay tied to `s` itself,
       // never derived from jid.
       const asLid = `${s}@lid`;
-      if (lidMap[asLid]) {
-        jid = asLid;
-      } else {
-        const lidForPhone = Object.keys(lidMap).find(
-          (k) => lidMap[k] === `${s}@s.whatsapp.net`,
-        );
-        jid = lidForPhone ?? `${s}@s.whatsapp.net`;
-      }
+      jid = lidMap[asLid] ? asLid : preferLid(`${s}@s.whatsapp.net`, lidMap);
       input = s;
     }
     // Not deduped here: two different input spellings that happen to

@@ -81,7 +81,9 @@ Baileys 7 uses LID (Local Identifier) format alongside phone JIDs. The same pers
 
 ## Names and privacy
 
-The server caches saved contact names from WhatsApp's own contact sync (the same list your phone already has) at `~/.whatsapp-channel/contacts.json` — never the `contacts.md` some people keep for their own DM habits, which this plugin never reads. Only a contact's **name** is cached this way, and only a name — self-reported "About"/display text (`.notify`) is kept separately and never trusted for anything security-relevant, since anyone messaging the account can set that to whatever they want, including someone else's real name or number.
+**Off by default.** Set `WHATSAPP_CACHE_CONTACTS=1` to have the server cache saved contact names from WhatsApp's own contact sync (the same list your phone already has) at `~/.whatsapp-channel/contacts.json` — never the `contacts.md` some people keep for their own DM habits, which this plugin never reads. Only a contact's **name** is cached this way, and only a name — self-reported "About"/display text (`.notify`) is kept separately and never trusted for anything security-relevant, since anyone messaging the account can set that to whatever they want, including someone else's real name or number.
+
+Without it, name resolution and masking still work for the lifetime of the running server (built fresh each run from WhatsApp's own contact sync), it just isn't written to disk — so a restart starts blank again. Turn it on for name/mention lookups to survive a restart. Either way, `WHATSAPP_ACCESS_MODE=static` disables this cache too, on top of `WHATSAPP_CACHE_CONTACTS` — a static deployment can't be made to write local state by one env var but not the other. The recency cache the wizard ranks by (`dm-activity.json`) follows the same on/off switch, since it's the same kind of per-sender data — including for a sender the access gate rejected, which is exactly what makes this opt-in rather than always-on.
 
 **Names may reach the AI model; raw phone numbers should not.** When you ask Claude to reply and mention someone, it can use a saved name (`"Akash"`) instead of a number — that name is what appears in Claude's context. Anywhere a number would otherwise be shown to a human (an ambiguous-name error, `group_roster` for someone with no saved name) it's masked to the last 4 digits (`•••••5122`) before it's built into any string, not filtered afterward.
 
@@ -117,6 +119,10 @@ The `/whatsapp-claude-channel:access` skill will point you at it if you ask for 
 ### Removing someone already granted access
 
 `/whatsapp-claude-channel:access remove <jid>` (or the equivalent CLI command) also forgets their cached name from `contacts.json`, not just their allowlist entry — it does **not** touch `lid-map.json` (needed for correct message/mention matching if they're still an active participant in a group you can see) and it does **not** remove them from any shared group or block them on WhatsApp, neither of which this plugin does. If they're still in a group with roster access, they'll show up there as a masked number from then on instead of by name — the honest consequence of choosing to forget someone this plugin was never going to remove from a group.
+
+### Forgetting a stranger who was never allowlisted
+
+`remove` requires the JID to actually be on the allowlist, and refuses otherwise — but with caching on, a name/activity entry gets cached the moment anyone DMs once, allowlisted or not (contact and chat sync events fire before the access gate runs). `bun scripts/access.ts forget <jid>` purges the cached name and activity entry directly, with no allowlist requirement — the general-purpose way to clear someone's cached identity regardless of whether they were ever approved.
 
 ## Mention detection
 

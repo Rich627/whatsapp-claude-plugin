@@ -183,6 +183,55 @@ describe("allowlist", () => {
   });
 });
 
+describe("forget", () => {
+  test("purges a cached name for a JID that was NEVER allowlisted - remove refuses this, forget doesn't", () => {
+    const dir = freshStateDir();
+    writeContacts(dir, { "1@s.whatsapp.net": { name: "Akash" } });
+    expect(run(dir, "remove", "1@s.whatsapp.net").code).toBe(1);
+    const res = run(dir, "forget", "1@s.whatsapp.net");
+    expect(res.code).toBe(0);
+    expect(readContacts(dir)["1@s.whatsapp.net"]).toBeUndefined();
+  });
+
+  test("purges the recency cache entry too", () => {
+    const dir = freshStateDir();
+    writeDmActivity(dir, {
+      "1@s.whatsapp.net": 5000,
+      "2@s.whatsapp.net": 3000,
+    });
+    const res = run(dir, "forget", "1@s.whatsapp.net");
+    expect(res.code).toBe(0);
+    const activity = JSON.parse(
+      readFileSync(join(dir, "dm-activity.json"), "utf8"),
+    );
+    expect(activity["1@s.whatsapp.net"]).toBeUndefined();
+    expect(activity["2@s.whatsapp.net"]).toBe(3000);
+  });
+
+  test("resolves through lid-map.json, same as remove", () => {
+    const dir = freshStateDir();
+    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
+    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
+    const res = run(dir, "forget", "184710990000999@lid");
+    expect(res.code).toBe(0);
+    expect(readContacts(dir)["61403911675@s.whatsapp.net"]).toBeUndefined();
+  });
+
+  test("nothing cached for the JID fails loudly, not a silent no-op", () => {
+    const dir = freshStateDir();
+    expect(run(dir, "forget", "nobody@s.whatsapp.net").code).toBe(1);
+  });
+
+  test("never touches access.json, even for a JID that happens to be allowlisted", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    writeContacts(dir, { "1@s.whatsapp.net": { name: "Akash" } });
+    const res = run(dir, "forget", "1@s.whatsapp.net");
+    expect(res.code).toBe(0);
+    expect(access(dir).allowFrom).toEqual(["1@s.whatsapp.net"]);
+  });
+});
+
 describe("policy", () => {
   test("a valid mode is written; an invalid one is refused", () => {
     const dir = freshStateDir();

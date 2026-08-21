@@ -3,7 +3,7 @@
 // every case - access.ts's top-level switch executes immediately on any
 // import (same class of problem server.ts has, see its own comments on
 // why mentions.ts/contacts.ts/mask.ts were extracted the same way).
-import { contactName, type ContactsMap } from "./contacts";
+import { type ContactsMap } from "./contacts";
 import { looksLikeNumber, maskNumber } from "./mask";
 
 export type GroupMeta = {
@@ -72,9 +72,21 @@ export function rankGroups(
 // A candidate is only ever a chat with real activity (dmActivity is only
 // ever written for a chat that's actually exchanged a message) - never the
 // whole phone contact list, which is exactly what keeps this from ever
-// asking about hundreds of never-messaged contacts. Name shown when known
-// and not number-shaped (same guarantee group_roster already gives - see
-// scripts/mask.ts's looksLikeNumber), a masked number otherwise, never raw.
+// asking about hundreds of never-messaged contacts.
+//
+// Deliberately does NOT use contacts.ts's contactName() (its name-or-notify
+// fallback is fine for passive display elsewhere, see mask.ts's own
+// comment) - here the label decides who gets DM access under a banner that
+// says the decision is AI-free, so a `.notify` label needs to look
+// different from a `.name` one, not just fall back silently. `.notify` is
+// self-reported by anyone who's ever messaged the account (see contacts.ts)
+// - dm-activity.json/contacts.json get populated by ungated Baileys events
+// even for senders the access gate already rejected, so an unknown number
+// that DMs once with push name "Mum" would otherwise rank and read
+// identically to an actually-saved contact. A `.name` entry only exists
+// because the account owner saved it themselves, so it's shown plain; a
+// `.notify`-only entry is marked unverified and paired with the masked
+// number, so approving it is a visibly different decision.
 export function rankDms(
   activity: Record<string, number>,
   contacts: ContactsMap,
@@ -90,8 +102,14 @@ export function rankDms(
     .sort(([, a], [, b]) => b - a)
     .slice(0, limit)
     .map(([jid]) => {
-      const name = contactName(contacts, jid);
-      const label = name && !looksLikeNumber(name) ? name : maskNumber(jid);
-      return { jid, label };
+      const entry = contacts[jid];
+      const masked = maskNumber(jid);
+      if (entry?.name && !looksLikeNumber(entry.name)) {
+        return { jid, label: entry.name };
+      }
+      if (entry?.notify && !looksLikeNumber(entry.notify)) {
+        return { jid, label: `${entry.notify} (unverified) - ${masked}` };
+      }
+      return { jid, label: masked };
     });
 }
