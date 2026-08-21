@@ -1473,7 +1473,7 @@ const handleToolCall = async (req: {
           // mention here even when its "@id" text landed beyond the 200-char
           // cut — the notification comes from the mentions array, not the text.
           const previewMentions = mentionJids.length
-            ? mentionJids.map((m) => m.jid)
+            ? [...new Set(mentionJids.map((m) => m.jid))]
             : undefined;
           const sent = await sock.sendMessage(
             chat_id,

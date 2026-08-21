@@ -24,25 +24,32 @@ describe("normalizeMentionJids", () => {
     });
   });
 
-  test("full JID input passes through normalized, unchanged as the match key", () => {
+  test("full JID input matches on its own local part, not the full string", () => {
     const [pair] = normalizeMentionJids(
       ["61434505973@s.whatsapp.net"],
       {},
       jidNormalizedUser,
     );
     expect(pair).toEqual({
-      input: "61434505973@s.whatsapp.net",
+      input: "61434505973",
       jid: "61434505973@s.whatsapp.net",
     });
   });
 
-  test("dedupes by resolved JID", () => {
+  test("two input spellings resolving to the same jid both survive", () => {
+    // A LID and its phone number for the same person, passed as two
+    // separate mentions entries: neither input should be silently dropped,
+    // since the reply text might use either spelling.
+    const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
     const pairs = normalizeMentionJids(
-      ["61434505973", "@61434505973"],
-      {},
+      ["184710990000999", "61403911675"],
+      lidMap,
       jidNormalizedUser,
     );
-    expect(pairs).toHaveLength(1);
+    expect(pairs).toEqual([
+      { input: "184710990000999", jid: "184710990000999@lid" },
+      { input: "61403911675", jid: "184710990000999@lid" },
+    ]);
   });
 });
 
@@ -81,5 +88,25 @@ describe("mentionsForChunk", () => {
   test("no match in this chunk's text returns undefined", () => {
     const pairs = normalizeMentionJids(["61434505973"], {}, jidNormalizedUser);
     expect(mentionsForChunk("no mentions in here", pairs)).toBeUndefined();
+  });
+
+  test("a shorter mentioned id that prefixes a longer one doesn't false-match", () => {
+    const pairs = normalizeMentionJids(["6123", "61234567"], {}, jidNormalizedUser);
+    const result = mentionsForChunk("hey @61234567 nice work", pairs);
+    expect(result).toEqual(["61234567@s.whatsapp.net"]);
+  });
+
+  test("two input spellings for the same person produce one jid, not two", () => {
+    const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
+    const pairs = normalizeMentionJids(
+      ["184710990000999", "61403911675"],
+      lidMap,
+      jidNormalizedUser,
+    );
+    const result = mentionsForChunk(
+      "@184710990000999 and @61403911675 are the same person",
+      pairs,
+    );
+    expect(result).toEqual(["184710990000999@lid"]);
   });
 });

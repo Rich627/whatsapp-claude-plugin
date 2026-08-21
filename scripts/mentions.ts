@@ -16,7 +16,6 @@ export function normalizeMentionJids(
   jidNormalizedUser: (jid: string) => string,
 ): MentionPair[] {
   const out: MentionPair[] = [];
-  const seenJids = new Set<string>();
   for (const entry of raw) {
     const s = String(entry ?? "")
       .trim()
@@ -39,11 +38,19 @@ export function normalizeMentionJids(
         jid = lidForPhone ?? `${s}@s.whatsapp.net`;
       }
     }
-    if (seenJids.has(jid)) continue;
-    seenJids.add(jid);
-    out.push({ input: s, jid });
+    // The match key is always the input's own local part — a full JID
+    // input ("<num>@s.whatsapp.net") still matches "@<num>" in text, the
+    // same as a bare number does, since nobody writes "@<num>@domain" in a
+    // chat message. Not deduped here: two different input spellings that
+    // happen to resolve to the same jid (a LID and its phone number) must
+    // both stay matchable, since the text might use either spelling.
+    out.push({ input: s.split("@")[0], jid });
   }
   return out;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // A long reply is split into chunks; only attach a mention to the chunk whose
@@ -51,12 +58,17 @@ export function normalizeMentionJids(
 // against the original input id the caller typed, not the resolved JID —
 // resolution can silently swap a bare number for a cached LID with a
 // different local part, and matching on that instead used to drop the
-// mention from every chunk whenever a mapping happened to be cached.
+// mention from every chunk whenever a mapping happened to be cached. The
+// match requires a digit boundary after the id so a shorter mentioned id
+// that's a text-prefix of a longer one in the same message ("6123" vs
+// "61234567") doesn't falsely attach to the longer one's chunk.
 export function mentionsForChunk(
   text: string,
   all: MentionPair[],
 ): string[] | undefined {
   if (!all.length) return undefined;
-  const hits = all.filter((m) => text.includes(`@${m.input}`));
-  return hits.length ? hits.map((m) => m.jid) : undefined;
+  const hits = all.filter((m) =>
+    new RegExp(`@${escapeRegExp(m.input)}(?!\\d)`).test(text),
+  );
+  return hits.length ? [...new Set(hits.map((m) => m.jid))] : undefined;
 }
