@@ -98,6 +98,18 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### `remove <jid>`
 
 1. Read, filter `allowFrom` to exclude `<jid>`, write.
+2. Also forget them from the two local caches this plugin keeps beyond
+   the allowlist itself, using the same resolved key both are stored
+   under: read `~/.whatsapp-channel/contacts.json` (their cached name) and
+   `~/.whatsapp-channel/dm-activity.json` (their recency entry for the
+   wizard's top-10), delete their entry from each, write back whichever
+   actually changed. Resolve `<jid>` through
+   `~/.whatsapp-channel/lid-map.json` first if it's a `@lid` form - both
+   files key by the phone-form JID that LID maps to. Never touch
+   `lid-map.json` itself - it's needed for correct message/mention
+   matching if they're still an active participant in a shared group.
+   Tell the user this happened only if an entry actually existed to
+   remove (don't claim to have forgotten someone never cached).
 
 ### `policy <mode>`
 
@@ -229,14 +241,15 @@ the two are interchangeable. This skill stays the friendlier path: it can ask th
 group personality questions and write a tailored config.md, which the CLI does not.
 
 The CLI also has one command this skill deliberately does not implement:
-`bun scripts/access.ts wizard`, a guided pass over every joined group that
-hasn't been decided on yet (archived ones skipped by default), asking two
-yes/no questions per group in the terminal — can Claude reply here, and
-can Claude see member names. It's terminal-only by design (see the
-`wizard` entry above) so a group-access decision can be made with a
+`bun scripts/access.ts wizard`, a checkbox screen (arrow keys + space +
+enter) over the account's 5 most recently active groups and 10 most
+recently active DM contacts, so review stays to one screen each instead
+of scaling with how many groups/contacts exist. It's terminal-only by
+design (see the `wizard` entry above) so the decision can be made with a
 verifiable guarantee that no AI model was involved in making it. Point
-the user at it for reviewing several unconfigured groups at once; use
-this skill's own `group add` for one group with a custom personality.
+the user at it for setting up several groups or contacts at once; use
+this skill's own `group add` for one group with a custom personality, or
+`allow <jid>` for one contact.
 
 ## Implementation notes
 

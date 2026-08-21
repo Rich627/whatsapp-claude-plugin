@@ -93,15 +93,26 @@ This is a **best-effort mitigation, not a hard guarantee**: it depends on a save
 
 Both fail with a clear error if the group's `roster` flag isn't granted.
 
-## Guided group consent (wizard)
+## Guided bulk setup (wizard)
 
-`bun scripts/access.ts wizard` walks every joined group not yet configured (archived ones skipped by default — pass `--include-archived` to include them), asking two separate yes/no questions per group: can Claude reply here, and can Claude also see member names. It reads group names from a cache (`~/.whatsapp-channel/groups-meta.json`) that only the running server writes — automatically, once, the moment WhatsApp connects (the same way it already auto-syncs your saved contact names), and again every time the `list_groups` tool runs. If the server has never connected at all yet, the wizard has nothing to show; pair it first.
+`bun scripts/access.ts wizard` shows a checkbox screen of your **5 most recently active groups** and a second one for your **10 most recently active DM contacts** — the same recency signal the WhatsApp app itself sorts its own chat list by — so review stays to one screen each instead of scaling with how many groups or contacts you actually have. Navigate with the arrow keys, toggle with space, submit with enter.
+
+- **Groups**: pick which ones Claude can reply in, then (only for the ones you just picked) a second checkbox for which also get roster access.
+- **Contacts**: pick which ones can message Claude — added straight to the allowlist, no second question.
+- Archived groups are skipped by default (pass `--include-archived` to include them). Anything already configured, or outside the top 5/10, isn't shown here — add it individually later with `group add`/`allow`, or just ask Claude (it already knows the name from context).
+- Ctrl-C cancels cleanly at any point; nothing is written until every question on screen has been answered.
+
+Group/contact names and recency come from caches (`~/.whatsapp-channel/groups-meta.json`, `dm-activity.json`) that only the running server writes — automatically, as WhatsApp reports chat activity, no manual step needed once the account has connected at least once. If it's never connected yet, the wizard has nothing to show; pair it first.
 
 It's a terminal command, deliberately not a Claude Code skill: running it yourself, outside any chat, is what makes this true —
 
 > No group or contact data was sent to any AI model during this setup — this ran entirely in your terminal.
 
 The `/whatsapp-claude-channel:access` skill will point you at it if you ask for guided setup there, but will never run it on your behalf.
+
+### Removing someone already granted access
+
+`/whatsapp-claude-channel:access remove <jid>` (or the equivalent CLI command) also forgets their cached name from `contacts.json`, not just their allowlist entry — it does **not** touch `lid-map.json` (needed for correct message/mention matching if they're still an active participant in a group you can see) and it does **not** remove them from any shared group or block them on WhatsApp, neither of which this plugin does. If they're still in a group with roster access, they'll show up there as a masked number from then on instead of by name — the honest consequence of choosing to forget someone this plugin was never going to remove from a group.
 
 ## Mention detection
 
