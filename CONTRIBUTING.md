@@ -6,13 +6,22 @@ small and moves fast, so a few conventions keep pull requests easy to review and
 ## Project at a glance
 
 - **Runtime:** [Bun](https://bun.sh). TypeScript runs directly — there is **no build
-  step** and **no test suite**.
+  step**.
 - **Dependencies:** only two — `@modelcontextprotocol/sdk` and
   `@whiskeysockets/baileys`. Baileys is pinned to a release candidate and patched by
   `patch-baileys.mjs` (runs automatically on `postinstall`). **Please do not add new
   runtime dependencies without opening an issue first** — a slim dependency tree is a
   deliberate goal.
-- **The whole MCP server is one file:** `server.ts`.
+- **`server.ts` holds the MCP server itself** — connection lifecycle, tool
+  handlers, module-level state. Logic that's pure enough to unit-test without
+  pulling in `server.ts`'s connect-on-import side effects lives in `lib/` and
+  is imported by `server.ts` at runtime (e.g. `lib/mentions.ts`). `scripts/`
+  is different: reference scripts a user runs directly or copies out of the
+  repo (`bun scripts/access.ts`, `cp scripts/whisper-transcribe.sh ...`) —
+  `server.ts` never imports from `scripts/`.
+- **Tests:** `bun test` runs the suite (`lib/*.test.ts`, `scripts/*.test.ts`).
+  Not every module has one yet — add one for new `lib/` modules and for
+  `scripts/` modules where a real bug class is worth guarding against.
 
 ## Getting set up
 

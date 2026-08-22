@@ -25,6 +25,7 @@ import makeWASocket, {
   downloadMediaMessage,
   getContentType,
   jidNormalizedUser,
+  jidDecode,
   isLidUser,
   type WASocket,
   type WAMessage,
@@ -49,6 +50,7 @@ import {
 } from "fs";
 import { homedir } from "os";
 import { join, extname, sep, basename } from "path";
+import { normalizeMentionJids, mentionsForChunk } from "./lib/mentions";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -414,43 +416,10 @@ function resolveToPhone(jid: string): string {
 }
 
 // ─── Outbound mentions ──────────────────────────────────────────────
-// Writing "@12345" in the text is not enough: WhatsApp only renders a mention —
-// and only notifies the person — when the message also carries a `mentions`
-// array of JIDs. Without it the @ is inert text. Accept ids in whatever shape
-// the caller has (bare, @-prefixed, LID or phone, full JID) and normalise.
-function normalizeMentionJids(raw: string[]): string[] {
-  const out: string[] = [];
-  for (const entry of raw) {
-    const s = String(entry ?? "")
-      .trim()
-      .replace(/^@/, "");
-    if (!s) continue;
-    if (s.includes("@")) {
-      out.push(jidNormalizedUser(s));
-      continue;
-    }
-    // Group participants are LID-addressed, and the text convention is "@<lid>",
-    // so prefer the LID form whenever we know it.
-    const asLid = `${s}@lid`;
-    if (lidMap[asLid]) {
-      out.push(asLid);
-      continue;
-    }
-    const lidForPhone = Object.keys(lidMap).find(
-      (k) => lidMap[k] === `${s}@s.whatsapp.net`,
-    );
-    out.push(lidForPhone ?? `${s}@s.whatsapp.net`);
-  }
-  return [...new Set(out)];
-}
-
-// A long reply is split into chunks; only attach a mention to the chunk whose
-// text actually references it, so nobody gets pinged once per chunk.
-function mentionsForChunk(text: string, all: string[]): string[] | undefined {
-  if (!all.length) return undefined;
-  const hits = all.filter((jid) => text.includes(`@${jid.split("@")[0]}`));
-  return hits.length ? hits : undefined;
-}
+// normalizeMentionJids / mentionsForChunk live in ./lib/mentions.ts (not
+// scripts/, which is reference scripts users run or copy out directly - see
+// CONTRIBUTING.md) so they're unit-testable without pulling in server.ts's
+// connect-on-import side effects (see lib/mentions.test.ts).
 
 // Our own lidMap is only populated passively, by the `lid-mapping.update`
 // event (see connectWhatsApp). That event does not reliably fire for every
@@ -1460,6 +1429,9 @@ const handleToolCall = async (req: {
         const files = (args.files as string[] | undefined) ?? [];
         const mentionJids = normalizeMentionJids(
           (args.mentions as string[] | undefined) ?? [],
+          lidMap,
+          jidNormalizedUser,
+          jidDecode,
         );
 
         assertAllowedChat(chat_id);
@@ -1503,7 +1475,9 @@ const handleToolCall = async (req: {
           // itself has no caption to carry mentions), so attach every requested
           // mention here even when its "@id" text landed beyond the 200-char
           // cut — the notification comes from the mentions array, not the text.
-          const previewMentions = mentionJids.length ? mentionJids : undefined;
+          const previewMentions = mentionJids.length
+            ? [...new Set(mentionJids.map((m) => m.jid))]
+            : undefined;
           const sent = await sock.sendMessage(
             chat_id,
             previewMentions
