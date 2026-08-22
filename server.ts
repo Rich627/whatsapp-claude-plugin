@@ -207,10 +207,10 @@ function pidAlive(pid: number): boolean {
 // holder recorded, "" when started by something that does not set one.
 type LockHolder = { pid: number; client: string };
 
-function acquireSingletonLock(): LockHolder | null {
+function acquireSingletonLock(quiet = false): LockHolder | null {
   let myStart = processStartTime(process.pid);
   if (myStart === undefined) myStart = processStartTime(process.pid); // one retry
-  if (myStart === undefined) {
+  if (myStart === undefined && !quiet) {
     process.stderr.write(
       `${LOG_PREFIX}: could not read own start time; lock will be written without one\n`,
     );
@@ -260,11 +260,13 @@ function acquireSingletonLock(): LockHolder | null {
         (currentStart === undefined ||
           (lockedStart !== "" && currentStart === lockedStart))
       ) {
-        process.stderr.write(
-          `${LOG_PREFIX}: another whatsapp server is already running (pid ${otherPid}). ` +
-            `Not connecting — duplicate instances kick each other off Baileys. ` +
-            `Lock file: ${LOCK_FILE}\n`,
-        );
+        if (!quiet) {
+          process.stderr.write(
+            `${LOG_PREFIX}: another whatsapp server is already running (pid ${otherPid}). ` +
+              `Not connecting — duplicate instances kick each other off Baileys. ` +
+              `Lock file: ${LOCK_FILE}\n`,
+          );
+        }
         return { pid: otherPid, client: otherClient };
       }
     }
@@ -274,9 +276,11 @@ function acquireSingletonLock(): LockHolder | null {
       // (another instance took the stale lock over during our probe):
       // deleting it now would remove a live server's lock. They are the
       // server; we go into conflict mode.
-      process.stderr.write(
-        `${LOG_PREFIX}: lost the lock race to another starting server\n`,
-      );
+      if (!quiet) {
+        process.stderr.write(
+          `${LOG_PREFIX}: lost the lock race to another starting server\n`,
+        );
+      }
       return { pid: otherPid > 0 ? otherPid : 0, client: otherClient };
     }
     rmSync(LOCK_FILE, { force: true });
@@ -284,7 +288,7 @@ function acquireSingletonLock(): LockHolder | null {
 }
 
 function releaseSingletonLock(): void {
-  if (CONFLICT) return; // not ours to release
+  if (!isPrimary) return; // not (or not yet) ours to release
   try {
     const pidLine = readFileSync(LOCK_FILE, "utf8").split("\n")[0].trim();
     if (Number(pidLine) === process.pid) rmSync(LOCK_FILE, { force: true });
@@ -303,8 +307,15 @@ const conflictReason = CONFLICT
           ? ", started by this same client"
           : `, started by another client (pid ${CONFLICT.client})`
         : ""
-    }). WhatsApp allows one connection per account, so this session cannot send or receive. To use WhatsApp here, quit the other session, then start this one again.`
+    }). WhatsApp allows one connection per account, so this session cannot send or receive. This session keeps retrying in the background and takes over automatically if that server exits — no restart needed.`
   : "";
+
+// PRD §6/FR3: role is a RUNTIME state from here on. CONFLICT above stays the
+// immutable startup snapshot (it is still what conflictReason and the
+// startup branch read); isPrimary is what every later role check reads.
+// There is no primary → secondary transition (PRD §3: no proactive handoff),
+// so this only ever goes false → true, exactly once.
+let isPrimary = !CONFLICT;
 
 // ─── IPC listener (primary) ────────────────────────────────────────────
 // PRD §11 M1: the primary side of local multi-terminal sync. Opens a local
@@ -546,6 +557,9 @@ process.on("uncaughtException", (err) => {
 
 type IpcRelay = {
   call(name: string, args: Record<string, unknown>): Promise<unknown>;
+  // Needed only by the reconnect tick, to discard a relay that finished
+  // connecting after a lock tick had already promoted us (§4 race 1).
+  close(): void;
 };
 
 const IPC_CLOSED_MSG = "primary connection closed";
@@ -577,13 +591,18 @@ function readIpcToken(): string | null {
 // Resolves to a relay handle, or null for EVERY failure: no token, nothing
 // listening, connection refused, handshake refused (stale token), handshake
 // timeout. Never throws, never exits - the caller keeps today's stub.
-function connectToPrimary(): Promise<IpcRelay | null> {
+function connectToPrimary(
+  onClose?: () => void,
+  quiet = false,
+): Promise<IpcRelay | null> {
   return new Promise((res) => {
     const token = readIpcToken();
     if (!token) {
-      process.stderr.write(
-        `${LOG_PREFIX}: ipc: no usable token; staying in stub mode\n`,
-      );
+      if (!quiet) {
+        process.stderr.write(
+          `${LOG_PREFIX}: ipc: no usable token; staying in stub mode\n`,
+        );
+      }
       res(null);
       return;
     }
@@ -601,13 +620,28 @@ function connectToPrimary(): Promise<IpcRelay | null> {
     // .pipeline/review.md for the live reproduction.
     const buf = new LineBuffer();
     let settled = false;
+    let notifiedClose = false;
+    // Only a connection that completed its handshake and then died is a
+    // "lost primary". `settled` alone can't carry this guard: `fail()` sets
+    // it true on the never-connected path too, and the `close` event that
+    // its own `s.destroy()` triggers would then misread that as "was live".
+    // `live` is set true in exactly one place — the hello-ack branch below.
+    let live = false;
+    const lost = () => {
+      if (notifiedClose) return;
+      notifiedClose = true;
+      s.destroy(); // idempotent; the error path does not go through fail()'s
+      onClose?.(); // destroy once settled is already true
+    };
 
     const fail = (why: string) => {
       if (settled) return;
       settled = true;
-      process.stderr.write(
-        `${LOG_PREFIX}: ipc: ${why}; staying in stub mode\n`,
-      );
+      if (!quiet) {
+        process.stderr.write(
+          `${LOG_PREFIX}: ipc: ${why}; staying in stub mode\n`,
+        );
+      }
       s.destroy();
       res(null);
     };
@@ -620,14 +654,14 @@ function connectToPrimary(): Promise<IpcRelay | null> {
 
     s.on("error", (err) => {
       pending.failAll(new Error(IPC_CLOSED_MSG));
-      // T05 retries this
       fail(`connect failed (${(err as NodeJS.ErrnoException).code ?? err})`);
+      if (live) lost();
     });
 
     s.on("close", () => {
       pending.failAll(new Error(IPC_CLOSED_MSG));
-      // T05 retries this
       fail("primary closed the connection");
+      if (live) lost();
     });
 
     s.on("data", (chunk: string) => {
@@ -656,12 +690,9 @@ function connectToPrimary(): Promise<IpcRelay | null> {
         if (msg.id === IPC_HELLO_ID) {
           if (settled) continue;
           settled = true;
+          live = true;
           s.setTimeout(0); // idle timer would otherwise fire on a quiet session
-          // connectToPrimary() is only ever invoked from the `CONFLICT ? ...`
-          // call below, so CONFLICT is non-null for the lifetime of this call.
-          process.stderr.write(
-            `${LOG_PREFIX}: ipc: connected to primary (pid ${CONFLICT!.pid})\n`,
-          );
+          process.stderr.write(`${LOG_PREFIX}: ipc: connected to primary\n`);
           res(relay);
           continue;
         }
@@ -682,11 +713,123 @@ function connectToPrimary(): Promise<IpcRelay | null> {
         }
         return result;
       },
+      close() {
+        s.destroy();
+      },
     };
   });
 }
 
-const ipcRelay: IpcRelay | null = CONFLICT ? await connectToPrimary() : null;
+// Reassigned on promotion (→ null) and on a successful reconnect. Declared
+// separately from the initial connect so the socket callbacks registered
+// inside connectToPrimary() can never touch it in its TDZ.
+let ipcRelay: IpcRelay | null = null;
+if (CONFLICT) ipcRelay = await connectToPrimary(onRelayLost);
+
+// PRD §11 M4 / FR3+FR5. Role changes at runtime from here.
+
+// The one state that serves the stub: cannot execute locally, has no live
+// primary to relay to. Read per request, never cached.
+const degraded = () => !isPrimary && !ipcRelay;
+
+// PRD §12 tier 1. Both cadences run concurrently; whichever wins stops both.
+const RECONNECT_INTERVAL_MS = 2000;
+const LOCK_RETRY_INTERVAL_MS = 3000;
+let retrying = false;
+// Bumped on every startRetryLoop() call. A timer callback from an earlier
+// chain carries the generation it was queued under; if that no longer
+// matches retryGen when it fires, the chain it belonged to is dead and the
+// callback must not re-arm itself — otherwise a reconnect-then-die flap
+// inside a stale timer's remaining window leaves two live chains running
+// forever (each re-arming the other), tripling on a third flap.
+let retryGen = 0;
+
+function onRelayLost(): void {
+  if (isPrimary) return; // we closed it ourselves after promoting
+  ipcRelay = null;
+  process.stderr.write(`${LOG_PREFIX}: ipc: lost the primary connection\n`);
+  startRetryLoop();
+}
+
+function startRetryLoop(): void {
+  if (retrying || isPrimary) return;
+  retrying = true;
+  const gen = ++retryGen;
+  process.stderr.write(
+    `${LOG_PREFIX}: ipc: no primary reachable; retrying (reconnect ` +
+      `${RECONNECT_INTERVAL_MS}ms / lock ${LOCK_RETRY_INTERVAL_MS}ms)\n`,
+  );
+  queueReconnect(gen);
+  queueLockRetry(gen);
+}
+
+// setTimeout chains, not setInterval: acquireSingletonLock() blocks the event
+// loop on a synchronous start-time probe (server.ts:155 — a PowerShell CIM
+// spawn on Windows) and connectToPrimary() can take IPC_PROBE_TIMEOUT_MS, so
+// fixed intervals would let ticks pile up on top of each other.
+function queueReconnect(gen: number): void {
+  setTimeout(async () => {
+    if (!retrying || gen !== retryGen) return;
+    const relay = await connectToPrimary(onRelayLost, true);
+    if (!retrying || gen !== retryGen) return relay?.close(); // stale chain — a lock tick promoted us, or a newer chain took over, while this connect was in flight
+    if (!relay) return queueReconnect(gen);
+    ipcRelay = relay;
+    retrying = false;
+  }, RECONNECT_INTERVAL_MS).unref();
+}
+
+function queueLockRetry(gen: number): void {
+  setTimeout(() => {
+    if (!retrying || gen !== retryGen) return;
+    // ponytail: no backoff. Cheap when it matters (a clean primary exit
+    // leaves no lock file, so this is one atomic create), but a primary that
+    // stays alive with no reachable listener keeps this probing every 3s for
+    // as long as that lasts — PRD §12 accepted that cost. `quiet=true` here
+    // stops the refusal line itself from repeating (only the one-shot
+    // startup call at the top of the file still prints it), so what remains
+    // is the synchronous start-time probe alone, every 3s. Add a backoff
+    // after N attempts if that probe cost ever bites.
+    let won: LockHolder | null;
+    try {
+      won = acquireSingletonLock(true);
+    } catch (err) {
+      // acquireSingletonLock() rethrows any writeFileSync failure that isn't
+      // EEXIST (e.g. Windows EPERM against a delete-pending lock file, racing
+      // the old primary's own releaseSingletonLock()). An uncaught throw here
+      // would kill this callback before the next retry is queued, silently
+      // ending the chain for good — this process could never promote again.
+      // Log once (deliberately not quiet-gated: a repeating FS failure is a
+      // real fault, not the steady-state noise `quiet` exists to hide) and
+      // keep the chain alive.
+      process.stderr.write(
+        `${LOG_PREFIX}: lock retry failed (${err instanceof Error ? err.message : String(err)}); will retry\n`,
+      );
+      return queueLockRetry(gen);
+    }
+    if (won) return queueLockRetry(gen);
+    retrying = false;
+    process.stderr.write(
+      `${LOG_PREFIX}: won the singleton lock; promoting to primary\n`,
+    );
+    void becomePrimary();
+  }, LOCK_RETRY_INTERVAL_MS).unref();
+}
+
+// Everything today's startup `else` branch does, callable at any time.
+async function becomePrimary(): Promise<void> {
+  // Before any await: shutdown() firing during connectWhatsApp() must find
+  // isPrimary true so releaseSingletonLock() removes the lock we just took,
+  // and a tool call arriving mid-promotion must fall through to the existing
+  // `if (!sock) throw "WhatsApp not connected"` rather than the stub (PRD §12).
+  isPrimary = true;
+  ipcRelay = null;
+  // Primary-only background work, started once on becoming primary and never
+  // stopped: there is no primary → secondary transition to stop them for.
+  if (!STATIC) setInterval(checkApprovals, 5000).unref();
+  setInterval(pruneMessageLog, 60 * 60 * 1000).unref();
+  await startIpcListener();
+  await connectWhatsApp();
+}
 
 // The primary is same-user and token-verified, but this is still another
 // process's JSON. A result that is not shaped like a CallToolResult must not
@@ -1370,10 +1513,6 @@ function checkApprovals(): void {
   }
 }
 
-// Never from a conflict-mode server: it has no socket, so it would only delete
-// the handoff files the connected server is about to act on.
-if (!STATIC && !CONFLICT) setInterval(checkApprovals, 5000).unref();
-
 // ─── Server-side cron engine ────────────────────────────────────────
 
 type CronJob = {
@@ -1801,10 +1940,6 @@ function pruneMessageLog(): void {
   } catch {}
 }
 
-// Prune every hour. Not from a conflict-mode server: a second read-then-rewrite
-// of the log could drop lines the connected server appended in between.
-if (!CONFLICT) setInterval(pruneMessageLog, 60 * 60 * 1000).unref();
-
 // ─── Photo extensions ──────────────────────────────────────────────────
 
 const PHOTO_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
@@ -1845,9 +1980,9 @@ const mcp = new Server(
       // Conflict first: instructions are one of the few things every MCP
       // client must put in front of the model, so this is where a refused
       // server gets to explain itself.
-      ...(CONFLICT && !ipcRelay
+      ...(degraded()
         ? [
-            `WHATSAPP UNAVAILABLE IN THIS SESSION. ${conflictReason} Tell the user this if they ask about WhatsApp; do not attempt to send messages.`,
+            `WHATSAPP UNAVAILABLE IN THIS SESSION. ${conflictReason} Tell the user this if they ask about WhatsApp; do not attempt to send messages, and do not tell the user to restart anything.`,
             "",
           ]
         : []),
@@ -1990,147 +2125,164 @@ mcp.setNotificationHandler(
 
 // ─── Tools ─────────────────────────────────────────────────────────────
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "reply",
-      description:
-        "Reply on WhatsApp. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for quoting, mentions (to @-tag people) and files (absolute paths) to attach images or documents.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          chat_id: { type: "string" },
-          text: { type: "string" },
-          reply_to: {
-            type: "string",
+// Known ceiling: a client that read tools/list while this process was
+// degraded keeps that cached list even after promotion (PRD §6 rules out
+// notifications/tools/list_changed). Unreachable in the owner's scenario — a
+// secondary that reaches its primary at startup never advertises the stub —
+// and the alternative is the dynamic-tool-list mechanism the PRD rejected.
+mcp.setRequestHandler(ListToolsRequestSchema, async () =>
+  degraded()
+    ? {
+        tools: [
+          {
+            name: "whatsapp_unavailable",
+            description: `WhatsApp is not available in this session. ${conflictReason} No other WhatsApp tool exists here.`,
+            inputSchema: { type: "object", properties: {} },
+          },
+        ],
+      }
+    : {
+        tools: [
+          {
+            name: "reply",
             description:
-              "Message ID to quote-reply. Use message_id from the inbound <channel> block.",
+              "Reply on WhatsApp. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for quoting, mentions (to @-tag people) and files (absolute paths) to attach images or documents.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                chat_id: { type: "string" },
+                text: { type: "string" },
+                reply_to: {
+                  type: "string",
+                  description:
+                    "Message ID to quote-reply. Use message_id from the inbound <channel> block.",
+                },
+                mentions: {
+                  type: "array",
+                  items: { type: "string" },
+                  description:
+                    'People to @-tag. Prefer a saved contact\'s name where you know it, e.g. ["Akash"] — a raw number or id never needs to appear anywhere in your own text or reasoning. Falls back to the user_id/lid from an inbound <channel> block (a phone number or full JID also works) for someone with no saved name yet. In a group where roster access is granted, use the single value "all" to tag every current member — this expands server-side from live group membership, so it works even for members with no saved contact name and no matter how many there are. You MUST also write the matching "@<value>" into text, using the exact same value you pass here (the name, or "all", if that\'s what you passed); the array is what makes WhatsApp render it as a real mention and notify them, the text alone does nothing. A name matching more than one saved contact fails the call rather than guessing — use the id for that person instead.',
+                },
+                files: {
+                  type: "array",
+                  items: { type: "string" },
+                  description:
+                    "Absolute file paths to attach. Images send as photos; other types as documents. Max 16MB each.",
+                },
+              },
+              required: ["chat_id", "text"],
+            },
           },
-          mentions: {
-            type: "array",
-            items: { type: "string" },
+          {
+            name: "react",
             description:
-              'People to @-tag. Prefer a saved contact\'s name where you know it, e.g. ["Akash"] — a raw number or id never needs to appear anywhere in your own text or reasoning. Falls back to the user_id/lid from an inbound <channel> block (a phone number or full JID also works) for someone with no saved name yet. In a group where roster access is granted, use the single value "all" to tag every current member — this expands server-side from live group membership, so it works even for members with no saved contact name and no matter how many there are. You MUST also write the matching "@<value>" into text, using the exact same value you pass here (the name, or "all", if that\'s what you passed); the array is what makes WhatsApp render it as a real mention and notify them, the text alone does nothing. A name matching more than one saved contact fails the call rather than guessing — use the id for that person instead.',
+              "Add an emoji reaction to a WhatsApp message. Any emoji is supported.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                chat_id: { type: "string" },
+                message_id: { type: "string" },
+                emoji: { type: "string" },
+              },
+              required: ["chat_id", "message_id", "emoji"],
+            },
           },
-          files: {
-            type: "array",
-            items: { type: "string" },
+          {
+            name: "download_attachment",
             description:
-              "Absolute file paths to attach. Images send as photos; other types as documents. Max 16MB each.",
+              "Download a media attachment from a WhatsApp message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                file_id: {
+                  type: "string",
+                  description:
+                    "The attachment_file_id (message ID) from inbound meta",
+                },
+              },
+              required: ["file_id"],
+            },
           },
-        },
-        required: ["chat_id", "text"],
-      },
-    },
-    {
-      name: "react",
-      description:
-        "Add an emoji reaction to a WhatsApp message. Any emoji is supported.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          chat_id: { type: "string" },
-          message_id: { type: "string" },
-          emoji: { type: "string" },
-        },
-        required: ["chat_id", "message_id", "emoji"],
-      },
-    },
-    {
-      name: "download_attachment",
-      description:
-        "Download a media attachment from a WhatsApp message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          file_id: {
-            type: "string",
+          {
+            name: "edit_message",
             description:
-              "The attachment_file_id (message ID) from inbound meta",
+              "Edit a message this account previously sent. Only works on the account's own messages.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                chat_id: { type: "string" },
+                message_id: { type: "string" },
+                text: { type: "string" },
+              },
+              required: ["chat_id", "message_id", "text"],
+            },
           },
-        },
-        required: ["file_id"],
-      },
-    },
-    {
-      name: "edit_message",
-      description:
-        "Edit a message this account previously sent. Only works on the account's own messages.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          chat_id: { type: "string" },
-          message_id: { type: "string" },
-          text: { type: "string" },
-        },
-        required: ["chat_id", "message_id", "text"],
-      },
-    },
-    {
-      name: "status",
-      description:
-        "Get WhatsApp connection status. Returns whether connected, the pairing code (if pending), and the connected JID. Call this on session start to check setup state and show the pairing code to the user.",
-      inputSchema: {
-        type: "object",
-        properties: {},
-      },
-    },
-    {
-      name: "wait_for_messages",
-      description:
-        "Wait for the next inbound WhatsApp message, up to 40 seconds. Returns immediately if messages are already unreplied. Use this when you want to stay responsive without polling: call it, handle whatever it returns, call it again. It returns an empty result if nothing arrives in time, which is normal, not an error. (In Claude Code messages are also pushed into the session automatically, so this is mainly for other MCP clients.)",
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "unreplied",
-      description:
-        "Get messages received but not yet replied to. Call this on session start (after status) to catch up on messages that arrived before this session or were missed due to a restart. Each entry includes chat_id, message_id, user, text, and timestamp.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          chat_id: {
-            type: "string",
+          {
+            name: "status",
             description:
-              "Optional: filter to a specific chat. Omit to get all unreplied messages.",
+              "Get WhatsApp connection status. Returns whether connected, the pairing code (if pending), and the connected JID. Call this on session start to check setup state and show the pairing code to the user.",
+            inputSchema: {
+              type: "object",
+              properties: {},
+            },
           },
-        },
-      },
-    },
-    {
-      name: "catch_up",
-      description:
-        'Recover conversation context after a restart. For every chat active in the last 24h, returns the recent messages in BOTH directions (sender name for incoming, "You" for replies this agent sent), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
-      inputSchema: {
-        type: "object",
-        properties: {},
-      },
-    },
-    {
-      name: "list_groups",
-      description:
-        "List every WhatsApp group this account is currently a member of, with each group's name and JID, whether it's already allowlisted, and whether roster access (member names, needed for @all) is granted. Use this to find the JID of a newly-joined group so it can be added via the /whatsapp-claude-channel:access skill — no need to guess the JID from logs. Read-only: does not change access. Also refreshes the on-disk group name/count cache the terminal access wizard (bun scripts/access.ts wizard) reads from.",
-      inputSchema: {
-        type: "object",
-        properties: {},
-      },
-    },
-    {
-      name: "group_roster",
-      description:
-        'List an allowlisted group\'s members, by name where a saved contact name is known, or a masked number otherwise — never a raw phone number. Only works when roster access has been explicitly granted for that group (bun scripts/access.ts wizard, or "group add --roster"); fails with a clear error otherwise. Use this before an @all mention, or to answer who is in a chat.',
-      inputSchema: {
-        type: "object",
-        properties: {
-          chat_id: {
-            type: "string",
-            description: "The group's JID, from list_groups.",
+          {
+            name: "wait_for_messages",
+            description:
+              "Wait for the next inbound WhatsApp message, up to 40 seconds. Returns immediately if messages are already unreplied. Use this when you want to stay responsive without polling: call it, handle whatever it returns, call it again. It returns an empty result if nothing arrives in time, which is normal, not an error. (In Claude Code messages are also pushed into the session automatically, so this is mainly for other MCP clients.)",
+            inputSchema: { type: "object", properties: {} },
           },
-        },
-        required: ["chat_id"],
+          {
+            name: "unreplied",
+            description:
+              "Get messages received but not yet replied to. Call this on session start (after status) to catch up on messages that arrived before this session or were missed due to a restart. Each entry includes chat_id, message_id, user, text, and timestamp.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                chat_id: {
+                  type: "string",
+                  description:
+                    "Optional: filter to a specific chat. Omit to get all unreplied messages.",
+                },
+              },
+            },
+          },
+          {
+            name: "catch_up",
+            description:
+              'Recover conversation context after a restart. For every chat active in the last 24h, returns the recent messages in BOTH directions (sender name for incoming, "You" for replies this agent sent), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
+            inputSchema: {
+              type: "object",
+              properties: {},
+            },
+          },
+          {
+            name: "list_groups",
+            description:
+              "List every WhatsApp group this account is currently a member of, with each group's name and JID, whether it's already allowlisted, and whether roster access (member names, needed for @all) is granted. Use this to find the JID of a newly-joined group so it can be added via the /whatsapp-claude-channel:access skill — no need to guess the JID from logs. Read-only: does not change access. Also refreshes the on-disk group name/count cache the terminal access wizard (bun scripts/access.ts wizard) reads from.",
+            inputSchema: {
+              type: "object",
+              properties: {},
+            },
+          },
+          {
+            name: "group_roster",
+            description:
+              'List an allowlisted group\'s members, by name where a saved contact name is known, or a masked number otherwise — never a raw phone number. Only works when roster access has been explicitly granted for that group (bun scripts/access.ts wizard, or "group add --roster"); fails with a clear error otherwise. Use this before an @all mention, or to answer who is in a chat.',
+            inputSchema: {
+              type: "object",
+              properties: {
+                chat_id: {
+                  type: "string",
+                  description: "The group's JID, from list_groups.",
+                },
+              },
+              required: ["chat_id"],
+            },
+          },
+        ],
       },
-    },
-  ],
-}));
+);
 
 // Wrapped below so every result carries the unreplied count: a client that
 // cannot be pushed to still learns there is traffic, on its next tool call,
@@ -2601,6 +2753,11 @@ const handleToolCall = async (req: {
 };
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+  // FR5: no live connection and nothing to relay to — answer immediately
+  // with today's stub text instead of letting the call queue on a dead
+  // socket. Same shape the startup stub used to return (no isError, no
+  // unreplied suffix), so nothing downstream changes.
+  if (degraded()) return { content: [{ type: "text", text: conflictReason }] };
   const result = await handleToolCall(req);
   const pending = getUnreplied().length;
   const last = result.content?.[result.content.length - 1];
@@ -2641,8 +2798,10 @@ function shutdown(): void {
   // Stops accepting and unlinks the Unix socket file. Any open connection is
   // torn down by the process.exit(0) three lines down, which is what gives a
   // connected secondary its instant disconnect (PRD §6 tier 1).
-  // ponytail: no explicit socket set to destroy — T04 introduces one for
-  // broadcast, and until then exit does the same job.
+  // process.exit(0) below is unconditional and synchronous, so the OS closes
+  // every secondarySockets fd instantly and each connected secondary gets its
+  // own close event — no explicit destroy loop needed, that would be dead
+  // code on every path through this function.
   try {
     ipcServer?.close();
   } catch {}
@@ -3629,36 +3788,16 @@ async function connectWhatsApp(): Promise<void> {
   );
 }
 
-if (CONFLICT) {
-  if (ipcRelay) {
-    // The real ListTools/CallTool handlers registered above stay in effect;
-    // handleToolCall's relay branch sends every call to the primary. PRD §6:
-    // the tool list is static, only what happens on a call changes.
-    process.stderr.write(
-      `${LOG_PREFIX}: relaying tool calls to the primary (pid ${CONFLICT.pid})\n`,
-    );
-  } else {
-    // Registered last, so these replace the real handlers. Exposing reply/react
-    // in conflict mode would be worse than exposing nothing: they would accept a
-    // message, fail to send it, and the agent would report it as delivered.
-    mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
-        {
-          name: "whatsapp_unavailable",
-          description: `WhatsApp is not available in this session. ${conflictReason} No other WhatsApp tool exists here.`,
-          inputSchema: { type: "object", properties: {} },
-        },
-      ],
-    }));
-    mcp.setRequestHandler(CallToolRequestSchema, async () => ({
-      content: [{ type: "text", text: conflictReason }],
-    }));
-    // Baileys is never touched here, so the one-connection invariant holds
-    // exactly as it did when this path called process.exit(2).
-    process.stderr.write(`${LOG_PREFIX}: ${conflictReason}\n`);
-  }
-} else {
+if (!CONFLICT) {
   process.stderr.write(`${LOG_PREFIX}: starting\n`);
-  await startIpcListener();
-  await connectWhatsApp();
+  await becomePrimary();
+} else if (ipcRelay) {
+  process.stderr.write(
+    `${LOG_PREFIX}: relaying tool calls to the primary (pid ${CONFLICT.pid})\n`,
+  );
+} else {
+  // Baileys is never touched here, so the one-connection invariant holds
+  // exactly as it did when this path called process.exit(2).
+  process.stderr.write(`${LOG_PREFIX}: ${conflictReason}\n`);
+  startRetryLoop(); // FR5: degraded, but never permanently
 }
