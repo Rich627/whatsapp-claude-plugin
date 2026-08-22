@@ -94,6 +94,10 @@ const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
 const TASKS_FILE = join(STATE_DIR, "tasks.md");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
 const IPC_TOKEN_FILE = join(STATE_DIR, ".ipc-token");
+// Read by scripts/statusline-role.ts. PID-scoped so two terminals never
+// collide on one file; a stale one from a dead process is harmless, the
+// reader only ever looks up a pid it just found alive in the process list.
+const ROLE_FILE = join(STATE_DIR, `.role-${process.pid}`);
 // resolve(): two terminals can pass the same directory spelled differently
 // (trailing separator, relative path) and ipcSocketPath hashes the raw
 // string on Windows, giving two different pipe names. STATE_DIR is fixed at
@@ -321,6 +325,15 @@ const conflictReason = CONFLICT
 // There is no primary → secondary transition (PRD §3: no proactive handoff),
 // so this only ever goes false → true, exactly once.
 let isPrimary = !CONFLICT;
+
+// PRD §14: written on every role transition so scripts/statusline-role.ts
+// (a separate, freshly-spawned process per render) has something to read —
+// it cannot see this process's in-memory isPrimary/ipcRelay/retrying.
+function writeRoleFile(role: "primary" | "secondary" | "reconnecting"): void {
+  try {
+    writeFileSync(ROLE_FILE, role);
+  } catch {}
+}
 
 // ─── IPC listener (primary) ────────────────────────────────────────────
 // PRD §11 M1: the primary side of local multi-terminal sync. Opens a local
@@ -756,6 +769,7 @@ function onRelayLost(): void {
 function startRetryLoop(): void {
   if (retrying || isPrimary) return;
   retrying = true;
+  writeRoleFile("reconnecting");
   const gen = ++retryGen;
   process.stderr.write(
     `${LOG_PREFIX}: ipc: no primary reachable; retrying (reconnect ` +
@@ -777,6 +791,7 @@ function queueReconnect(gen: number): void {
     if (!relay) return queueReconnect(gen);
     ipcRelay = relay;
     retrying = false;
+    writeRoleFile("secondary");
   }, RECONNECT_INTERVAL_MS).unref();
 }
 
@@ -824,6 +839,7 @@ async function becomePrimary(): Promise<void> {
   // and a tool call arriving mid-promotion must fall through to the existing
   // `if (!sock) throw "WhatsApp not connected"` rather than the stub (PRD §12).
   isPrimary = true;
+  writeRoleFile("primary");
   ipcRelay = null;
   // Primary-only background work, started once on becoming primary and never
   // stopped: there is no primary → secondary transition to stop them for.
@@ -2807,6 +2823,9 @@ function shutdown(): void {
   try {
     ipcServer?.close();
   } catch {}
+  try {
+    rmSync(ROLE_FILE, { force: true });
+  } catch {}
   releaseSingletonLock();
   setTimeout(() => process.exit(0), 2000);
   try {
@@ -3797,6 +3816,7 @@ if (!CONFLICT) {
   process.stderr.write(
     `${LOG_PREFIX}: relaying tool calls to the primary (pid ${CONFLICT.pid})\n`,
   );
+  writeRoleFile("secondary");
 } else {
   // Baileys is never touched here, so the one-connection invariant holds
   // exactly as it did when this path called process.exit(2).

@@ -216,6 +216,27 @@ If something still seems stuck (most likely after killing a terminal outside Cla
 pkill -f "whatsapp.*server"
 ```
 
+## Statusline (optional)
+
+`scripts/statusline-role.ts` prints `WA:primary`, `WA:secondary` or
+`WA:reconnecting` (colored, empty string otherwise) for whichever terminal
+it's run in. Append it to a Claude Code `statusLine` command to see at a
+glance which terminal holds the real connection:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "your-existing-statusline-command && bun <plugin-dir>/scripts/statusline-role.ts"
+  }
+}
+```
+
+It finds the server by walking down from the Claude Code CLI process:
+first the plugin's own wrapper process, then `server.ts` among that
+wrapper's children. Same-machine, read-only, never throws - a miss just
+means no segment, not a broken statusline.
+
 ## Known limitations
 
 **Inbound message delivery is Claude Code only.** Messages are pushed into a session with `notifications/claude/channel`, which is a Claude Code extension, not part of MCP. Other MCP clients (Codex CLI, Gemini CLI, Cursor) drop unknown notifications silently, so there the plugin is poll-only: call `wait_for_messages`, `catch_up` or `unreplied` to see what arrived. Delivery inside Claude Code was broken by client bugs ([#37933](https://github.com/anthropics/claude-code/issues/37933), [#36477](https://github.com/anthropics/claude-code/issues/36477), [#37633](https://github.com/anthropics/claude-code/issues/37633)) and worked again when last checked on v2.1.235; if messages stop appearing, check those issues before suspecting this plugin.
