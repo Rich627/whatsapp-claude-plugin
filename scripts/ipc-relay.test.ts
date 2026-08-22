@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ownStartTime, sleep, startFakePrimary } from "./ipc-test-helpers";
 
-// Reviewer finding (.pipeline/review.md): connectToPrimary() calling
+// Reviewer finding: connectToPrimary() calling
 // s.unref() on the relay socket wedges startup dead on this runtime, because
 // nothing else in the event loop is ref'd until the MCP stdio transport
 // connects hundreds of lines later. bun test's existing coverage never opens
@@ -75,8 +75,8 @@ describe("ipc relay (secondary)", () => {
         await sleep(250);
       }
       expect(stdout).toContain('"id":1');
-      // FR1: a relaying secondary must not still advertise the stub warning
-      // in its MCP `instructions` (spec §4.5/§0.2).
+      // A relaying secondary must not still advertise the stub warning
+      // in its MCP `instructions`.
       expect(stdout).not.toContain("WHATSAPP UNAVAILABLE");
 
       child.stdin.write(
@@ -108,7 +108,7 @@ describe("ipc relay (secondary)", () => {
     }
   }, 60_000);
 
-  test("a real secondary re-emits a broadcast notify as its own MCP notification (PRD FR2)", async () => {
+  test("a real secondary re-emits a broadcast notify as its own MCP notification", async () => {
     const dir = mkdtempSync(join(tmpdir(), "wa-relay-notify-"));
     const token = "b".repeat(64);
     writeFileSync(join(dir, ".ipc-token"), token + "\n", { mode: 0o600 });

@@ -319,16 +319,17 @@ const conflictReason = CONFLICT
     }). WhatsApp allows one connection per account, so this session cannot send or receive. This session keeps retrying in the background and takes over automatically if that server exits — no restart needed.`
   : "";
 
-// PRD §6/FR3: role is a RUNTIME state from here on. CONFLICT above stays the
-// immutable startup snapshot (it is still what conflictReason and the
-// startup branch read); isPrimary is what every later role check reads.
-// There is no primary → secondary transition (PRD §3: no proactive handoff),
-// so this only ever goes false → true, exactly once.
+// Role is a RUNTIME state from here on. CONFLICT above stays the immutable
+// startup snapshot (it is still what conflictReason and the startup branch
+// read); isPrimary is what every later role check reads. There is no
+// primary → secondary transition: handoff is reactive only, triggered by the
+// primary exiting, never proactively, so this only ever goes false → true,
+// exactly once.
 let isPrimary = !CONFLICT;
 
-// PRD §14: written on every role transition so scripts/statusline-role.ts
-// (a separate, freshly-spawned process per render) has something to read —
-// it cannot see this process's in-memory isPrimary/ipcRelay/retrying.
+// Written on every role transition so scripts/statusline-role.ts (a separate,
+// freshly-spawned process per render) has something to read — it cannot see
+// this process's in-memory isPrimary/ipcRelay/retrying.
 function writeRoleFile(role: "primary" | "secondary" | "reconnecting"): void {
   try {
     writeFileSync(ROLE_FILE, role);
@@ -336,12 +337,12 @@ function writeRoleFile(role: "primary" | "secondary" | "reconnecting"): void {
 }
 
 // ─── IPC listener (primary) ────────────────────────────────────────────
-// PRD §11 M1: the primary side of local multi-terminal sync. Opens a local
-// Unix socket / Windows named pipe, generates a fresh auth token, accepts
-// connections, and drops any that don't present that token. No relay, no
-// broadcast, no tracked connection list — those are later tasks (T03/T04).
+// The primary side of local multi-terminal sync. Opens a local Unix socket /
+// Windows named pipe, generates a fresh auth token, accepts connections, and
+// drops any that don't present that token. No relay, no broadcast, no
+// tracked connection list yet — those are added further down this file.
 
-// PRD §9/§12: the same-user boundary is enforced by a shared secret in a
+// The same-user boundary is enforced by a shared secret in a
 // 0600 file (the trust model contacts.json/lid-map.json already use), not by
 // pipe/socket ACLs. Regenerated every time a primary starts listening — a
 // secondary always reads this file fresh right before connecting, so there
@@ -365,9 +366,8 @@ function writeIpcToken(): string {
 // 4096 bytes is a generous multiple of a real hello (a 64-char hex token
 // plus JSON framing is well under 200 bytes) and small enough that a
 // babbling client dies immediately.
-// ponytail: flat pre-auth cap, no rate limit and no post-auth cap. A
-// token-verified peer is the same OS user; if that stops being true, cap
-// there too.
+// Flat pre-auth cap, no rate limit and no post-auth cap. A token-verified
+// peer is the same OS user; if that stops being true, cap there too.
 const IPC_PRE_AUTH_MAX_BYTES = 4096;
 
 // Constant-time compare. A same-user attacker who can time this can already
@@ -427,10 +427,10 @@ function handleIpcConnection(socket: NetSocket, token: string): void {
         }
         const { id, name } = msg;
         const args = (msg.args ?? {}) as Record<string, unknown>;
-        // FR6: the exact same handleToolCall a direct call runs - not a copy,
-        // and deliberately not the unreplied-suffix wrapper (spec §0.1: the
-        // secondary adds that itself from the shared message log, and doing it
-        // here too would append it twice).
+        // The exact same handleToolCall a direct call runs - not a copy, and
+        // deliberately not the unreplied-suffix wrapper: the secondary adds
+        // that itself from the shared message log, and doing it here too
+        // would append it twice.
         void handleToolCall({ params: { name, arguments: args } })
           .then((result) => {
             if (!socket.destroyed) {
@@ -462,15 +462,15 @@ function handleIpcConnection(socket: NetSocket, token: string): void {
   });
 }
 
-// ponytail: 1 s. A same-machine socket connect either completes or errors in
+// 1 s. A same-machine socket connect either completes or errors in
 // microseconds; this only bounds a pathological hung listener so startup
-// cannot wedge. Not a PRD value — see .pipeline/spec.md §8.
+// cannot wedge. Not tuned to any external spec, just a generous ceiling.
 const IPC_PROBE_TIMEOUT_MS = 1000;
 
 let ipcServer: NetServer | null = null;
 
-// PRD §11 M3 / FR2: every currently-connected, token-verified secondary,
-// for broadcasting inbound-message notifications to. Populated on a
+// Every currently-connected, token-verified secondary, for broadcasting
+// inbound-message notifications to. Populated on a
 // successful hello (handleIpcConnection), pruned on socket close.
 const secondarySockets = new Set<NetSocket>();
 
@@ -504,13 +504,13 @@ function probeIpcSocket(path: string): Promise<SocketProbe> {
 }
 
 // Never throws: a failed IPC listener must not stop this process from being
-// a normal, fully working primary (PRD §6 — the tool list is static and
-// direct execution is unaffected).
+// a normal, fully working primary — the tool list is static and direct
+// execution is unaffected either way.
 async function startIpcListener(): Promise<void> {
   try {
     const path = IPC_SOCKET_PATH;
-    // FR4 is Unix-socket-only: on Windows a dead process's pipe stops
-    // existing, so there is nothing stale to recover from.
+    // Stale-socket recovery is Unix-socket-only: on Windows a dead process's
+    // named pipe stops existing, so there is nothing stale to recover from.
     if (process.platform !== "win32" && existsSync(path)) {
       if (!isStaleSocket(await probeIpcSocket(path))) {
         process.stderr.write(
@@ -564,16 +564,17 @@ process.on("uncaughtException", (err) => {
 });
 
 // ─── IPC relay (secondary) ─────────────────────────────────────────────
-// PRD §11 M2: a process that lost the singleton lock makes ONE attempt to
-// reach the primary's listener and relay its tool calls there instead of
-// serving the whatsapp_unavailable stub. One attempt, at startup, the same
-// shape as acquireSingletonLock()'s single attempt - retry, reconnect and
-// promotion are T05.
+// A process that lost the singleton lock connects to the primary's listener
+// and relays its tool calls there instead of serving the whatsapp_unavailable
+// stub. The initial attempt happens once at startup, the same shape as
+// acquireSingletonLock()'s single attempt; retry, reconnect and auto-
+// promotion when the primary disappears are implemented further down this
+// file (see startRetryLoop and the reconnect tick).
 
 type IpcRelay = {
   call(name: string, args: Record<string, unknown>): Promise<unknown>;
   // Needed only by the reconnect tick, to discard a relay that finished
-  // connecting after a lock tick had already promoted us (§4 race 1).
+  // connecting after a lock tick had already promoted us to primary.
   close(): void;
 };
 
@@ -585,13 +586,13 @@ const IPC_CLOSED_MSG = "primary connection closed";
 // Server.notification() throws "Not connected" until then, so anything
 // received early must queue instead of being dropped silently.
 let mcpReady = false;
-const PENDING_NOTIFICATIONS_CAP = 200; // ponytail: flat cap, drop oldest first
+const PENDING_NOTIFICATIONS_CAP = 200; // flat cap, drop oldest first
 const pendingSecondaryNotifications: Array<{
   method: string;
   params: Record<string, unknown>;
 }> = [];
 
-// Fail closed (PRD §9): a missing, unreadable or empty token file is the same
+// Fail closed: a missing, unreadable or empty token file is the same
 // outcome as "no primary reachable" - we do not connect without one. Never
 // log the value.
 function readIpcToken(): string | null {
@@ -631,8 +632,9 @@ function connectToPrimary(
     // transport connects hundreds of lines later) — on this runtime, unref'ing
     // this socket here can stop the event loop from delivering any further
     // events on it at all, so the hello ack (or the timeout meant to catch
-    // its absence) never arrives and startup hangs forever. See
-    // .pipeline/review.md for the live reproduction.
+    // its absence) never arrives and startup hangs forever. Reproduced live
+    // during review by unref'ing this socket and watching startup wedge with
+    // no error and no timeout firing.
     const buf = new LineBuffer();
     let settled = false;
     let notifiedClose = false;
@@ -682,8 +684,8 @@ function connectToPrimary(
     s.on("data", (chunk: string) => {
       for (const msg of buf.push(chunk)) {
         if (msg.type === "notify") {
-          // PRD §11 M3 / FR2: re-emit the primary's inbound-message
-          // notification to this secondary's own MCP client, unchanged.
+          // Re-emit the primary's inbound-message notification to this
+          // secondary's own MCP client, unchanged.
           const params = msg.params as Record<string, unknown>;
           if (!mcpReady) {
             if (
@@ -741,13 +743,14 @@ function connectToPrimary(
 let ipcRelay: IpcRelay | null = null;
 if (CONFLICT) ipcRelay = await connectToPrimary(onRelayLost);
 
-// PRD §11 M4 / FR3+FR5. Role changes at runtime from here.
+// Role changes at runtime from here.
 
 // The one state that serves the stub: cannot execute locally, has no live
 // primary to relay to. Read per request, never cached.
 const degraded = () => !isPrimary && !ipcRelay;
 
-// PRD §12 tier 1. Both cadences run concurrently; whichever wins stops both.
+// Reconnect and lock-retry each run on their own timer; both cadences run
+// concurrently, and whichever wins stops both.
 const RECONNECT_INTERVAL_MS = 2000;
 const LOCK_RETRY_INTERVAL_MS = 3000;
 let retrying = false;
@@ -798,10 +801,10 @@ function queueReconnect(gen: number): void {
 function queueLockRetry(gen: number): void {
   setTimeout(() => {
     if (!retrying || gen !== retryGen) return;
-    // ponytail: no backoff. Cheap when it matters (a clean primary exit
+    // No backoff. Cheap when it matters (a clean primary exit
     // leaves no lock file, so this is one atomic create), but a primary that
     // stays alive with no reachable listener keeps this probing every 3s for
-    // as long as that lasts — PRD §12 accepted that cost. `quiet=true` here
+    // as long as that lasts — an accepted cost for now. `quiet=true` here
     // stops the refusal line itself from repeating (only the one-shot
     // startup call at the top of the file still prints it), so what remains
     // is the synchronous start-time probe alone, every 3s. Add a backoff
@@ -837,7 +840,7 @@ async function becomePrimary(): Promise<void> {
   // Before any await: shutdown() firing during connectWhatsApp() must find
   // isPrimary true so releaseSingletonLock() removes the lock we just took,
   // and a tool call arriving mid-promotion must fall through to the existing
-  // `if (!sock) throw "WhatsApp not connected"` rather than the stub (PRD §12).
+  // `if (!sock) throw "WhatsApp not connected"` rather than the stub.
   isPrimary = true;
   writeRoleFile("primary");
   ipcRelay = null;
@@ -1863,7 +1866,7 @@ function markReplied(chat_id: string): void {
 // methods are dropped silently. So the agent asks, and this parks that ask
 // until a message lands.
 //
-// ponytail: re-reads the log every 2s while waiting, rather than being woken
+// Re-reads the log every 2s while waiting, rather than being woken
 // in-process. Simpler, works whoever wrote the line, and costs at most 2s of
 // latency in a chat bridge. Wake on write if that ever matters.
 async function waitForUnreplied(maxMs: number): Promise<MessageLogEntry[]> {
@@ -2144,10 +2147,11 @@ mcp.setNotificationHandler(
 // ─── Tools ─────────────────────────────────────────────────────────────
 
 // Known ceiling: a client that read tools/list while this process was
-// degraded keeps that cached list even after promotion (PRD §6 rules out
-// notifications/tools/list_changed). Unreachable in the owner's scenario — a
-// secondary that reaches its primary at startup never advertises the stub —
-// and the alternative is the dynamic-tool-list mechanism the PRD rejected.
+// degraded keeps that cached list even after promotion — this server
+// deliberately does not send notifications/tools/list_changed. Unreachable
+// in the owner's scenario, since a secondary that reaches its primary at
+// startup never advertises the stub in the first place, and a dynamic
+// tool-list mechanism was rejected as unnecessary complexity for that case.
 mcp.setRequestHandler(ListToolsRequestSchema, async () =>
   degraded()
     ? {
@@ -2310,11 +2314,11 @@ const handleToolCall = async (req: {
 }): Promise<CallToolResult> => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>;
   try {
-    // FR1/FR6: a secondary runs no tool locally - it hands the call to the
+    // A secondary runs no tool locally - it hands the call to the
     // primary, which executes it through this same function. One fork, one
     // execution path. The unreplied suffix is added by our own
     // CallToolRequestSchema wrapper below, from the shared message log - not
-    // by the primary (see .pipeline/spec.md §0.1).
+    // by the primary, so it is never appended twice.
     if (ipcRelay) {
       return asCallToolResult(
         await ipcRelay.call(req.params.name, args),
@@ -2771,7 +2775,7 @@ const handleToolCall = async (req: {
 };
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
-  // FR5: no live connection and nothing to relay to — answer immediately
+  // No live connection and nothing to relay to — answer immediately
   // with today's stub text instead of letting the call queue on a dead
   // socket. Same shape the startup stub used to return (no isError, no
   // unreplied suffix), so nothing downstream changes.
@@ -2815,7 +2819,7 @@ function shutdown(): void {
   // widening the same clobber race startIpcListener() guards against.
   // Stops accepting and unlinks the Unix socket file. Any open connection is
   // torn down by the process.exit(0) three lines down, which is what gives a
-  // connected secondary its instant disconnect (PRD §6 tier 1).
+  // connected secondary its instant disconnect.
   // process.exit(0) below is unconditional and synchronous, so the OS closes
   // every secondarySockets fd instantly and each connected secondary gets its
   // own close event — no explicit destroy loop needed, that would be dead
@@ -3335,8 +3339,8 @@ async function handleMessage(msg: WAMessage): Promise<void> {
   });
 
   // Emit channel notification. Built once and reused for the broadcast
-  // below (PRD §11 M3/FR2) so a secondary's session sees byte-identical
-  // content to the primary's own - never a second, re-derived copy.
+  // below so a secondary's session sees byte-identical content to the
+  // primary's own - never a second, re-derived copy.
   const notifyParams = {
     content: contentText,
     meta: {
@@ -3821,5 +3825,5 @@ if (!CONFLICT) {
   // Baileys is never touched here, so the one-connection invariant holds
   // exactly as it did when this path called process.exit(2).
   process.stderr.write(`${LOG_PREFIX}: ${conflictReason}\n`);
-  startRetryLoop(); // FR5: degraded, but never permanently
+  startRetryLoop(); // Degraded, but never permanently
 }

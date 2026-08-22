@@ -79,7 +79,7 @@ export class LineBuffer {
       if (!line.trim()) continue;
       try {
         const parsed: unknown = JSON.parse(line);
-        // ponytail: type-tag check only, not a per-shape validator. A
+        // Type-tag check only, not a per-shape validator. A
         // well-formed {"type":"call"} with a missing id/args still gets
         // through; tighten here if a relayed call ever comes from
         // something other than this same module.
@@ -92,7 +92,7 @@ export class LineBuffer {
   }
 }
 
-// FR4: a Unix-socket FILE outlives the process that bound it, so its mere
+// A Unix-socket FILE outlives the process that bound it, so its mere
 // existence proves nothing. server.ts probes it with a real connect and
 // passes the outcome here; this decides whether the path is safe to unlink
 // and rebind. Pure, so the decision table is unit-testable without a socket.
@@ -100,8 +100,8 @@ export type SocketProbe = { connected: boolean; code?: string };
 
 export function isStaleSocket(probe: SocketProbe): boolean {
   if (probe.connected) return false; // someone is listening — never unlink
-  // ECONNREFUSED: the file exists, nobody is accepting — the crashed-primary
-  // leftover FR4 is about. ENOENT: it vanished between our existsSync and
+  // ECONNREFUSED: the file exists, nobody is accepting — a crashed-primary
+  // leftover. ENOENT: it vanished between our existsSync and
   // the connect; binding is fine.
   return probe.code === "ECONNREFUSED" || probe.code === "ENOENT";
 }
@@ -118,7 +118,7 @@ export const IPC_HELLO_ID = "hello";
 
 // Correlates a relayed call with the primary's eventual result. Pure: the
 // caller owns the socket and hands the id/result pairs in as they arrive.
-// ponytail: no per-call timeout - close/error is the liveness signal. Add
+// No per-call timeout - close/error is the liveness signal. Add
 // one only if a real hang shows up.
 export class PendingCalls {
   private seq = 0;

@@ -30,7 +30,7 @@ export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // A fake primary that speaks the real protocol: acks a matching hello, then
 // answers every `call` with a recognizable CallToolResult so a test can prove
-// the reply actually crossed the socket, round trip. `notifyAfterHello` (T04)
+// the reply actually crossed the socket, round trip. `notifyAfterHello`
 // optionally pushes one unprompted `notify` frame right after the hello ack,
 // the same way a real primary broadcasts an inbound message to an
 // already-connected secondary. Unlike a plain srv.close() (which only stops

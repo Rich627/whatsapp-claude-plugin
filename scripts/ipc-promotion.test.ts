@@ -6,11 +6,11 @@ import { join, resolve } from "node:path";
 import { ipcSocketPath } from "./ipc";
 import { ownStartTime, sleep, startFakePrimary } from "./ipc-test-helpers";
 
-// PRD §11 M4 / spec.md §7: T05's auto-promotion and degradation, exercised
-// against a real server.ts child process the same way scripts/ipc-relay.test.ts
-// does — a fake primary built from this module's own encode/LineBuffer/
-// IPC_HELLO_ID, driven over stdio as a real MCP client, lock planted via
-// ownStartTime() to force the secondary path.
+// Exercises a secondary's auto-promotion and degradation when its primary
+// disappears, against a real server.ts child process the same way
+// scripts/ipc-relay.test.ts does — a fake primary built from this module's
+// own encode/LineBuffer/IPC_HELLO_ID, driven over stdio as a real MCP
+// client, lock planted via ownStartTime() to force the secondary path.
 
 const SERVER = join(import.meta.dir, "..", "server.ts");
 
@@ -22,7 +22,7 @@ const SERVER = join(import.meta.dir, "..", "server.ts");
 // isolated runs, because startIpcListener()'s token rewrite happens inside
 // server.listen()'s async success callback — the "won the singleton lock"
 // stderr line (written before becomePrimary() is even called) gives that
-// callback no guaranteed head start. See .pipeline/test-results.md.
+// callback no guaranteed head start. Fixed here by polling instead.
 async function waitFor(
   check: () => boolean,
   attempts: number,
@@ -225,7 +225,7 @@ describe("ipc promotion/degradation (secondary)", () => {
       );
 
       // A restarted primary writes a fresh token and rebinds the socket path
-      // (unlink first on non-win32, matching startIpcListener()'s own FR4
+      // (unlink first on non-win32, matching startIpcListener()'s own
       // stale-socket handling).
       const newToken = "b".repeat(64);
       writeFileSync(join(rig.dir, ".ipc-token"), newToken + "\n", {
