@@ -16,11 +16,7 @@ import { normalizeJid as jidNormalizedUser } from "../scripts/ranking";
 
 describe("normalizeMentionJids", () => {
   test("bare number with no cached LID resolves to the phone JID", () => {
-    const [pair] = normalizeMentionJids(
-      ["61434505973"],
-      {},
-      jidNormalizedUser,
-    );
+    const [pair] = normalizeMentionJids(["61434505973"], {}, jidNormalizedUser);
     expect(pair).toEqual({
       input: "61434505973",
       jid: "61434505973@s.whatsapp.net",
@@ -321,11 +317,7 @@ describe("mentionsForChunk", () => {
   test("four mixed entries: only the ones referenced in this chunk's text are attached", () => {
     const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
     const raw = ["61434505973", "23058185377", "61405070760", "61403911675"];
-    const pairs = normalizeMentionJids(
-      raw,
-      lidMap,
-      jidNormalizedUser,
-    );
+    const pairs = normalizeMentionJids(raw, lidMap, jidNormalizedUser);
     const text =
       "@61434505973 @23058185377 @61405070760 @61403911675 all four, please";
     const result = mentionsForChunk(text, pairs);
@@ -338,11 +330,7 @@ describe("mentionsForChunk", () => {
   });
 
   test("no match in this chunk's text returns undefined", () => {
-    const pairs = normalizeMentionJids(
-      ["61434505973"],
-      {},
-      jidNormalizedUser,
-    );
+    const pairs = normalizeMentionJids(["61434505973"], {}, jidNormalizedUser);
     expect(mentionsForChunk("no mentions in here", pairs)).toBeUndefined();
   });
 
