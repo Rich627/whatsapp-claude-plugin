@@ -1,14 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import {
-  execFileSync,
-  spawn,
-  type ChildProcessWithoutNullStreams,
-} from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { encode, IPC_HELLO_ID, ipcSocketPath, LineBuffer } from "./ipc";
+import { ipcSocketPath } from "./ipc";
+import { ownStartTime, sleep, startFakePrimary } from "./ipc-test-helpers";
 
 // PRD §11 M4 / spec.md §7: T05's auto-promotion and degradation, exercised
 // against a real server.ts child process the same way scripts/ipc-relay.test.ts
@@ -17,88 +13,6 @@ import { encode, IPC_HELLO_ID, ipcSocketPath, LineBuffer } from "./ipc";
 // ownStartTime() to force the secondary path.
 
 const SERVER = join(import.meta.dir, "..", "server.ts");
-
-// Duplicated exactly as scripts/ipc-relay.test.ts/scripts/server-conflict.test.ts/
-// scripts/doctor.test.ts already do — this repo's established way of naming a
-// live process (this test) as the lock holder a spawned server.ts must treat
-// as a real, unbeatable primary.
-function ownStartTime(): string {
-  const [cmd, args] =
-    process.platform === "win32"
-      ? [
-          `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            `(Get-CimInstance Win32_Process -Filter "ProcessId=${process.pid}" -ErrorAction Stop | ForEach-Object { $_.CreationDate.ToFileTimeUtc() })`,
-          ],
-        ]
-      : ["ps", ["-p", String(process.pid), "-o", "lstart="]];
-  return execFileSync(cmd, args, {
-    encoding: "utf8",
-    windowsHide: true,
-  }).trim();
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// Same shape as scripts/ipc-relay.test.ts's fixture: acks a matching hello,
-// then answers every `call` with a recognizable CallToolResult so a test can
-// prove the reply actually crossed the socket, round trip. Unlike a plain
-// srv.close() (which only stops accepting NEW connections — the existing one
-// to the child stays open until something ends it), the returned `close()`
-// also destroys every socket this fixture has accepted, so a test can
-// simulate a hard-killed primary dropping the child's live connection.
-function startFakePrimary(
-  dir: string,
-  token: string,
-): Promise<{ close(): void }> {
-  const path = ipcSocketPath(resolve(dir));
-  const sockets = new Set<Socket>();
-  const srv = createServer((s) => {
-    sockets.add(s);
-    s.on("close", () => sockets.delete(s));
-    s.setEncoding("utf8");
-    const buf = new LineBuffer();
-    let authed = false;
-    s.on("error", () => s.destroy());
-    s.on("data", (chunk: string) => {
-      for (const msg of buf.push(chunk)) {
-        if (!authed) {
-          if (msg.type !== "hello" || msg.token !== token) {
-            s.destroy();
-            return;
-          }
-          authed = true;
-          s.write(encode({ type: "result", id: IPC_HELLO_ID, result: "ok" }));
-          continue;
-        }
-        if (msg.type === "call") {
-          s.write(
-            encode({
-              type: "result",
-              id: msg.id,
-              result: {
-                content: [{ type: "text", text: `relayed:${msg.name}` }],
-              },
-            }),
-          );
-        }
-      }
-    });
-  });
-  return new Promise((res) =>
-    srv.listen(path, () =>
-      res({
-        close() {
-          srv.close();
-          for (const s of sockets) s.destroy();
-        },
-      }),
-    ),
-  );
-}
 
 // Same poll-until-timeout pattern used for every multi-step assertion in this
 // file: repeatedly re-checks `check()` until it's truthy or the budget runs

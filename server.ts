@@ -94,6 +94,11 @@ const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
 const TASKS_FILE = join(STATE_DIR, "tasks.md");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
 const IPC_TOKEN_FILE = join(STATE_DIR, ".ipc-token");
+// resolve(): two terminals can pass the same directory spelled differently
+// (trailing separator, relative path) and ipcSocketPath hashes the raw
+// string on Windows, giving two different pipe names. STATE_DIR is fixed at
+// startup, so this only needs computing once.
+const IPC_SOCKET_PATH = ipcSocketPath(resolve(STATE_DIR));
 
 // Load ~/.whatsapp-channel/.env into process.env. Real env wins.
 try {
@@ -490,10 +495,7 @@ function probeIpcSocket(path: string): Promise<SocketProbe> {
 // direct execution is unaffected).
 async function startIpcListener(): Promise<void> {
   try {
-    // resolve(): two terminals can pass the same directory spelled
-    // differently (trailing separator, relative path) and ipcSocketPath
-    // hashes the raw string on Windows, giving two different pipe names.
-    const path = ipcSocketPath(resolve(STATE_DIR));
+    const path = IPC_SOCKET_PATH;
     // FR4 is Unix-socket-only: on Windows a dead process's pipe stops
     // existing, so there is nothing stale to recover from.
     if (process.platform !== "win32" && existsSync(path)) {
@@ -608,7 +610,7 @@ function connectToPrimary(
     }
 
     const pending = new PendingCalls();
-    const s = connect(ipcSocketPath(resolve(STATE_DIR)));
+    const s = connect(IPC_SOCKET_PATH);
     s.setEncoding("utf8");
     // Deliberately left ref'd, unlike every other background handle in this
     // file. This runs before the top-level `await` below settles, and at

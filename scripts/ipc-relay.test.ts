@@ -1,10 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { encode, IPC_HELLO_ID, ipcSocketPath, LineBuffer } from "./ipc";
+import { join } from "node:path";
+import { ownStartTime, sleep, startFakePrimary } from "./ipc-test-helpers";
 
 // Reviewer finding (.pipeline/review.md): connectToPrimary() calling
 // s.unref() on the relay socket wedges startup dead on this runtime, because
@@ -20,79 +19,6 @@ import { encode, IPC_HELLO_ID, ipcSocketPath, LineBuffer } from "./ipc";
 // real conflicting server.
 
 const SERVER = join(import.meta.dir, "..", "server.ts");
-
-// Same probe server.ts's acquireSingletonLock() uses, duplicated here exactly
-// as scripts/server-conflict.test.ts and scripts/doctor.test.ts already do -
-// this repo's established way of naming a live process (this test) as the
-// lock holder a spawned server.ts must treat as a real, unbeatable primary.
-function ownStartTime(): string {
-  const [cmd, args] =
-    process.platform === "win32"
-      ? [
-          `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            `(Get-CimInstance Win32_Process -Filter "ProcessId=${process.pid}" -ErrorAction Stop | ForEach-Object { $_.CreationDate.ToFileTimeUtc() })`,
-          ],
-        ]
-      : ["ps", ["-p", String(process.pid), "-o", "lstart="]];
-  return execFileSync(cmd, args, {
-    encoding: "utf8",
-    windowsHide: true,
-  }).trim();
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// A fake primary that speaks the real protocol: acks a matching hello, then
-// answers every `call` with a recognizable CallToolResult so the test can
-// prove the reply actually crossed the socket, round trip. `notifyAfterHello`
-// (T04) additionally pushes one unprompted `notify` frame right after the
-// hello ack, the same way a real primary broadcasts an inbound message to an
-// already-connected secondary - proves the re-emit path without needing a
-// second connection or reshaping this fixture for every caller.
-function startFakePrimary(
-  dir: string,
-  token: string,
-  notifyAfterHello?: { method: string; params: unknown },
-) {
-  const path = ipcSocketPath(resolve(dir));
-  const srv = createServer((s) => {
-    s.setEncoding("utf8");
-    const buf = new LineBuffer();
-    let authed = false;
-    s.on("error", () => s.destroy());
-    s.on("data", (chunk: string) => {
-      for (const msg of buf.push(chunk)) {
-        if (!authed) {
-          if (msg.type !== "hello" || msg.token !== token) {
-            s.destroy();
-            return;
-          }
-          authed = true;
-          s.write(encode({ type: "result", id: IPC_HELLO_ID, result: "ok" }));
-          if (notifyAfterHello)
-            s.write(encode({ type: "notify", ...notifyAfterHello }));
-          continue;
-        }
-        if (msg.type === "call") {
-          s.write(
-            encode({
-              type: "result",
-              id: msg.id,
-              result: {
-                content: [{ type: "text", text: `relayed:${msg.name}` }],
-              },
-            }),
-          );
-        }
-      }
-    });
-  });
-  return new Promise<typeof srv>((res) => srv.listen(path, () => res(srv)));
-}
 
 describe("ipc relay (secondary)", () => {
   test("a real secondary connects, completes MCP initialize, and relays a tool call", async () => {
