@@ -200,7 +200,17 @@ Each account gets fully isolated state (auth, allowlist, groups, inbox). Claude 
 
 ## Session conflicts
 
-WhatsApp allows only **one connection per auth state**. Running two instances causes a 440 disconnect. Check for stale processes:
+WhatsApp allows only **one real connection per auth state** - a protocol limit, not something this plugin works around. What changed is what happens when a second `server.ts` process starts (a second Claude Code terminal, most commonly) while another is already connected.
+
+**Both terminals stay usable.** The first process to start becomes the primary and holds the real WhatsApp connection. Every later process becomes a secondary: it relays its tool calls (`reply`, `react`, etc.) to the primary over a local, same-machine, token-authenticated channel, and re-emits the primary's inbound-message notifications as its own. From inside Claude Code both terminals behave the same - send, react, and receive all work in either one.
+
+**If the primary closes, the other one takes over automatically.** A clean exit (`/exit`, Ctrl+C, the terminal closing normally) hands off within a few seconds. A hard-killed process (crash, force-quit) is only caught by the existing 15-second parent-liveness check, so that takeover can take up to ~30-40 seconds. No manual restart needed either way - the secondary keeps retrying in the background and promotes itself the moment it wins.
+
+**While neither the original connection nor a takeover has succeeded**, a secondary falls back to a `whatsapp_unavailable` stub tool instead of a call that hangs or fails silently - if a tool call reports WhatsApp unavailable right after a crash or restart, wait a few seconds and retry.
+
+**Limits:** same machine only, no cross-machine relay; tested with two terminals, three or more is unsupported.
+
+If something still seems stuck (most likely after killing a terminal outside Claude Code's normal exit path), clear stale processes directly:
 
 ```sh
 pkill -f "whatsapp.*server"
