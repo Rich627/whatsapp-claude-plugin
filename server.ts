@@ -444,19 +444,6 @@ function notifyRoleChange(
   notifySystem(content, `role-${role}`);
 }
 
-// Numeric semver compare - "0.9.0" < "0.10.0" needs this; a plain string
-// compare gets that backwards on any double-digit segment.
-function versionGt(a: string, b: string): boolean {
-  const pa = a.split(".").map(Number);
-  const pb = b.split(".").map(Number);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const na = pa[i] ?? 0;
-    const nb = pb[i] ?? 0;
-    if (na !== nb) return na > nb;
-  }
-  return false;
-}
-
 // Hand-maintained: one entry per version worth telling a returning terminal
 // about. announceUpdateIfNeeded() shows every entry newer than the state
 // directory's last-seen version concatenated, so skipping several updates
@@ -484,8 +471,13 @@ function announceUpdateIfNeeded(): void {
     lastSeen = readFileSync(LAST_SEEN_VERSION_FILE, "utf8").trim();
   } catch {}
   if (lastSeen === PLUGIN_VERSION) return;
+  // "0.18.0" > "0.9.0" needs numeric collation, not a plain string compare
+  // (which gets any double-digit segment backwards).
   const newEntries = lastSeen
-    ? CHANGELOG.filter((e) => versionGt(e.version, lastSeen))
+    ? CHANGELOG.filter(
+        (e) =>
+          e.version.localeCompare(lastSeen, undefined, { numeric: true }) > 0,
+      )
     : CHANGELOG.slice(-1);
   const notes = newEntries.flatMap((e) => e.notes);
   const content =
