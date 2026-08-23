@@ -141,6 +141,11 @@ const CACHE_CONTACTS = !STATIC && process.env.WHATSAPP_CACHE_CONTACTS === "1";
 // and is reported as such rather than guessed at.
 const CLIENT_ID = (process.env.CLAUDE_PID ?? "").trim();
 const ACCOUNT_NAME = process.env.WHATSAPP_ACCOUNT_NAME || "";
+// Default on: the plugin tells Claude to surface inbound messages and role
+// changes to the user proactively (not just on the next natural reply).
+// Opt out per-terminal with WHATSAPP_QUIET=1 - never a config file, so it
+// can't silently persist past the session that set it.
+const AUTO_NOTIFY = process.env.WHATSAPP_QUIET !== "1";
 const SERVER_NAME = ACCOUNT_NAME ? `whatsapp-${ACCOUNT_NAME}` : "whatsapp";
 const LOG_PREFIX = ACCOUNT_NAME
   ? `whatsapp[${ACCOUNT_NAME}]`
@@ -359,10 +364,59 @@ diagFileEnabled = isPrimary;
 // Written on every role transition so scripts/statusline-role.ts (a separate,
 // freshly-spawned process per render) has something to read — it cannot see
 // this process's in-memory isPrimary/ipcRelay/retrying.
-function writeRoleFile(role: "primary" | "secondary" | "reconnecting"): void {
+function writeRoleFile(
+  role: "primary" | "secondary" | "reconnecting",
+  everConnected = false,
+): void {
   try {
     writeFileSync(ROLE_FILE, role);
   } catch {}
+  notifyRoleChange(role, everConnected);
+}
+
+// Shared shape for a system (not-from-a-chat) channel notification — used
+// for role changes here and for the pairing-code notification further down.
+// Fire-and-forget, same as every other notification in this file: a
+// delivery failure here must never block whatever triggered it.
+function notifySystem(content: string, idPrefix: string): void {
+  mcp
+    .notification({
+      method: "notifications/claude/channel",
+      params: {
+        content,
+        meta: {
+          chat_id: "system",
+          message_id: `${idPrefix}-${Date.now()}`,
+          user: "WhatsApp Setup",
+          user_id: "system",
+          ts: new Date().toISOString(),
+        },
+      },
+    })
+    .catch((err) => {
+      logDiag(
+        `${LOG_PREFIX}: failed to deliver system notification to Claude: ${err}\n`,
+      );
+    });
+}
+
+// everConnected distinguishes an actual disconnect (onRelayLost) from never
+// having reached a primary in the first place (the degraded startup path) -
+// same "reconnecting" role file either way, different wording.
+function notifyRoleChange(
+  role: "primary" | "secondary" | "reconnecting",
+  everConnected = false,
+): void {
+  if (!AUTO_NOTIFY) return;
+  const content =
+    role === "primary"
+      ? "This terminal is now the primary WhatsApp connection."
+      : role === "secondary"
+        ? "This terminal is now a secondary — WhatsApp is relayed from another terminal that's already connected."
+        : everConnected
+          ? "Lost the primary WhatsApp connection; retrying."
+          : "Couldn't reach the primary WhatsApp connection; retrying.";
+  notifySystem(content, `role-${role}`);
 }
 
 // ─── IPC listener (primary) ────────────────────────────────────────────
@@ -789,13 +843,13 @@ function onRelayLost(): void {
   if (isPrimary) return; // we closed it ourselves after promoting
   ipcRelay = null;
   logDiag(`${LOG_PREFIX}: ipc: lost the primary connection\n`);
-  startRetryLoop();
+  startRetryLoop(true);
 }
 
-function startRetryLoop(): void {
+function startRetryLoop(everConnected = false): void {
   if (retrying || isPrimary) return;
   retrying = true;
-  writeRoleFile("reconnecting");
+  writeRoleFile("reconnecting", everConnected);
   const gen = ++retryGen;
   logDiag(
     `${LOG_PREFIX}: ipc: no primary reachable; retrying (reconnect ` +
@@ -2032,6 +2086,12 @@ const mcp = new Server(
         : []),
       "The sender reads WhatsApp, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.",
       "",
+      ...(AUTO_NOTIFY
+        ? [
+            'Notifications are on by default (set WHATSAPP_QUIET=1 to turn them off for this terminal). When a channel notification with chat_id="system" and user_id="system" arrives — a role change (this terminal becoming primary/secondary, or losing/regaining the primary connection) or a pairing code — tell the user about it right away rather than waiting for your next natural reply. For an ordinary inbound message notification, also tell the user it arrived immediately rather than silently queuing it for later.',
+            "",
+          ]
+        : []),
       'Messages from WhatsApp arrive as <channel source="whatsapp" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       "",
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions. WhatsApp supports any emoji for reactions (no whitelist restriction).',
@@ -3465,21 +3525,7 @@ async function requestAndAnnouncePairingCode(
   // Re-registering an unchanged code is routine during pairing — only surface
   // it to the session when there is actually something new to type.
   if (!isNewCode) return;
-  mcp
-    .notification({
-      method: "notifications/claude/channel",
-      params: {
-        content: pairingMsg,
-        meta: {
-          chat_id: "system",
-          message_id: `pairing-${Date.now()}`,
-          user: "WhatsApp Setup",
-          user_id: "system",
-          ts: new Date().toISOString(),
-        },
-      },
-    })
-    .catch(() => {});
+  notifySystem(pairingMsg, "pairing");
 }
 
 // ─── WA Web client version ─────────────────────────────────────────────
