@@ -54,10 +54,12 @@ type Rig = {
 async function startSecondaryRig(
   dirPrefix: string,
   extraEnv: Record<string, string> = {},
-  preSeed?: (dir: string) => void,
+  lastSeenVersion?: string,
 ): Promise<Rig> {
   const dir = mkdtempSync(join(tmpdir(), dirPrefix));
-  preSeed?.(dir);
+  if (lastSeenVersion !== undefined) {
+    writeFileSync(join(dir, ".last-seen-version"), lastSeenVersion);
+  }
   const token = "a".repeat(64);
   writeFileSync(join(dir, ".ipc-token"), token + "\n", { mode: 0o600 });
   writeFileSync(
@@ -549,16 +551,29 @@ describe("update notice (announceUpdateIfNeeded)", () => {
   // "0.9.0" because "1" < "9"). A naive string compare would wrongly treat
   // 0.9.0 as newer and skip the notice entirely.
   test("announces once when the recorded version is older", async () => {
-    const rig = await startSecondaryRig("wa-promo-update-old-", {}, (dir) =>
-      writeFileSync(join(dir, ".last-seen-version"), "0.9.0"),
-    );
+    const rig = await startSecondaryRig("wa-promo-update-old-", {}, "0.9.0");
     try {
-      expect(rig.stdout()).toContain(
-        `WhatsApp plugin updated to v${PLUGIN_VERSION} (from v0.9.0)`,
-      );
-      expect(readFileSync(join(rig.dir, ".last-seen-version"), "utf8")).toBe(
-        PLUGIN_VERSION,
-      );
+      expect(
+        await waitFor(
+          () =>
+            rig
+              .stdout()
+              .includes(
+                `WhatsApp plugin updated to v${PLUGIN_VERSION} (from v0.9.0)`,
+              ),
+          20,
+          250,
+        ),
+      ).toBe(true);
+      expect(
+        await waitFor(
+          () =>
+            readFileSync(join(rig.dir, ".last-seen-version"), "utf8") ===
+            PLUGIN_VERSION,
+          20,
+          250,
+        ),
+      ).toBe(true);
     } finally {
       rig.child.kill();
       try {
@@ -568,10 +583,16 @@ describe("update notice (announceUpdateIfNeeded)", () => {
   }, 30_000);
 
   test("stays quiet when the recorded version already matches", async () => {
-    const rig = await startSecondaryRig("wa-promo-update-current-", {}, (dir) =>
-      writeFileSync(join(dir, ".last-seen-version"), PLUGIN_VERSION),
+    const rig = await startSecondaryRig(
+      "wa-promo-update-current-",
+      {},
+      PLUGIN_VERSION,
     );
     try {
+      // Same settle-then-assert-absence shape as the WHATSAPP_QUIET test
+      // above: a bare check right after startup can't tell "never fires"
+      // from "fires a moment late".
+      await sleep(1_000);
       expect(rig.stdout()).not.toContain("WhatsApp plugin updated to v");
     } finally {
       rig.child.kill();
