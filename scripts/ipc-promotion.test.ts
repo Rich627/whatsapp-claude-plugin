@@ -565,6 +565,11 @@ describe("update notice (announceUpdateIfNeeded)", () => {
           250,
         ),
       ).toBe(true);
+      // The point of this notice for an already-paired user is that it
+      // actually tells them the wizard exists and how to run it - a header
+      // line alone doesn't verify that; the CHANGELOG note text must be in
+      // what they're shown, not just tracked internally.
+      expect(rig.stdout()).toContain("bun scripts/access.ts wizard");
       expect(
         await waitFor(
           () =>
