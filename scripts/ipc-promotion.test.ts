@@ -147,6 +147,24 @@ function listTools(rig: Rig): number {
 }
 
 describe("ipc promotion/degradation (secondary)", () => {
+  // Regression: the initial role a process boots into isn't a "change" from
+  // anything (server.ts's pastInitialRole flag) - only announce from the
+  // second writeRoleFile() call on, i.e. a real transition. A prior version
+  // of this fix only special-cased the primary startup branch and missed the
+  // secondary one (this rig's own boot path), which kept firing "now a
+  // secondary" on every ordinary secondary startup.
+  test("boots as a secondary without announcing the initial role", async () => {
+    const rig = await startSecondaryRig("wa-promo-quiet-boot-");
+    try {
+      expect(rig.stdout()).not.toContain("notifications/claude/channel");
+    } finally {
+      rig.child.kill();
+      try {
+        rig.primary.close();
+      } catch {}
+    }
+  }, 30_000);
+
   test("degrades when the primary vanishes and the lock is unwinnable", async () => {
     const rig = await startSecondaryRig("wa-promo-degrade-");
     try {

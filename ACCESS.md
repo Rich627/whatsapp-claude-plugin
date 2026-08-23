@@ -154,7 +154,7 @@ Configure outbound behavior with `/whatsapp-claude-channel:access set <key> <val
 
 ### Proactive notifications
 
-**On by default.** Claude is told to surface things to you the moment they happen, rather than waiting for its next natural reply: an inbound message arriving, this terminal's role _changing_ (becoming primary/secondary, or losing/regaining the primary connection — see multi-terminal sync below; the initial role a terminal starts in isn't a change and never announces), and a pairing code. Set `WHATSAPP_QUIET=1` to turn this off for one terminal — a pairing code you need is always in the diagnostics log regardless, so nothing is lost. It's an env var, not a saved setting, so it only applies to sessions started with it set — nothing persists it past the terminal that set it.
+**On by default.** Claude is told to surface things to you the moment they happen, rather than waiting for its next natural reply: an inbound message arriving, this terminal's role _changing_ (becoming primary/secondary, or losing/regaining the primary connection — see multi-terminal sync below; the initial role a terminal starts in isn't a change and never announces), a pairing code, and the "paired and connected" confirmation. Set `WHATSAPP_QUIET=1` to turn all of that off for one terminal — a pairing code you need is always in the diagnostics log regardless, so nothing is lost. It's an env var, not a saved setting, so it only applies to sessions started with it set — nothing persists it past the terminal that set it.
 
 This only controls whether Claude _announces_ a role change. The underlying primary/secondary mechanism, the role file, and the statusline segment (see `scripts/statusline-role.ts`) all keep working the same either way.
 
