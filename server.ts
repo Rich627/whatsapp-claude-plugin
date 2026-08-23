@@ -25,7 +25,6 @@ import makeWASocket, {
   downloadMediaMessage,
   getContentType,
   jidNormalizedUser,
-  jidDecode,
   isLidUser,
   type WASocket,
   type WAMessage,
@@ -50,7 +49,19 @@ import {
 } from "fs";
 import { homedir } from "os";
 import { join, extname, sep, basename } from "path";
-import { normalizeMentionJids, mentionsForChunk } from "./lib/mentions";
+import {
+  expandAllMention,
+  isReservedAllToken,
+  normalizeMentionJids,
+  mentionsForChunk,
+} from "./lib/mentions";
+import {
+  contactName,
+  mergeContact,
+  migrateContactKey,
+  type ContactsMap,
+} from "./scripts/contacts";
+import { looksLikeNumber, maskNumber } from "./scripts/mask";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -61,6 +72,9 @@ const INBOX_DIR = join(STATE_DIR, "inbox");
 const ENV_FILE = join(STATE_DIR, ".env");
 const GROUPS_DIR = join(STATE_DIR, "groups");
 const LID_MAP_FILE = join(STATE_DIR, "lid-map.json");
+const CONTACTS_FILE = join(STATE_DIR, "contacts.json");
+const GROUPS_META_FILE = join(STATE_DIR, "groups-meta.json");
+const DM_ACTIVITY_FILE = join(STATE_DIR, "dm-activity.json");
 const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
 const TASKS_FILE = join(STATE_DIR, "tasks.md");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
@@ -85,6 +99,17 @@ try {
 
 const PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER;
 const STATIC = process.env.WHATSAPP_ACCESS_MODE === "static";
+// Off by default: contacts.json/dm-activity.json cache the display name and
+// last-activity time of EVERYONE the account has ever seen, including a
+// sender the access gate rejected (contacts.upsert/chats.upsert fire from
+// Baileys before any allowlist check runs) - so unlike access.json (which
+// only ever holds jids the owner explicitly allowed), this is plaintext
+// persistence the owner may not expect for someone they never approved.
+// STATIC mode already disables all local config writes (see saveAccess) -
+// this cache follows the same rule, never just WHATSAPP_CACHE_CONTACTS
+// alone, so a static deployment can't be made to write local state by
+// setting one env var but not the other.
+const CACHE_CONTACTS = !STATIC && process.env.WHATSAPP_CACHE_CONTACTS === "1";
 // The client process that spawned us, when it identifies itself. Claude Code
 // sets CLAUDE_PID; other MCP clients set nothing, which reads as "unknown"
 // and is reported as such rather than guessed at.
@@ -288,6 +313,11 @@ type PendingEntry = {
 type GroupPolicy = {
   requireMention: boolean;
   allowFrom: string[];
+  // Separate from "can act here": lets Claude reply in a large group
+  // without ever being handed its member list. Read defensively
+  // (`?? false`/`!!`) everywhere - a policy written before this field
+  // existed has no `roster` key at all, not an explicit false.
+  roster?: boolean;
 };
 
 type Access = {
@@ -408,11 +438,70 @@ function recordLidMapping(lid: string, pn: string): void {
     lidMap[nLid] = nPn;
     saveLidMap();
   }
+  // Centralized here, not at each caller: a contact cached under its raw
+  // @lid key (before this resolution was known) needs to move to the
+  // phone key contactKey() will compute from now on, no matter which of
+  // this function's two callers (the passive lid-mapping.update event, or
+  // ensureLidResolved's active fallback) is the one that actually learned
+  // the mapping.
+  reloadContactsMap();
+  if (migrateContactKey(contactsMap, nLid, nPn)) {
+    saveContactsMap();
+  }
+  reloadDmActivity();
+  if (migrateDmActivity(nLid, nPn)) {
+    saveDmActivity();
+  }
 }
 
 function resolveToPhone(jid: string): string {
   if (!isLidUser(jid)) return jid;
   return lidMap[jidNormalizedUser(jid)] ?? jid;
+}
+
+// ─── Contacts name cache ────────────────────────────────────────────
+// A linked device gets the phone's real contact list synced to it, same as
+// WhatsApp Web - Baileys exposes this as contacts.upsert/contacts.update
+// (see connectWhatsApp). Persisted the same way lidMap is: loaded once on
+// startup, rewritten atomically whenever an event actually changes something.
+
+let contactsMap: ContactsMap = {};
+try {
+  contactsMap = JSON.parse(readFileSync(CONTACTS_FILE, "utf8"));
+} catch {}
+
+function saveContactsMap(): void {
+  if (!CACHE_CONTACTS) return;
+  const tmp = CONTACTS_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(contactsMap, null, 2) + "\n", {
+    mode: 0o600,
+  });
+  renameSync(tmp, CONTACTS_FILE);
+}
+
+// scripts/access.ts's `remove` runs as a separate process and can delete a
+// contact's cached name from this same file while the server is up - the
+// in-memory contactsMap has no way to learn that on its own. Without this,
+// the next contacts.upsert/update or LID migration would merge its update
+// into the stale in-memory copy (which still has the forgotten entry) and
+// write that whole map back out, silently resurrecting exactly what
+// forgetContact() was just asked to remove. Called immediately before every
+// mutate-then-save path below, so what's on disk is always this process's
+// own last write OR an external edit - never lost either way, since a
+// mutation is always followed by an immediate synchronous save (no event
+// can interleave and lose an in-memory-only change).
+function reloadContactsMap(): void {
+  try {
+    contactsMap = JSON.parse(readFileSync(CONTACTS_FILE, "utf8"));
+  } catch {}
+}
+
+// Same key every other identity lookup in this file uses (resolveToPhone
+// before jidNormalizedUser, see lines above) - a contact Baileys syncs under
+// its @lid form must land under the same key a later phone-resolved lookup
+// would use, or it's silently unfindable there.
+function contactKey(jid: string): string {
+  return jidNormalizedUser(resolveToPhone(jid));
 }
 
 // ─── Outbound mentions ──────────────────────────────────────────────
@@ -463,6 +552,208 @@ function isAllowedJid(jid: string, allowList: string[]): boolean {
 // ─── Group name cache ─────────────────────────────────────────────────
 
 const groupNameCache: Record<string, string> = {};
+
+// ─── Group metadata cache (persisted) ──────────────────────────────────
+// scripts/access.ts's wizard runs as a standalone terminal command with no
+// WhatsApp connection of its own - only this server process has one. This
+// on-disk snapshot (name, member count, archived flag) is how the wizard
+// sees real group names without needing a live socket. Written whenever
+// list_groups runs (name/count) and whenever an archived state changes
+// (chats.upsert/chats.update, see connectWhatsApp) - never by the wizard
+// itself, which only reads it.
+type GroupMeta = {
+  name: string;
+  memberCount: number;
+  archived: boolean;
+  // Epoch ms of the group's last activity (WhatsApp's own conversationTimestamp),
+  // for ranking the access wizard's "top 5 by recency" - same field the
+  // WhatsApp app itself sorts its chat list by. Absent until at least one
+  // chats.upsert/update has been seen for this group.
+  lastActivityAt?: number;
+  updatedAt: number;
+};
+
+let groupsMeta: Record<string, GroupMeta> = {};
+try {
+  groupsMeta = JSON.parse(readFileSync(GROUPS_META_FILE, "utf8"));
+} catch {}
+
+function saveGroupsMeta(): void {
+  const tmp = GROUPS_META_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(groupsMeta, null, 2) + "\n", {
+    mode: 0o600,
+  });
+  renameSync(tmp, GROUPS_META_FILE);
+}
+
+// DM (non-group) chat activity, keyed the same phone-resolved way
+// contacts.json is (contactKey()) so a wizard lookup can reuse the same
+// key for both the timestamp and the saved name with no extra resolution.
+// Only a timestamp - a DM has no name/archived concept of its own the way
+// a group does (names live in contactsMap already).
+let dmActivity: Record<string, number> = {};
+try {
+  dmActivity = JSON.parse(readFileSync(DM_ACTIVITY_FILE, "utf8"));
+} catch {}
+
+function saveDmActivity(): void {
+  if (!CACHE_CONTACTS) return;
+  const tmp = DM_ACTIVITY_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(dmActivity, null, 2) + "\n", {
+    mode: 0o600,
+  });
+  renameSync(tmp, DM_ACTIVITY_FILE);
+}
+
+// Same reasoning as reloadContactsMap() above - scripts/access.ts's
+// `remove` also drops the removed jid's dm-activity.json entry, and this
+// in-memory copy needs to learn that before its next mutate-then-save.
+function reloadDmActivity(): void {
+  try {
+    dmActivity = JSON.parse(readFileSync(DM_ACTIVITY_FILE, "utf8"));
+  } catch {}
+}
+
+// A DM's activity can get recorded under its raw @lid key before
+// recordLidMapping ever learns the matching phone number - contactsMap
+// already migrates this way (migrateContactKey); dmActivity needs the same
+// treatment or a stale @lid-keyed entry sits there forever while later
+// writes go to the phone key instead, letting the same person show up
+// twice in the wizard's ranking and letting `remove`'s forget-purge miss
+// the lid-keyed entry entirely. Keeps the more recent of the two
+// timestamps on a real conflict, not just whichever key wins.
+function migrateDmActivity(oldKey: string, newKey: string): boolean {
+  if (oldKey === newKey) return false;
+  const stale = dmActivity[oldKey];
+  if (stale === undefined) return false;
+  delete dmActivity[oldKey];
+  const current = dmActivity[newKey];
+  dmActivity[newKey] = current !== undefined ? Math.max(current, stale) : stale;
+  return true;
+}
+
+// Baileys' chat timestamps are Unix SECONDS (the WhatsApp protobuf
+// convention) and may arrive as a plain number or a protobuf Long -
+// Number() on either already works, the same conversion this file already
+// uses for msg.messageTimestamp. Converted to epoch ms here to match every
+// other timestamp this codebase stores (Date.now()-based).
+function toEpochMs(
+  ts: number | { toNumber(): number } | null | undefined,
+): number | undefined {
+  if (ts === null || ts === undefined) return undefined;
+  const seconds = typeof ts === "number" ? ts : ts.toNumber();
+  return seconds * 1000;
+}
+
+// Only groups carry an access decision in this project - a DM's archived
+// state has no equivalent meaning here, so non-group chat ids are ignored.
+function applyChatArchive(
+  id: string | null | undefined,
+  archived: boolean | null | undefined,
+): boolean {
+  if (!id || !id.endsWith("@g.us")) return false;
+  if (archived === undefined || archived === null) return false;
+  const existing = groupsMeta[id];
+  if (existing?.archived === archived) return false;
+  groupsMeta[id] = {
+    name: existing?.name ?? groupNameCache[id] ?? id,
+    memberCount: existing?.memberCount ?? 0,
+    lastActivityAt: existing?.lastActivityAt,
+    archived,
+    updatedAt: Date.now(),
+  };
+  return true;
+}
+
+// Records last-activity time for any chat - a group's entry in groupsMeta
+// (ranks the access wizard's top-5) or a DM's entry in dmActivity (top-10).
+// Returns which cache actually changed, so the batched chats.upsert/update
+// listener (many chats in one event, especially on first sync) saves once
+// per event instead of once per chat.
+function applyChatActivity(
+  id: string | null | undefined,
+  conversationTimestamp: number | { toNumber(): number } | null | undefined,
+): { groups: boolean; dms: boolean } {
+  const activityMs = toEpochMs(conversationTimestamp);
+  if (!id || activityMs === undefined) return { groups: false, dms: false };
+  if (id.endsWith("@g.us")) {
+    const existing = groupsMeta[id];
+    if (existing?.lastActivityAt === activityMs)
+      return { groups: false, dms: false };
+    groupsMeta[id] = {
+      name: existing?.name ?? groupNameCache[id] ?? id,
+      memberCount: existing?.memberCount ?? 0,
+      archived: existing?.archived ?? false,
+      lastActivityAt: activityMs,
+      updatedAt: Date.now(),
+    };
+    return { groups: true, dms: false };
+  }
+  if (id.endsWith("@s.whatsapp.net") || id.endsWith("@lid")) {
+    const key = contactKey(id);
+    if (dmActivity[key] === activityMs) return { groups: false, dms: false };
+    dmActivity[key] = activityMs;
+    return { groups: false, dms: true };
+  }
+  return { groups: false, dms: false };
+}
+
+let groupsMetaRefreshedAt = 0;
+const GROUPS_META_CONNECT_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+
+// Fetches every group this account is currently in and updates the name
+// cache and the persisted groups-meta snapshot - shared by list_groups
+// (which also builds the display text from the result, and always wants a
+// real fetch - an explicit call is asking for current state) and
+// connectWhatsApp (which calls this on every successful connect purely to
+// warm the cache, the same way contacts.upsert already warms the
+// contact-name cache automatically, no user action required). Archived
+// state is left untouched here - it's only ever set by the
+// chats.upsert/chats.update listeners.
+//
+// `skipIfRecent` exists only for the connect call site: a flaky-network
+// period can cycle disconnect/reconnect many times in a few minutes, and
+// without this a full group-list fetch (a real query against WhatsApp's
+// servers, not free) would refire on every single one for data that
+// almost never changes between reconnects seconds apart. list_groups
+// never passes it, so an explicit call is always a real fetch.
+async function refreshGroupsMeta(
+  activeSock: NonNullable<typeof sock>,
+  { skipIfRecent = false }: { skipIfRecent?: boolean } = {},
+) {
+  if (
+    skipIfRecent &&
+    Date.now() - groupsMetaRefreshedAt < GROUPS_META_CONNECT_COOLDOWN_MS
+  ) {
+    return [];
+  }
+  const meta = await activeSock.groupFetchAllParticipating();
+  groupsMetaRefreshedAt = Date.now();
+  const groups = Object.values(meta);
+  let metaChanged = false;
+  for (const g of groups) {
+    const name = g.subject || "(no name)";
+    if (g.subject) groupNameCache[g.id] = g.subject;
+    const existing = groupsMeta[g.id];
+    const memberCount = g.participants?.length ?? 0;
+    if (
+      !existing ||
+      existing.name !== name ||
+      existing.memberCount !== memberCount
+    ) {
+      groupsMeta[g.id] = {
+        name,
+        memberCount,
+        archived: existing?.archived ?? false,
+        lastActivityAt: existing?.lastActivityAt,
+        updatedAt: Date.now(),
+      };
+      metaChanged = true;
+    }
+  }
+  if (metaChanged) saveGroupsMeta();
+  return groups;
+}
 
 async function resolveGroupName(groupJid: string): Promise<string> {
   if (groupNameCache[groupJid]) return groupNameCache[groupJid];
@@ -1306,7 +1597,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "array",
             items: { type: "string" },
             description:
-              'User ids to @-tag, e.g. ["210363773620264"] — the user_id/lid from an inbound <channel> block (a phone number or full JID also works). You MUST also write the matching "@<id>" into text, using the same id you pass here; the array is what makes WhatsApp render it as a real mention and notify them, the text alone does nothing.',
+              'People to @-tag. Prefer a saved contact\'s name where you know it, e.g. ["Akash"] — a raw number or id never needs to appear anywhere in your own text or reasoning. Falls back to the user_id/lid from an inbound <channel> block (a phone number or full JID also works) for someone with no saved name yet. In a group where roster access is granted, use the single value "all" to tag every current member — this expands server-side from live group membership, so it works even for members with no saved contact name and no matter how many there are. You MUST also write the matching "@<value>" into text, using the exact same value you pass here (the name, or "all", if that\'s what you passed); the array is what makes WhatsApp render it as a real mention and notify them, the text alone does nothing. A name matching more than one saved contact fails the call rather than guessing — use the id for that person instead.',
           },
           files: {
             type: "array",
@@ -1404,10 +1695,25 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_groups",
       description:
-        "List every WhatsApp group this account is currently a member of, with each group's name and JID, and whether it's already allowlisted. Use this to find the JID of a newly-joined group so it can be added via the /whatsapp-claude-channel:access skill — no need to guess the JID from logs. Read-only: does not change access.",
+        "List every WhatsApp group this account is currently a member of, with each group's name and JID, whether it's already allowlisted, and whether roster access (member names, needed for @all) is granted. Use this to find the JID of a newly-joined group so it can be added via the /whatsapp-claude-channel:access skill — no need to guess the JID from logs. Read-only: does not change access. Also refreshes the on-disk group name/count cache the terminal access wizard (bun scripts/access.ts wizard) reads from.",
       inputSchema: {
         type: "object",
         properties: {},
+      },
+    },
+    {
+      name: "group_roster",
+      description:
+        'List an allowlisted group\'s members, by name where a saved contact name is known, or a masked number otherwise — never a raw phone number. Only works when roster access has been explicitly granted for that group (bun scripts/access.ts wizard, or "group add --roster"); fails with a clear error otherwise. Use this before an @all mention, or to answer who is in a chat.',
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: {
+            type: "string",
+            description: "The group's JID, from list_groups.",
+          },
+        },
+        required: ["chat_id"],
       },
     },
   ],
@@ -1427,15 +1733,38 @@ const handleToolCall = async (req: {
         const text = args.text as string;
         const reply_to = args.reply_to as string | undefined;
         const files = (args.files as string[] | undefined) ?? [];
-        const mentionJids = normalizeMentionJids(
-          (args.mentions as string[] | undefined) ?? [],
-          lidMap,
-          jidNormalizedUser,
-          jidDecode,
-        );
+        const rawMentions = (args.mentions as string[] | undefined) ?? [];
+        const isAllToken = (m: string) => isReservedAllToken(m, contactsMap);
 
+        // Checked before any mention work: "all" triggers a live
+        // groupMetadata() fetch below, and that must never run for a chat
+        // this call isn't even allowed to send to.
         assertAllowedChat(chat_id);
         if (!sock) throw new Error("WhatsApp not connected");
+
+        const mentionJids = normalizeMentionJids(
+          rawMentions.filter((m) => !isAllToken(m)),
+          lidMap,
+          jidNormalizedUser,
+          contactsMap,
+        );
+        if (rawMentions.some(isAllToken)) {
+          if (!chat_id.endsWith("@g.us")) {
+            throw new Error('"all" is only valid for a group chat\'s mentions');
+          }
+          if (!loadAccess().groups[chat_id]?.roster) {
+            throw new Error(
+              '"all" needs roster access for this group — run "bun scripts/access.ts wizard" (or "group add --roster") to grant it',
+            );
+          }
+          const roster = await sock.groupMetadata(chat_id);
+          mentionJids.push(
+            ...expandAllMention(
+              roster.participants.map((p) => p.id),
+              jidNormalizedUser,
+            ),
+          );
+        }
 
         for (const f of files) {
           assertSendable(f);
@@ -1756,8 +2085,7 @@ const handleToolCall = async (req: {
       case "list_groups": {
         if (!sock) throw new Error("WhatsApp not connected");
         const access = loadAccess();
-        const meta = await sock.groupFetchAllParticipating();
-        const groups = Object.values(meta);
+        const groups = await refreshGroupsMeta(sock);
         if (groups.length === 0) {
           return {
             content: [
@@ -1768,17 +2096,66 @@ const handleToolCall = async (req: {
         groups.sort((a, b) => (a.subject ?? "").localeCompare(b.subject ?? ""));
         const lines = groups.map((g) => {
           const allowed = g.id in access.groups;
+          const roster = !!access.groups[g.id]?.roster;
           const name = g.subject || "(no name)";
-          if (g.subject) groupNameCache[g.id] = g.subject; // warm the cache while we have it
-          return `${allowed ? "✓" : "+"} ${name}\n    ${g.id}${allowed ? "" : "  (NOT allowlisted)"}`;
+          const flags = `${allowed ? "✓" : "+"}${roster ? "R" : ""}`;
+          return `${flags} ${name}\n    ${g.id}${allowed ? "" : "  (NOT allowlisted)"}`;
         });
         const legend =
-          "✓ = allowlisted   + = joined but not allowlisted (add via /whatsapp-claude-channel:access)";
+          "✓ = allowlisted   + = joined but not allowlisted   R = roster access granted (add/change via /whatsapp-claude-channel:access)";
         return {
           content: [
             {
               type: "text",
               text: `${groups.length} group(s):\n\n${lines.join("\n")}\n\n${legend}`,
+            },
+          ],
+        };
+      }
+
+      case "group_roster": {
+        const chat_id = args.chat_id as string;
+        if (!sock) throw new Error("WhatsApp not connected");
+        const access = loadAccess();
+        const policy = access.groups[chat_id];
+        if (!policy) {
+          throw new Error(`chat ${chat_id} is not an allowlisted group`);
+        }
+        if (!policy.roster) {
+          throw new Error(
+            'roster access is not granted for this group — run "bun scripts/access.ts wizard" (or "group add --roster") to grant it',
+          );
+        }
+        const meta = await sock.groupMetadata(chat_id);
+        const lines = meta.participants.map((p) => {
+          // resolveToPhone(p.id) only resolves through OUR OWN passively-
+          // populated lidMap (see its own comment) - a participant we've
+          // never exchanged a lid-mapping.update event with (never spoken)
+          // falls back to the raw LID jid unresolved, so both the name
+          // lookup and the mask below would key/show the LID's own digits
+          // instead of the phone number. groupMetadata() already returns
+          // each participant's phoneNumber directly (Baileys resolves this
+          // as part of the roster fetch itself, no event needed) - prefer
+          // that, and feed it back into lidMap so later lookups elsewhere
+          // (allowlist matching, other tools) benefit too, not just this one.
+          if (p.phoneNumber && isLidUser(p.id)) {
+            recordLidMapping(p.id, p.phoneNumber);
+          }
+          const phone = p.phoneNumber ?? resolveToPhone(p.id);
+          const name = contactName(contactsMap, contactKey(phone));
+          // .notify (self-reported) commonly defaults to the person's own
+          // number for anyone who never set a custom display name -
+          // contactName()'s permissive name-or-notify fallback would hand
+          // that back as if it were a real name. This tool's whole point is
+          // never showing a raw number, so treat a number-shaped result the
+          // same as no name at all.
+          return name && !looksLikeNumber(name) ? name : maskNumber(phone);
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${lines.length} member(s) of ${meta.subject || chat_id}:\n${lines.join("\n")}`,
             },
           ],
         };
@@ -2506,13 +2883,91 @@ async function connectWhatsApp(): Promise<void> {
 
   sock.ev.on("creds.update", saveCreds);
 
-  // Track LID ↔ phone number mappings for identity resolution
+  // Track LID ↔ phone number mappings for identity resolution.
+  // recordLidMapping also migrates the contacts cache; see its definition.
   sock.ev.on(
     "lid-mapping.update" as any,
     (mapping: { lid: string; pn: string }) => {
       recordLidMapping(mapping.lid, mapping.pn);
     },
   );
+
+  // Cache saved contact names as WhatsApp syncs them to this linked device.
+  // .name is what the account owner saved on their own phone; .notify is
+  // self-reported by the contact. See recordContact/mergeContact for why
+  // those stay separate instead of collapsing into one trusted field.
+  sock.ev.on("contacts.upsert", (contacts) => {
+    // One batch save after the loop, not one per contact: this event
+    // delivers the whole address book on first sync (hundreds to
+    // thousands of entries), and contactsMap starts empty so nearly every
+    // entry is a "change" - a sync writeFileSync+renameSync per entry
+    // would block on a full-map JSON serialization that many times in a row.
+    reloadContactsMap();
+    let changed = false;
+    for (const c of contacts) {
+      if (c.name || c.notify) {
+        if (
+          mergeContact(contactsMap, contactKey(c.id), {
+            name: c.name,
+            notify: c.notify,
+          })
+        ) {
+          changed = true;
+        }
+      }
+    }
+    if (changed) saveContactsMap();
+  });
+  sock.ev.on("contacts.update", (updates) => {
+    reloadContactsMap();
+    let changed = false;
+    for (const u of updates) {
+      if (u.id && (u.name || u.notify)) {
+        if (
+          mergeContact(contactsMap, contactKey(u.id), {
+            name: u.name,
+            notify: u.notify,
+          })
+        ) {
+          changed = true;
+        }
+      }
+    }
+    if (changed) saveContactsMap();
+  });
+
+  // Archived state for groups (see applyChatArchive) and last-activity time
+  // for both groups and DMs (see applyChatActivity), feeding the on-disk
+  // groups-meta and dm-activity caches - the terminal access wizard uses
+  // archived to exclude groups from its default listing, and activity to
+  // rank its "top 5 groups / top 10 contacts" screen the same way the
+  // WhatsApp app itself orders its own chat list.
+  sock.ev.on("chats.upsert", (chats) => {
+    reloadDmActivity();
+    let groupsChanged = false;
+    let dmsChanged = false;
+    for (const c of chats) {
+      if (applyChatArchive(c.id, c.archived)) groupsChanged = true;
+      const activity = applyChatActivity(c.id, c.conversationTimestamp);
+      if (activity.groups) groupsChanged = true;
+      if (activity.dms) dmsChanged = true;
+    }
+    if (groupsChanged) saveGroupsMeta();
+    if (dmsChanged) saveDmActivity();
+  });
+  sock.ev.on("chats.update", (updates) => {
+    reloadDmActivity();
+    let groupsChanged = false;
+    let dmsChanged = false;
+    for (const u of updates) {
+      if (applyChatArchive(u.id, u.archived)) groupsChanged = true;
+      const activity = applyChatActivity(u.id, u.conversationTimestamp);
+      if (activity.groups) groupsChanged = true;
+      if (activity.dms) dmsChanged = true;
+    }
+    if (groupsChanged) saveGroupsMeta();
+    if (dmsChanged) saveDmActivity();
+  });
 
   // ─── Pairing code: request independently of QR event ─────────────────
   // Bun's WebSocket shim may not fire the 'upgrade'/'unexpected-response'
@@ -2620,6 +3075,24 @@ async function connectWhatsApp(): Promise<void> {
           },
         })
         .catch(() => {});
+
+      // Warm the groups-meta cache on every connect, same as contacts.upsert
+      // already warms the contact-name cache automatically - so the
+      // terminal access wizard has real group names to show without
+      // needing list_groups called manually first. Best-effort: a failure
+      // here must never break the connection itself, and it doesn't block
+      // startup (fire-and-forget, not awaited). Fire-and-forget also means
+      // this can theoretically resolve after a later reconnect has already
+      // replaced `sock` - since it's the same account either way, the
+      // worst case is writing slightly-stale-but-still-correct data, and
+      // the next successful fetch (past the cooldown below) overwrites it
+      // regardless. skipIfRecent keeps a flaky-network reconnect storm from
+      // re-fetching the full group list on every single reconnect.
+      refreshGroupsMeta(sock!, { skipIfRecent: true }).catch((err) => {
+        process.stderr.write(
+          `${LOG_PREFIX}: failed to warm groups-meta cache on connect: ${err}\n`,
+        );
+      });
     }
 
     if (connection === "close") {

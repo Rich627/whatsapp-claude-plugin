@@ -1,15 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import { jidDecode, jidNormalizedUser } from "@whiskeysockets/baileys";
-import { mentionsForChunk, normalizeMentionJids } from "./mentions";
+import {
+  expandAllMention,
+  isReservedAllToken,
+  mentionsForChunk,
+  normalizeMentionJids,
+} from "./mentions";
+// Reused, not hand-rolled again: this is what scripts/ranking.ts mirrors
+// Baileys' real jidNormalizedUser with (strips both the ":device" and
+// "_agent" parts of the user segment, maps "@c.us" to "@s.whatsapp.net",
+// does NOT lowercase). An earlier version of this mock only stripped the
+// device suffix, which a code review caught as a divergence from the real
+// export - importing the single already-correct implementation instead of
+// maintaining a second hand-rolled mirror means it can't drift again.
+import { normalizeJid as jidNormalizedUser } from "../scripts/ranking";
 
 describe("normalizeMentionJids", () => {
   test("bare number with no cached LID resolves to the phone JID", () => {
-    const [pair] = normalizeMentionJids(
-      ["61434505973"],
-      {},
-      jidNormalizedUser,
-      jidDecode,
-    );
+    const [pair] = normalizeMentionJids(["61434505973"], {}, jidNormalizedUser);
     expect(pair).toEqual({
       input: "61434505973",
       jid: "61434505973@s.whatsapp.net",
@@ -22,7 +29,6 @@ describe("normalizeMentionJids", () => {
       ["61403911675"],
       lidMap,
       jidNormalizedUser,
-      jidDecode,
     );
     expect(pair).toEqual({
       input: "61403911675",
@@ -35,7 +41,6 @@ describe("normalizeMentionJids", () => {
       ["61434505973@s.whatsapp.net"],
       {},
       jidNormalizedUser,
-      jidDecode,
     );
     expect(pair).toEqual({
       input: "61434505973",
@@ -47,12 +52,55 @@ describe("normalizeMentionJids", () => {
     // reply_to_sender surfaces contextInfo.participant verbatim, which can
     // carry a device suffix ("<num>:12@s.whatsapp.net"). Nobody types
     // "@<num>:12" in reply text, so the match key must strip it the same
-    // way jidDecode().user does.
+    // way jidNormalizedUser does before deriving input from the result.
     const [pair] = normalizeMentionJids(
       ["61434505973:12@s.whatsapp.net"],
       {},
       jidNormalizedUser,
-      jidDecode,
+    );
+    expect(pair).toEqual({
+      input: "61434505973",
+      jid: "61434505973@s.whatsapp.net",
+    });
+  });
+
+  test("full JID with a device suffix: the suffix doesn't end up in the match key", () => {
+    // jidNormalizedUser strips ":5" for `jid`; if `input` kept it, the text
+    // match would look for "@61434505973:5" while the caller wrote plain
+    // "@61434505973" - silently unmatchable.
+    const [pair] = normalizeMentionJids(
+      ["61434505973:5@s.whatsapp.net"],
+      {},
+      jidNormalizedUser,
+    );
+    expect(pair).toEqual({
+      input: "61434505973",
+      jid: "61434505973@s.whatsapp.net",
+    });
+  });
+
+  test("full JID with an _agent suffix: input is derived from the normalized jid, not re-parsed from the raw string", () => {
+    // Regression: input used to come from a second, less complete regex
+    // applied directly to the raw input, which only stripped a device
+    // suffix - an _agent-suffixed JID kept "_5" in the match key even
+    // though jidNormalizedUser (and so `jid`) correctly strips it, so the
+    // text match for plain "@61434505973" would have silently missed.
+    const [pair] = normalizeMentionJids(
+      ["61434505973_5@s.whatsapp.net"],
+      {},
+      jidNormalizedUser,
+    );
+    expect(pair).toEqual({
+      input: "61434505973",
+      jid: "61434505973@s.whatsapp.net",
+    });
+  });
+
+  test("full JID with both an _agent and a device suffix: both are stripped from the match key", () => {
+    const [pair] = normalizeMentionJids(
+      ["61434505973_5:9@s.whatsapp.net"],
+      {},
+      jidNormalizedUser,
     );
     expect(pair).toEqual({
       input: "61434505973",
@@ -67,7 +115,6 @@ describe("normalizeMentionJids", () => {
       ["@@61434505973"],
       {},
       jidNormalizedUser,
-      jidDecode,
     );
     expect(pair.input).toBe("61434505973");
   });
@@ -81,12 +128,185 @@ describe("normalizeMentionJids", () => {
       ["184710990000999", "61403911675"],
       lidMap,
       jidNormalizedUser,
-      jidDecode,
     );
     expect(pairs).toEqual([
       { input: "184710990000999", jid: "184710990000999@lid" },
       { input: "61403911675", jid: "184710990000999@lid" },
     ]);
+  });
+
+  test("a known contact's name resolves to their jid, input stays the name", () => {
+    const contactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
+    const [pair] = normalizeMentionJids(
+      ["Akash"],
+      {},
+      jidNormalizedUser,
+      contactsMap,
+    );
+    expect(pair).toEqual({ input: "Akash", jid: "x@s.whatsapp.net" });
+  });
+
+  test("name resolution wins over treating the same string as a numeric id", () => {
+    // Nobody has a contact literally named after a phone number, but if
+    // they did, the name lookup must win - that's the whole point of
+    // preferring names over raw digits.
+    const contactsMap = { "x@s.whatsapp.net": { name: "61434505973" } };
+    const [pair] = normalizeMentionJids(
+      ["61434505973"],
+      {},
+      jidNormalizedUser,
+      contactsMap,
+    );
+    expect(pair.jid).toBe("x@s.whatsapp.net");
+  });
+
+  test("a resolved name prefers the LID form when known, same as the numeric path", () => {
+    // Group participants are LID-addressed; a name resolved straight from
+    // contacts.json used to ship the phone-form jid verbatim, which
+    // silently fails to attach/notify in a LID-addressed group.
+    const contactsMap = { "61403911675@s.whatsapp.net": { name: "Akash" } };
+    const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
+    const [pair] = normalizeMentionJids(
+      ["Akash"],
+      lidMap,
+      jidNormalizedUser,
+      contactsMap,
+    );
+    expect(pair).toEqual({ input: "Akash", jid: "184710990000999@lid" });
+  });
+
+  test("a name-shaped id that matches no contact throws, rather than shipping a nonsense jid", () => {
+    // Previously fell through to the numeric/LID path and shipped
+    // '"Someone Else"@s.whatsapp.net' - not a real jid, so WhatsApp
+    // silently fails to notify while the tool call still reports success.
+    expect(() =>
+      normalizeMentionJids(["Someone Else"], {}, jidNormalizedUser, {}),
+    ).toThrow(/doesn't match any saved contact/);
+  });
+
+  test("a name not in the contacts cache falls through to the old id-based path", () => {
+    const [pair] = normalizeMentionJids(
+      ["61434505973"],
+      {},
+      jidNormalizedUser,
+      { "y@s.whatsapp.net": { name: "SomeoneElse" } },
+    );
+    expect(pair).toEqual({
+      input: "61434505973",
+      jid: "61434505973@s.whatsapp.net",
+    });
+  });
+
+  test("no contactsMap passed at all: still works, old behaviour unchanged", () => {
+    const [pair] = normalizeMentionJids(["61434505973"], {}, jidNormalizedUser);
+    expect(pair.jid).toBe("61434505973@s.whatsapp.net");
+  });
+
+  test("two contacts sharing a name: throws instead of guessing", () => {
+    const contactsMap = {
+      "a@s.whatsapp.net": { name: "Neha" },
+      "b@s.whatsapp.net": { name: "Neha" },
+    };
+    expect(() =>
+      normalizeMentionJids(["Neha"], {}, jidNormalizedUser, contactsMap),
+    ).toThrow(/matches more than one contact/);
+  });
+
+  test("the ambiguous-name error shows masked numbers, not raw ones", () => {
+    const contactsMap = {
+      "918419935122@s.whatsapp.net": { name: "Neha" },
+      "61405070760@s.whatsapp.net": { name: "Neha" },
+    };
+    try {
+      normalizeMentionJids(["Neha"], {}, jidNormalizedUser, contactsMap);
+      throw new Error("expected normalizeMentionJids to throw");
+    } catch (err) {
+      const msg = (err as Error).message;
+      expect(msg).toContain("•••••5122");
+      expect(msg).toContain("•••••0760");
+      expect(msg).not.toContain("918419935122");
+      expect(msg).not.toContain("61405070760");
+    }
+  });
+});
+
+describe("isReservedAllToken", () => {
+  test('"all" with no saved contact of that name is the reserved token', () => {
+    expect(isReservedAllToken("all", {})).toBe(true);
+  });
+
+  test("case-insensitive and @-stripped, same as any other mention entry", () => {
+    expect(isReservedAllToken("@ALL", {})).toBe(true);
+    expect(isReservedAllToken(" All ", {})).toBe(true);
+  });
+
+  test('a real contact literally named "All" wins over the reserved token', () => {
+    const contactsMap = { "x@s.whatsapp.net": { name: "All" } };
+    expect(isReservedAllToken("all", contactsMap)).toBe(false);
+  });
+
+  test("any other entry is never the reserved token", () => {
+    expect(isReservedAllToken("Akash", {})).toBe(false);
+    expect(isReservedAllToken("61434505973", {})).toBe(false);
+  });
+
+  // Regression: a `mentions` array survives JSON parsing before any element
+  // is checked, so a non-string entry (a JSON number, or null) reaches here
+  // raw - reported by review as `entry.trim is not a function` when this
+  // called .trim() directly instead of coercing first, the same way
+  // normalizeMentionJids already does.
+  test("a non-string entry does not throw, coerced the same way normalizeMentionJids does", () => {
+    expect(() => isReservedAllToken(42, {})).not.toThrow();
+    expect(isReservedAllToken(42, {})).toBe(false);
+    expect(() => isReservedAllToken(null, {})).not.toThrow();
+    expect(isReservedAllToken(null, {})).toBe(false);
+  });
+});
+
+describe("expandAllMention", () => {
+  test('every participant gets a pair, all sharing input "all"', () => {
+    const pairs = expandAllMention(
+      ["61434505973@s.whatsapp.net", "184710990000999@lid"],
+      jidNormalizedUser,
+    );
+    expect(pairs).toEqual([
+      { input: "all", jid: "61434505973@s.whatsapp.net" },
+      { input: "all", jid: "184710990000999@lid" },
+    ]);
+  });
+
+  test("a device suffix is normalized away, same as any other jid input", () => {
+    const pairs = expandAllMention(
+      ["61434505973:5@s.whatsapp.net"],
+      jidNormalizedUser,
+    );
+    expect(pairs).toEqual([
+      { input: "all", jid: "61434505973@s.whatsapp.net" },
+    ]);
+  });
+
+  test("no participants: empty array, not an error", () => {
+    expect(expandAllMention([], jidNormalizedUser)).toEqual([]);
+  });
+
+  test("mentionsForChunk attaches every expanded pair when the text says @all", () => {
+    const pairs = expandAllMention(
+      ["a@s.whatsapp.net", "b@s.whatsapp.net", "c@lid"],
+      jidNormalizedUser,
+    );
+    const result = mentionsForChunk("hey @all, meeting moved up", pairs);
+    expect(result).toEqual(["a@s.whatsapp.net", "b@s.whatsapp.net", "c@lid"]);
+  });
+
+  test('mentionsForChunk does not false-match "@all" inside a longer word', () => {
+    const pairs = expandAllMention(["a@s.whatsapp.net"], jidNormalizedUser);
+    const result = mentionsForChunk("please allocate more time", pairs);
+    expect(result).toBeUndefined();
+  });
+
+  test("a chunk that doesn't mention @all attaches nothing", () => {
+    const pairs = expandAllMention(["a@s.whatsapp.net"], jidNormalizedUser);
+    expect(mentionsForChunk("no group mention in here", pairs)).toBeUndefined();
   });
 });
 
@@ -101,7 +321,6 @@ describe("mentionsForChunk", () => {
       ["61403911675"],
       lidMap,
       jidNormalizedUser,
-      jidDecode,
     );
     const result = mentionsForChunk("hey @61403911675 you're up", pairs);
     expect(result).toEqual(["184710990000999@lid"]);
@@ -110,12 +329,7 @@ describe("mentionsForChunk", () => {
   test("four mixed entries: only the ones referenced in this chunk's text are attached", () => {
     const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
     const raw = ["61434505973", "23058185377", "61405070760", "61403911675"];
-    const pairs = normalizeMentionJids(
-      raw,
-      lidMap,
-      jidNormalizedUser,
-      jidDecode,
-    );
+    const pairs = normalizeMentionJids(raw, lidMap, jidNormalizedUser);
     const text =
       "@61434505973 @23058185377 @61405070760 @61403911675 all four, please";
     const result = mentionsForChunk(text, pairs);
@@ -128,12 +342,7 @@ describe("mentionsForChunk", () => {
   });
 
   test("no match in this chunk's text returns undefined", () => {
-    const pairs = normalizeMentionJids(
-      ["61434505973"],
-      {},
-      jidNormalizedUser,
-      jidDecode,
-    );
+    const pairs = normalizeMentionJids(["61434505973"], {}, jidNormalizedUser);
     expect(mentionsForChunk("no mentions in here", pairs)).toBeUndefined();
   });
 
@@ -142,7 +351,6 @@ describe("mentionsForChunk", () => {
       ["6123", "61234567"],
       {},
       jidNormalizedUser,
-      jidDecode,
     );
     const result = mentionsForChunk("hey @61234567 nice work", pairs);
     expect(result).toEqual(["61234567@s.whatsapp.net"]);
@@ -154,12 +362,52 @@ describe("mentionsForChunk", () => {
       ["184710990000999", "61403911675"],
       lidMap,
       jidNormalizedUser,
-      jidDecode,
     );
     const result = mentionsForChunk(
       "@184710990000999 and @61403911675 are the same person",
       pairs,
     );
     expect(result).toEqual(["184710990000999@lid"]);
+  });
+
+  test("a name-based mention matches its @<Name> in text", () => {
+    const contactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
+    const pairs = normalizeMentionJids(
+      ["Akash"],
+      {},
+      jidNormalizedUser,
+      contactsMap,
+    );
+    const result = mentionsForChunk("Hey @Akash, can you check?", pairs);
+    expect(result).toEqual(["x@s.whatsapp.net"]);
+  });
+
+  test("a name that's a text-prefix of a longer word doesn't false-match", () => {
+    // Same class of bug as the numeric-prefix case, now for names: "Akash"
+    // must not match inside "Akashi".
+    const contactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
+    const pairs = normalizeMentionJids(
+      ["Akash"],
+      {},
+      jidNormalizedUser,
+      contactsMap,
+    );
+    const result = mentionsForChunk("Have you met @Akashi?", pairs);
+    expect(result).toBeUndefined();
+  });
+
+  test("casing drift between the resolved name and the text still matches", () => {
+    // resolveByName matches "Akash"/"akash"/"AKASH" identically, so the
+    // text match must not silently require the exact casing the caller
+    // happened to resolve with.
+    const contactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
+    const pairs = normalizeMentionJids(
+      ["Akash"],
+      {},
+      jidNormalizedUser,
+      contactsMap,
+    );
+    const result = mentionsForChunk("cc @akash for visibility", pairs);
+    expect(result).toEqual(["x@s.whatsapp.net"]);
   });
 });

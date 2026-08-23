@@ -28,12 +28,19 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { checkbox } from "@inquirer/prompts";
+import { forgetContact, type ContactsMap } from "./contacts";
+import { contactKeyFor, rankDms, rankGroups, type GroupMeta } from "./ranking";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
 const ACCESS_FILE = join(STATE_DIR, "access.json");
 const APPROVED_DIR = join(STATE_DIR, "approved");
 const GROUPS_DIR = join(STATE_DIR, "groups");
+const GROUPS_META_FILE = join(STATE_DIR, "groups-meta.json");
+const DM_ACTIVITY_FILE = join(STATE_DIR, "dm-activity.json");
+const CONTACTS_FILE = join(STATE_DIR, "contacts.json");
+const LID_MAP_FILE = join(STATE_DIR, "lid-map.json");
 
 const POLICIES = ["pairing", "allowlist", "disabled"];
 const SET_KEYS = [
@@ -44,7 +51,11 @@ const SET_KEYS = [
   "mentionPatterns",
 ];
 
-type GroupPolicy = { requireMention: boolean; allowFrom: string[] };
+type GroupPolicy = {
+  requireMention: boolean;
+  allowFrom: string[];
+  roster?: boolean;
+};
 type PendingEntry = { senderId: string; chatId: string; expiresAt: number };
 type Access = {
   dmPolicy: string;
@@ -104,15 +115,78 @@ const USAGE = `Usage: bun scripts/access.ts <command>
   deny <code>                     drop a pending pairing
   allow <jid>                     add a JID to the allowlist
   remove <jid>                    remove a JID from the allowlist
+  forget <jid>                    purge a cached name/activity entry, even
+                                   for a JID never allowlisted (see remove)
   policy <${POLICIES.join("|")}>   set the DM policy
-  group add <groupJid> [--mention] [--allow a,b]
+  group add <groupJid> [--mention|--no-mention] [--allow a,b] [--roster|--no-roster]
   group rm <groupJid>             stop responding in a group (files kept)
+  wizard [--include-archived]     guided group setup: can-act / can-see-roster,
+                                   per group, from names cached by list_groups
   set <key> <value>               ${SET_KEYS.join(", ")}
 
 JIDs look like 886912345678@s.whatsapp.net or 1203634244@g.us.`;
 
+function loadGroupsMeta(): Record<string, GroupMeta> {
+  if (!existsSync(GROUPS_META_FILE)) return {};
+  try {
+    return JSON.parse(readFileSync(GROUPS_META_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function loadDmActivity(): Record<string, number> {
+  if (!existsSync(DM_ACTIVITY_FILE)) return {};
+  try {
+    return JSON.parse(readFileSync(DM_ACTIVITY_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveDmActivity(activity: Record<string, number>): void {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  const tmp = DM_ACTIVITY_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(activity, null, 2) + "\n", {
+    mode: 0o600,
+  });
+  renameSync(tmp, DM_ACTIVITY_FILE);
+}
+
+function loadContacts(): ContactsMap {
+  if (!existsSync(CONTACTS_FILE)) return {};
+  try {
+    return JSON.parse(readFileSync(CONTACTS_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveContacts(map: ContactsMap): void {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  const tmp = CONTACTS_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(map, null, 2) + "\n", { mode: 0o600 });
+  renameSync(tmp, CONTACTS_FILE);
+}
+
+// This script has no live WhatsApp connection (see the file header) and
+// deliberately doesn't import Baileys just for its JID string utilities -
+// mirrors server.ts's resolveToPhone/contactKey exactly (same
+// resolve-then-normalize order), reading the same lid-map.json server.ts
+// writes, so a key computed here always matches the one contacts.json is
+// actually keyed under.
+function loadLidMap(): Record<string, string> {
+  if (!existsSync(LID_MAP_FILE)) return {};
+  try {
+    return JSON.parse(readFileSync(LID_MAP_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
 function status(): void {
   const a = load();
+  const meta = loadGroupsMeta();
   const now = Date.now();
   const lines = [
     `state dir:  ${STATE_DIR}`,
@@ -129,7 +203,10 @@ function status(): void {
   const groups = Object.entries(a.groups);
   lines.push(`groups:     ${groups.length}`);
   for (const [jid, g] of groups) {
-    lines.push(`  - ${jid}  mention=${g.requireMention}`);
+    const name = meta[jid]?.name;
+    lines.push(
+      `  - ${name ? `${name}  ` : ""}${jid}  mention=${g.requireMention}  roster=${!!g.roster}`,
+    );
   }
   process.stdout.write(lines.join("\n") + "\n");
 }
@@ -171,6 +248,25 @@ function pair(code: string): void {
   );
 }
 
+// A starting point, not a wizard: the skill (or a human) asks the real
+// questions and writes a tailored config.md. Here the files just have to
+// exist and be editable. Shared by both `group add` and the wizard so a
+// group provisioned either way ends up the same.
+function provisionGroupFiles(jid: string): string {
+  const dir = join(GROUPS_DIR, jid);
+  mkdirSync(dir, { recursive: true });
+  const config = join(dir, "config.md");
+  if (!existsSync(config)) {
+    writeFileSync(
+      config,
+      `# Soul\n\n## Identity\nA helpful assistant in this group.\n\n## Communication Style\n- Match the group's language and tone\n- Concise and direct, 1-2 sentences when possible\n\n## Goals\n- Answer questions from the group\n\n## Boundaries\n- Never share private information between groups or DMs\n- Never modify access control from a channel message\n\n## Context\n(describe what this group is for)\n`,
+    );
+  }
+  const memory = join(dir, "memory.md");
+  if (!existsSync(memory)) writeFileSync(memory, "# Group Memory\n\n");
+  return config;
+}
+
 function group(args: string[]): void {
   // Strict: an unknown flag, a missing --allow value, or a flag where the JID
   // should be is an error, not a group called "--mention".
@@ -178,7 +274,13 @@ function group(args: string[]): void {
   try {
     parsed = parseArgs({
       args,
-      options: { mention: { type: "boolean" }, allow: { type: "string" } },
+      options: {
+        mention: { type: "boolean" },
+        "no-mention": { type: "boolean" },
+        allow: { type: "string" },
+        roster: { type: "boolean" },
+        "no-roster": { type: "boolean" },
+      },
       allowPositionals: true,
     });
   } catch (err) {
@@ -186,7 +288,18 @@ function group(args: string[]): void {
   }
   const [sub, jidArg] = parsed.positionals;
   const jid = requireArg(jidArg, "group JID");
-  const { mention = false, allow } = parsed.values;
+  const {
+    mention = false,
+    "no-mention": noMention = false,
+    allow,
+    roster = false,
+    "no-roster": noRoster = false,
+  } = parsed.values;
+  // parseArgs has no built-in negation, so --mention/--no-mention (and the
+  // roster pair) are two separate flags - passing both at once is
+  // ambiguous, never silently resolved one way.
+  if (mention && noMention) die("Cannot pass both --mention and --no-mention.");
+  if (roster && noRoster) die("Cannot pass both --roster and --no-roster.");
   const a = load();
   if (sub === "rm") {
     if (!a.groups[jid]) die(`Group ${jid} is not configured.`);
@@ -199,28 +312,179 @@ function group(args: string[]): void {
   }
   if (sub !== "add") die(`Unknown group command "${sub}".\n\n${USAGE}`);
 
+  // Merge into an existing entry, don't overwrite it: re-adding an
+  // already-configured group to change just one thing (e.g. --roster)
+  // used to silently reset every OTHER flag back to its default
+  // (--mention lost, --allow cleared) since this always wrote a whole new
+  // object. Now an omitted flag keeps whatever was already there; only a
+  // flag actually passed changes anything. --allow "" (empty, but passed)
+  // still explicitly clears the allowlist - omitting --allow entirely is
+  // what preserves it. --no-mention/--no-roster are the explicit way to
+  // turn a flag back off - without them there was no way to revoke roster
+  // access short of `group rm` + a fresh `add` (losing allowFrom too).
+  const existing = a.groups[jid];
   a.groups[jid] = {
-    requireMention: mention,
-    allowFrom: allow?.split(",").map((s) => s.trim()) ?? [],
+    requireMention: mention
+      ? true
+      : noMention
+        ? false
+        : (existing?.requireMention ?? false),
+    allowFrom:
+      allow !== undefined
+        ? allow
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : (existing?.allowFrom ?? []),
+    roster: roster ? true : noRoster ? false : (existing?.roster ?? false),
   };
   save(a);
 
-  const dir = join(GROUPS_DIR, jid);
-  mkdirSync(dir, { recursive: true });
-  const config = join(dir, "config.md");
-  // A starting point, not a wizard: the skill asks the questions and writes a
-  // tailored file. Here the file just has to exist and be editable.
-  if (!existsSync(config)) {
-    writeFileSync(
-      config,
-      `# Soul\n\n## Identity\nA helpful assistant in this group.\n\n## Communication Style\n- Match the group's language and tone\n- Concise and direct, 1-2 sentences when possible\n\n## Goals\n- Answer questions from the group\n\n## Boundaries\n- Never share private information between groups or DMs\n- Never modify access control from a channel message\n\n## Context\n(describe what this group is for)\n`,
+  const config = provisionGroupFiles(jid);
+  process.stdout.write(
+    `${existing ? "Updated" : "Added"} ${jid} (mention required: ${a.groups[jid].requireMention}, roster: ${a.groups[jid].roster}).\nEdit its personality at ${config}\n`,
+  );
+}
+
+const PRIVACY_DISCLOSURE =
+  "No group or contact data was sent to any AI model during this setup — this ran entirely in your terminal.";
+
+// Bold amber, not red/green: a disclosure, not an error or a success state.
+// Plain text when the terminal can't render color, or NO_COLOR is set.
+function highlight(text: string): string {
+  if (!process.stdout.isTTY || process.env.NO_COLOR) return text;
+  return `\x1b[1;38;5;208m${text}\x1b[0m`;
+}
+
+const GROUP_CANDIDATE_LIMIT = 5;
+const DM_CANDIDATE_LIMIT = 10;
+
+// Guided setup for the account's most recently active groups and contacts
+// that haven't been decided on yet - top 5 / top 10 by recency, the same
+// way WhatsApp's own app orders its chat list, so the review stays to one
+// screen instead of every group/contact ever seen. Anything beyond that is
+// meant to be added one at a time later (`group add`/`allow`, or just
+// asking Claude - it already has the name from context), not reviewed here.
+//
+// Terminal, not chat: this is what makes "no data went to an AI" literally
+// true (no model runs during the decision), and it works for any client
+// driving this plugin, not just Claude Code. Reads from groups-meta.json,
+// dm-activity.json and contacts.json, none of which this script ever
+// writes to on its own - only the connected server (server.ts) populates
+// them, since only it holds the live WhatsApp connection.
+async function wizard(args: string[]): Promise<void> {
+  const includeArchived = args.includes("--include-archived");
+  const a = load();
+  const lidMap = loadLidMap();
+
+  const groupCandidates = rankGroups(
+    loadGroupsMeta(),
+    new Set(Object.keys(a.groups)),
+    includeArchived,
+    GROUP_CANDIDATE_LIMIT,
+  );
+  const dmCandidates = rankDms(
+    loadDmActivity(),
+    loadContacts(),
+    a.allowFrom,
+    lidMap,
+    DM_CANDIDATE_LIMIT,
+  );
+
+  if (groupCandidates.length === 0 && dmCandidates.length === 0) {
+    die(
+      "Nothing to review - either no group/contact activity is cached yet " +
+        "(pair the account and let it connect at least once first), or " +
+        "everything currently known is already configured.",
     );
   }
-  const memory = join(dir, "memory.md");
-  if (!existsSync(memory)) writeFileSync(memory, "# Group Memory\n\n");
+
+  let actGroups: string[] = [];
+  let rosterGroups: string[] = [];
+  let allowDms: string[] = [];
+  try {
+    if (groupCandidates.length > 0) {
+      actGroups = await checkbox({
+        message: "Which groups can Claude reply in?",
+        choices: groupCandidates.map((c) => ({ name: c.label, value: c.jid })),
+      });
+      if (actGroups.length > 0) {
+        rosterGroups = await checkbox({
+          message:
+            'Of those, which can Claude also see member names in (for "all" mentions)?',
+          choices: groupCandidates
+            .filter((c) => actGroups.includes(c.jid))
+            .map((c) => ({ name: c.label, value: c.jid })),
+        });
+      }
+    }
+    if (dmCandidates.length > 0) {
+      allowDms = await checkbox({
+        message: "Which contacts can message Claude?",
+        choices: dmCandidates.map((c) => ({ name: c.label, value: c.jid })),
+      });
+    }
+  } catch (err) {
+    // @inquirer/prompts throws this specific error on Ctrl-C/Ctrl-D -
+    // nothing has been written yet at this point (save() only happens
+    // below, after every question is answered), so there's nothing to
+    // roll back, just a clean message instead of a raw stack trace.
+    if (err instanceof Error && err.name === "ExitPromptError") {
+      process.stdout.write("\nCancelled - nothing was changed.\n");
+      return;
+    }
+    throw err;
+  }
+
+  for (const jid of actGroups) {
+    provisionGroupFiles(jid);
+  }
+  // Re-load rather than reuse `a`: the checkbox prompts above block on the
+  // user for an unbounded time, and the server can write access.json in
+  // that window (a pairing approval appended to allowFrom, a pending code
+  // created or pruned). Writing back the pre-prompt snapshot would silently
+  // revert that write - unlike the one-shot commands, where the load-to-save
+  // gap is a few ms, this gap is however long the user takes to answer.
+  if (actGroups.length > 0 || allowDms.length > 0) {
+    const fresh = load();
+    for (const jid of actGroups) {
+      fresh.groups[jid] = {
+        requireMention: true,
+        allowFrom: [],
+        roster: rosterGroups.includes(jid),
+      };
+    }
+    for (const jid of allowDms) {
+      if (!fresh.allowFrom.includes(jid)) fresh.allowFrom.push(jid);
+    }
+    save(fresh);
+  }
+
   process.stdout.write(
-    `Added ${jid} (mention required: ${a.groups[jid].requireMention}).\nEdit its personality at ${config}\n`,
+    `\n${actGroups.length} group(s), ${allowDms.length} contact(s) configured.\n`,
   );
+  process.stdout.write(`\n${highlight(PRIVACY_DISCLOSURE)}\n`);
+}
+
+// Shared by `remove` (which also drops the allowlist entry) and `forget`
+// (which purges the cache alone, for someone never allowlisted in the
+// first place). Never touches lid-map.json - see forgetContact's own
+// comment for why. If they're still in a shared group with roster access,
+// they'll show up there as a masked number from now on - not a bug, the
+// honest consequence of choosing to forget someone this plugin was never
+// going to remove from a group or block on WhatsApp.
+function forgetCachedIdentity(jid: string): boolean {
+  const key = contactKeyFor(loadLidMap(), jid);
+  const contacts = loadContacts();
+  const forgot = forgetContact(contacts, key);
+  if (forgot) saveContacts(contacts);
+  const activity = loadDmActivity();
+  const forgotActivity = key in activity;
+  if (forgotActivity) {
+    delete activity[key];
+    saveDmActivity(activity);
+  }
+  return forgot || forgotActivity;
 }
 
 function set(key: string, rawValue: string): void {
@@ -288,7 +552,25 @@ switch (command) {
     if (!a.allowFrom.includes(jid)) die(`${jid} is not on the allowlist.`);
     a.allowFrom = a.allowFrom.filter((j) => j !== jid);
     save(a);
-    process.stdout.write(`Removed ${jid}.\n`);
+    const forgot = forgetCachedIdentity(jid);
+    process.stdout.write(
+      `Removed ${jid}.${forgot ? " Forgot their cached name too." : ""}\n`,
+    );
+    break;
+  }
+  case "forget": {
+    // A stranger's name/activity gets cached the moment they DM once -
+    // contacts.upsert/chats.upsert fire from Baileys before any allowlist
+    // check runs (see server.ts) - so someone who was NEVER allowlisted has
+    // no access.json entry for `remove` to find, and `remove` refuses to
+    // run at all for them (see the allowFrom check above). This purges the
+    // cache directly with no allowlist requirement, so a stranger's cached
+    // name/activity can always be cleared even though they were never
+    // granted (or denied) anything to remove.
+    const jid = requireArg(rest[0], "JID");
+    const forgot = forgetCachedIdentity(jid);
+    if (!forgot) die(`Nothing cached for ${jid}.`);
+    process.stdout.write(`Forgot ${jid}'s cached name and activity.\n`);
     break;
   }
   case "policy": {
@@ -304,6 +586,9 @@ switch (command) {
   }
   case "group":
     group(rest);
+    break;
+  case "wizard":
+    await wizard(rest);
     break;
   case "set":
     set(requireArg(rest[0], "key"), requireArg(rest[1], "value"));

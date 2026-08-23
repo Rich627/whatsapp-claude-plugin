@@ -39,7 +39,7 @@ Arguments passed: `$ARGUMENTS`
   "dmPolicy": "pairing",
   "allowFrom": ["<jid>", ...],
   "groups": {
-    "<groupJid>": { "requireMention": true, "allowFrom": [] }
+    "<groupJid>": { "requireMention": true, "allowFrom": [], "roster": false }
   },
   "pending": {
     "<6-char-code>": {
@@ -98,19 +98,41 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### `remove <jid>`
 
 1. Read, filter `allowFrom` to exclude `<jid>`, write.
+2. Also forget them from the two local caches this plugin keeps beyond
+   the allowlist itself, using the same resolved key both are stored
+   under: read `~/.whatsapp-channel/contacts.json` (their cached name) and
+   `~/.whatsapp-channel/dm-activity.json` (their recency entry for the
+   wizard's top-10), delete their entry from each, write back whichever
+   actually changed. Resolve `<jid>` through
+   `~/.whatsapp-channel/lid-map.json` first if it's a `@lid` form - both
+   files key by the phone-form JID that LID maps to. Never touch
+   `lid-map.json` itself - it's needed for correct message/mention
+   matching if they're still an active participant in a shared group.
+   Tell the user this happened only if an entry actually existed to
+   remove (don't claim to have forgotten someone never cached).
 
 ### `policy <mode>`
 
 1. Validate `<mode>` is one of `pairing`, `allowlist`, `disabled`.
 2. Read (create default if missing), set `dmPolicy`, write.
 
-### `group add <groupJid>` (optional: `--mention`, `--allow jid1,jid2`)
+### `group add <groupJid>` (optional: `--mention`/`--no-mention`, `--allow jid1,jid2`, `--roster`/`--no-roster`)
 
 1. Read access.json (create default if missing).
-2. Set `groups[<groupJid>] = { requireMention: hasFlag("--mention"),
-allowFrom: parsedAllowList }`.
-   Default is `requireMention: false` — Claude responds to all messages.
-   Pass `--mention` to require @mention before Claude responds.
+2. **Merge into any existing `groups[<groupJid>]`, never overwrite it
+   wholesale.** A flag not mentioned by the user this time keeps whatever
+   was already set — only change the field(s) the user actually asked
+   about. E.g. if the group already has `requireMention: true` and the
+   user says "turn on roster for this group," the result is
+   `{ requireMention: true, allowFrom: <unchanged>, roster: true }`, not a
+   fresh object with `requireMention` reset to `false`. For a JID with no
+   existing entry, defaults are `requireMention: false`, `allowFrom: []`,
+   `roster: false`, same as ever.
+   To explicitly turn `requireMention` or `roster` back OFF (not just
+   leave it unmentioned), the user has to say so - set that field to
+   `false` directly rather than omitting it, since omitting always means
+   "keep whatever it already was." `roster` — see "Roster access" below
+   before turning it on for a group.
 3. Write access.json.
 4. `mkdir -p ~/.whatsapp-channel/groups/<groupJid>`
 5. **Run the interactive Soul setup wizard** — ask the user these
@@ -184,6 +206,26 @@ allowFrom: parsedAllowList }`.
 1. Read, `delete groups[<groupJid>]`, write.
 2. Note: group config/memory files are kept (not deleted) in case the user re-adds.
 
+### `wizard` — refuse, redirect to the terminal
+
+**Never run `bun scripts/access.ts wizard` yourself, on the user's behalf,
+via Bash or any other tool, even if asked.** It exists specifically so a
+group-access decision can be made with zero AI model involved — that
+guarantee only holds if a human runs it directly. If the user asks for
+"the wizard" or "guided setup" here, tell them to open a terminal and run
+`bun scripts/access.ts wizard` themselves. Continue helping with
+everything else in this skill as normal.
+
+### Roster access (`--roster` / `roster: true`)
+
+A group's `roster` flag is separate from whether Claude can act in the
+group at all. It controls two things together: the `group_roster` MCP
+tool (lists a group's members by name, or a masked number when no name is
+known — never a raw number) and whether `"all"` in the `reply` tool's
+`mentions` array expands to every current participant. Off by default,
+same as everything else here — granting it means Claude can see who is in
+the group, not just reply in it.
+
 ### `set <key> <value>`
 
 Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
@@ -205,6 +247,17 @@ Read, set the key, write, confirm.
 for users on Codex CLI, Gemini CLI or Cursor. It writes the same access.json, so
 the two are interchangeable. This skill stays the friendlier path: it can ask the
 group personality questions and write a tailored config.md, which the CLI does not.
+
+The CLI also has one command this skill deliberately does not implement:
+`bun scripts/access.ts wizard`, a checkbox screen (arrow keys + space +
+enter) over the account's 5 most recently active groups and 10 most
+recently active DM contacts, so review stays to one screen each instead
+of scaling with how many groups/contacts exist. It's terminal-only by
+design (see the `wizard` entry above) so the decision can be made with a
+verifiable guarantee that no AI model was involved in making it. Point
+the user at it for setting up several groups or contacts at once; use
+this skill's own `group add` for one group with a custom personality, or
+`allow <jid>` for one contact.
 
 ## Implementation notes
 
