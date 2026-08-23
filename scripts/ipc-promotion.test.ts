@@ -54,8 +54,10 @@ type Rig = {
 async function startSecondaryRig(
   dirPrefix: string,
   extraEnv: Record<string, string> = {},
+  preSeed?: (dir: string) => void,
 ): Promise<Rig> {
   const dir = mkdtempSync(join(tmpdir(), dirPrefix));
+  preSeed?.(dir);
   const token = "a".repeat(64);
   writeFileSync(join(dir, ".ipc-token"), token + "\n", { mode: 0o600 });
   writeFileSync(
@@ -532,4 +534,50 @@ describe("ipc promotion/degradation (secondary)", () => {
       } catch {}
     }
   }, 60_000);
+});
+
+const PLUGIN_VERSION: string = JSON.parse(
+  readFileSync(
+    join(import.meta.dir, "..", ".claude-plugin", "plugin.json"),
+    "utf8",
+  ),
+).version;
+
+describe("update notice (announceUpdateIfNeeded)", () => {
+  // "0.9.0" is deliberately not "0.1.0": versionGt() must compare
+  // numerically ("0.18.0" > "0.9.0"), not as strings (where "0.18.0" <
+  // "0.9.0" because "1" < "9"). A naive string compare would wrongly treat
+  // 0.9.0 as newer and skip the notice entirely.
+  test("announces once when the recorded version is older", async () => {
+    const rig = await startSecondaryRig("wa-promo-update-old-", {}, (dir) =>
+      writeFileSync(join(dir, ".last-seen-version"), "0.9.0"),
+    );
+    try {
+      expect(rig.stdout()).toContain(
+        `WhatsApp plugin updated to v${PLUGIN_VERSION} (from v0.9.0)`,
+      );
+      expect(readFileSync(join(rig.dir, ".last-seen-version"), "utf8")).toBe(
+        PLUGIN_VERSION,
+      );
+    } finally {
+      rig.child.kill();
+      try {
+        rig.primary.close();
+      } catch {}
+    }
+  }, 30_000);
+
+  test("stays quiet when the recorded version already matches", async () => {
+    const rig = await startSecondaryRig("wa-promo-update-current-", {}, (dir) =>
+      writeFileSync(join(dir, ".last-seen-version"), PLUGIN_VERSION),
+    );
+    try {
+      expect(rig.stdout()).not.toContain("WhatsApp plugin updated to v");
+    } finally {
+      rig.child.kill();
+      try {
+        rig.primary.close();
+      } catch {}
+    }
+  }, 30_000);
 });
