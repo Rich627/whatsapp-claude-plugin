@@ -125,10 +125,16 @@ export function normalizeMentionJids(
 // wins over a reserved keyword, the same precedence normalizeMentionJids
 // already gives a saved name over treating it as a numeric id.
 export function isReservedAllToken(
-  entry: string,
+  entry: unknown,
   contactsMap: ContactsMap,
 ): boolean {
-  const s = entry.trim().replace(/^@+/, "");
+  // Same coercion normalizeMentionJids uses below - callers pass raw,
+  // untyped `mentions` array entries (a JSON number or null survives JSON
+  // parsing before any array element is actually checked), so this must
+  // not assume `entry` is already a string.
+  const s = String(entry ?? "")
+    .trim()
+    .replace(/^@+/, "");
   if (s.toLowerCase() !== "all") return false;
   return !resolveByName(contactsMap, s).ok;
 }

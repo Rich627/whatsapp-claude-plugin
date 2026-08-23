@@ -249,6 +249,18 @@ describe("isReservedAllToken", () => {
     expect(isReservedAllToken("Akash", {})).toBe(false);
     expect(isReservedAllToken("61434505973", {})).toBe(false);
   });
+
+  // Regression: a `mentions` array survives JSON parsing before any element
+  // is checked, so a non-string entry (a JSON number, or null) reaches here
+  // raw - reported by review as `entry.trim is not a function` when this
+  // called .trim() directly instead of coercing first, the same way
+  // normalizeMentionJids already does.
+  test("a non-string entry does not throw, coerced the same way normalizeMentionJids does", () => {
+    expect(() => isReservedAllToken(42, {})).not.toThrow();
+    expect(isReservedAllToken(42, {})).toBe(false);
+    expect(() => isReservedAllToken(null, {})).not.toThrow();
+    expect(isReservedAllToken(null, {})).toBe(false);
+  });
 });
 
 describe("expandAllMention", () => {
