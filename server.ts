@@ -95,6 +95,7 @@ const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
 const TASKS_FILE = join(STATE_DIR, "tasks.md");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
 const IPC_TOKEN_FILE = join(STATE_DIR, ".ipc-token");
+const LAST_SEEN_VERSION_FILE = join(STATE_DIR, ".last-seen-version");
 // Read by scripts/statusline-role.ts. PID-scoped so two terminals never
 // collide on one file; a stale one from a dead process is harmless, the
 // reader only ever looks up a pid it just found alive in the process list.
@@ -146,6 +147,21 @@ const ACCOUNT_NAME = process.env.WHATSAPP_ACCOUNT_NAME || "";
 // Opt out per-terminal with WHATSAPP_QUIET=1 - never a config file, so it
 // can't silently persist past the session that set it.
 const AUTO_NOTIFY = process.env.WHATSAPP_QUIET !== "1";
+// Read once at startup (relative to this file, not CWD, so it's correct
+// regardless of where the process was launched from) so announceUpdateIfNeeded()
+// can tell the installed version apart from the last one this account's
+// state directory has seen.
+const PLUGIN_VERSION: string = (() => {
+  try {
+    const raw = readFileSync(
+      join(import.meta.dir, ".claude-plugin", "plugin.json"),
+      "utf8",
+    );
+    return JSON.parse(raw).version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 const SERVER_NAME = ACCOUNT_NAME ? `whatsapp-${ACCOUNT_NAME}` : "whatsapp";
 const LOG_PREFIX = ACCOUNT_NAME
   ? `whatsapp[${ACCOUNT_NAME}]`
@@ -426,6 +442,64 @@ function notifyRoleChange(
           ? "Lost the primary WhatsApp connection; retrying."
           : "Couldn't reach the primary WhatsApp connection; retrying.";
   notifySystem(content, `role-${role}`);
+}
+
+// Numeric semver compare - "0.9.0" < "0.10.0" needs this; a plain string
+// compare gets that backwards on any double-digit segment.
+function versionGt(a: string, b: string): boolean {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = pa[i] ?? 0;
+    const nb = pb[i] ?? 0;
+    if (na !== nb) return na > nb;
+  }
+  return false;
+}
+
+// Hand-maintained: one entry per version worth telling a returning terminal
+// about. announceUpdateIfNeeded() shows every entry newer than the state
+// directory's last-seen version concatenated, so skipping several updates
+// still surfaces all of them, not just the latest.
+const CHANGELOG: { version: string; notes: string[] }[] = [
+  {
+    version: "0.18.0",
+    notes: [
+      "Proactive notifications: Claude now tells you about an inbound message, a role change, a pairing code, or this notice right away instead of waiting for its next natural reply. Set WHATSAPP_QUIET=1 on a terminal to turn that off.",
+      "There's a guided setup wizard (`bun scripts/access.ts wizard`) that shows a checkbox screen of your most recently active WhatsApp groups and DM contacts, so you can bulk-approve chats you already have instead of pairing them one at a time.",
+    ],
+  },
+];
+
+// Tells a returning terminal what changed since the last version it ran -
+// once per version bump, not on every restart of the same version. A state
+// directory that has never recorded a version (a first-ever run, or an
+// existing user updating past the point this file started being written)
+// only sees the latest entry, not the whole history. Skipped entirely in
+// STATIC mode, which can't write local state at all (see CACHE_CONTACTS).
+function announceUpdateIfNeeded(): void {
+  if (STATIC) return;
+  let lastSeen = "";
+  try {
+    lastSeen = readFileSync(LAST_SEEN_VERSION_FILE, "utf8").trim();
+  } catch {}
+  if (lastSeen === PLUGIN_VERSION) return;
+  const newEntries = lastSeen
+    ? CHANGELOG.filter((e) => versionGt(e.version, lastSeen))
+    : CHANGELOG.slice(-1);
+  const notes = newEntries.flatMap((e) => e.notes);
+  const content =
+    `WhatsApp plugin updated to v${PLUGIN_VERSION}` +
+    (lastSeen ? ` (from v${lastSeen})` : "") +
+    `.\n\nWhat's new:\n` +
+    notes.map((n) => `- ${n}`).join("\n");
+  // Unconditionally logged first, same as the pairing code above: nothing
+  // is lost by staying quiet under WHATSAPP_QUIET=1.
+  logDiag(`${LOG_PREFIX}: ${content}\n`);
+  if (AUTO_NOTIFY) notifySystem(content, "update");
+  try {
+    writeFileSync(LAST_SEEN_VERSION_FILE, PLUGIN_VERSION);
+  } catch {}
 }
 
 // ─── IPC listener (primary) ────────────────────────────────────────────
@@ -3752,27 +3826,31 @@ async function connectWhatsApp(): Promise<void> {
       // Initialize server-side cron jobs from group configs
       initServerCrons();
 
-      // AUTO_NOTIFY-gated same as every other system notification.
+      const connectedMsg = [
+        `WhatsApp paired and connected as ${resolvedOwn}.`,
+        `Your number is auto-added to the allowlist and policy is locked to allowlist mode.`,
+        ``,
+        `To add another contact:`,
+        `  /whatsapp-claude-channel:access policy pairing`,
+        `  → have them DM this number → they get a 6-digit code`,
+        `  /whatsapp-claude-channel:access pair <code>`,
+        `  → auto-locks back to allowlist`,
+        ``,
+        `To add a group:`,
+        `  /whatsapp-claude-channel:access group add <groupJid>`,
+        `  → edit personality at ~/.whatsapp-channel/groups/<groupJid>/config.md`,
+        ``,
+        `Already have contacts and groups you talk to on WhatsApp? Run`,
+        `\`bun scripts/access.ts wizard\` for a checkbox screen to bulk-approve`,
+        `them instead of pairing each one individually.`,
+        ``,
+        `Ready to receive messages.`,
+      ].join("\n");
+      // Unconditionally logged first, same as the pairing code above: nothing
+      // is lost by staying quiet under WHATSAPP_QUIET=1.
+      logDiag(`${LOG_PREFIX}: ${connectedMsg}\n`);
       if (AUTO_NOTIFY) {
-        notifySystem(
-          [
-            `WhatsApp paired and connected as ${resolvedOwn}.`,
-            `Your number is auto-added to the allowlist and policy is locked to allowlist mode.`,
-            ``,
-            `To add another contact:`,
-            `  /whatsapp-claude-channel:access policy pairing`,
-            `  → have them DM this number → they get a 6-digit code`,
-            `  /whatsapp-claude-channel:access pair <code>`,
-            `  → auto-locks back to allowlist`,
-            ``,
-            `To add a group:`,
-            `  /whatsapp-claude-channel:access group add <groupJid>`,
-            `  → edit personality at ~/.whatsapp-channel/groups/<groupJid>/config.md`,
-            ``,
-            `Ready to receive messages.`,
-          ].join("\n"),
-          "connected",
-        );
+        notifySystem(connectedMsg, "connected");
       }
 
       // Warm the groups-meta cache on every connect, same as contacts.upsert
@@ -3905,3 +3983,5 @@ if (!CONFLICT) {
   logDiag(`${LOG_PREFIX}: ${conflictReason}\n`);
   startRetryLoop(); // Degraded, but never permanently
 }
+
+announceUpdateIfNeeded();

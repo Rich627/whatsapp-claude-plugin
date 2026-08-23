@@ -156,7 +156,10 @@ describe("ipc promotion/degradation (secondary)", () => {
   test("boots as a secondary without announcing the initial role", async () => {
     const rig = await startSecondaryRig("wa-promo-quiet-boot-");
     try {
-      expect(rig.stdout()).not.toContain("notifications/claude/channel");
+      // Not a blanket "no notification at all": a fresh temp state dir also
+      // has no .last-seen-version, so announceUpdateIfNeeded() legitimately
+      // fires its own (unrelated) one-time notice on this same boot.
+      expect(rig.stdout()).not.toContain("This terminal is now a secondary");
     } finally {
       rig.child.kill();
       try {
