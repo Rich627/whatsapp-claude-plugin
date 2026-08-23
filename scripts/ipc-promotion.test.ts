@@ -243,6 +243,11 @@ describe("ipc promotion/degradation (secondary)", () => {
         250,
       );
 
+      // Snapshot stdout *before* the reconnect so the notification check
+      // below can't be satisfied by the initial-boot "secondary" notification
+      // startSecondaryRig() already triggered — it must be the reconnect's own.
+      const beforeReconnect = rig.stdout().length;
+
       // A restarted primary writes a fresh token and rebinds the socket path
       // (unlink first on non-win32, matching startIpcListener()'s own
       // stale-socket handling).
@@ -270,9 +275,17 @@ describe("ipc promotion/degradation (secondary)", () => {
 
         // The reconnect restores the "secondary" role — writeRoleFile("secondary")
         // in queueReconnect() — which fires its own AUTO_NOTIFY notification.
-        expect(rig.stdout().includes("This terminal is now a secondary")).toBe(
-          true,
-        );
+        expect(
+          await waitFor(
+            () =>
+              rig
+                .stdout()
+                .slice(beforeReconnect)
+                .includes("This terminal is now a secondary"),
+            20,
+            250,
+          ),
+        ).toBe(true);
 
         const before = rig.stdout().length;
         const callId = callTool(rig, "unreplied");

@@ -367,11 +367,12 @@ diagFileEnabled = isPrimary;
 function writeRoleFile(
   role: "primary" | "secondary" | "reconnecting",
   everConnected = false,
+  announce = true,
 ): void {
   try {
     writeFileSync(ROLE_FILE, role);
   } catch {}
-  notifyRoleChange(role, everConnected);
+  if (announce) notifyRoleChange(role, everConnected);
 }
 
 // Shared shape for a system (not-from-a-chat) channel notification — used
@@ -911,14 +912,18 @@ function queueLockRetry(gen: number): void {
 }
 
 // Everything today's startup `else` branch does, callable at any time.
-async function becomePrimary(): Promise<void> {
+// announce=false for the ordinary startup call (server.ts:~3890): there is no
+// prior role to have changed from, so "now primary" would be spurious noise
+// on every single-terminal session. The lock-retry promotion call (a real
+// secondary -> primary transition) keeps the default true.
+async function becomePrimary(announce = true): Promise<void> {
   // Before any await: shutdown() firing during connectWhatsApp() must find
   // isPrimary true so releaseSingletonLock() removes the lock we just took,
   // and a tool call arriving mid-promotion must fall through to the existing
   // `if (!sock) throw "WhatsApp not connected"` rather than the stub.
   isPrimary = true;
   diagFileEnabled = true;
-  writeRoleFile("primary");
+  writeRoleFile("primary", false, announce);
   ipcRelay = null;
   // Primary-only background work, started once on becoming primary and never
   // stopped: there is no primary → secondary transition to stop them for.
@@ -3525,7 +3530,10 @@ async function requestAndAnnouncePairingCode(
   // Re-registering an unchanged code is routine during pairing — only surface
   // it to the session when there is actually something new to type.
   if (!isNewCode) return;
-  notifySystem(pairingMsg, "pairing");
+  // AUTO_NOTIFY-gated same as role changes (WHATSAPP_QUIET=1 means quiet for
+  // every proactive system notification) — the code is always in the diag
+  // log above regardless, so nothing is lost by staying quiet here.
+  if (AUTO_NOTIFY) notifySystem(pairingMsg, "pairing");
 }
 
 // ─── WA Web client version ─────────────────────────────────────────────
@@ -3740,36 +3748,25 @@ async function connectWhatsApp(): Promise<void> {
       // Initialize server-side cron jobs from group configs
       initServerCrons();
 
-      mcp
-        .notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: [
-              `WhatsApp paired and connected as ${resolvedOwn}.`,
-              `Your number is auto-added to the allowlist and policy is locked to allowlist mode.`,
-              ``,
-              `To add another contact:`,
-              `  /whatsapp-claude-channel:access policy pairing`,
-              `  → have them DM this number → they get a 6-digit code`,
-              `  /whatsapp-claude-channel:access pair <code>`,
-              `  → auto-locks back to allowlist`,
-              ``,
-              `To add a group:`,
-              `  /whatsapp-claude-channel:access group add <groupJid>`,
-              `  → edit personality at ~/.whatsapp-channel/groups/<groupJid>/config.md`,
-              ``,
-              `Ready to receive messages.`,
-            ].join("\n"),
-            meta: {
-              chat_id: "system",
-              message_id: `connected-${Date.now()}`,
-              user: "WhatsApp Setup",
-              user_id: "system",
-              ts: new Date().toISOString(),
-            },
-          },
-        })
-        .catch(() => {});
+      notifySystem(
+        [
+          `WhatsApp paired and connected as ${resolvedOwn}.`,
+          `Your number is auto-added to the allowlist and policy is locked to allowlist mode.`,
+          ``,
+          `To add another contact:`,
+          `  /whatsapp-claude-channel:access policy pairing`,
+          `  → have them DM this number → they get a 6-digit code`,
+          `  /whatsapp-claude-channel:access pair <code>`,
+          `  → auto-locks back to allowlist`,
+          ``,
+          `To add a group:`,
+          `  /whatsapp-claude-channel:access group add <groupJid>`,
+          `  → edit personality at ~/.whatsapp-channel/groups/<groupJid>/config.md`,
+          ``,
+          `Ready to receive messages.`,
+        ].join("\n"),
+        "connected",
+      );
 
       // Warm the groups-meta cache on every connect, same as contacts.upsert
       // already warms the contact-name cache automatically - so the
@@ -3889,7 +3886,7 @@ async function connectWhatsApp(): Promise<void> {
 
 if (!CONFLICT) {
   logDiag(`${LOG_PREFIX}: starting\n`);
-  await becomePrimary();
+  await becomePrimary(false);
 } else if (ipcRelay) {
   logDiag(
     `${LOG_PREFIX}: relaying tool calls to the primary (pid ${CONFLICT.pid})\n`,
