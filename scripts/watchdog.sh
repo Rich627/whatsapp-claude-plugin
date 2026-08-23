@@ -11,6 +11,8 @@
 # if you have one, otherwise a launchd kickstart.
 # Also detects API auth failures (401) in the agent's tmux pane and fires an
 # external alert hook so you find out before replies silently die for hours.
+# Finally, it watches for one-way silence: a Baileys socket that stays open and
+# keeps sending while never receiving another inbound message again.
 #
 # Setup:
 #   cp scripts/watchdog.sh ~/.whatsapp-channel/watchdog.sh
@@ -53,6 +55,8 @@ STUCK_STREAK_FILE="$STATE_DIR/.watchdog-stuck-streak"
 RESTART_COOLDOWN_FILE="$STATE_DIR/.watchdog-restart-cooldown"
 NET_FAIL_FILE="$STATE_DIR/.watchdog-net-fail-streak"
 NET_ALERT_FILE="$STATE_DIR/.watchdog-net-alert"
+INBOUND_ALERT_FILE="$STATE_DIR/.watchdog-inbound-alert"
+INBOUND_BASELINE_FILE="$STATE_DIR/.watchdog-inbound-baseline"
 # Optional: a full agent restart script (graceful /exit + relaunch), e.g. one
 # that ends with `tmux new-session -d -s whatsapp-agent ... claude ...`.
 # If absent, hard restarts fall back to a launchd kickstart.
@@ -73,6 +77,14 @@ RESTART_COOLDOWN_SECS=1800               # don't hard-restart more than once per
 NET_PROBE_URL="https://web.whatsapp.com" # cheap outbound reachability target
 NET_FAIL_LIMIT=3                         # consecutive failed probes before alerting
 NET_ALERT_COOLDOWN_SECS=1800             # don't re-alert an outage more than once per 30 min
+# One-way-silence thresholds. Deliberately generous: a genuinely quiet stretch
+# (asleep, at work, away for the day) is indistinguishable from a half-dead
+# socket, so the cheap action (an alert) comes first and the expensive one (a
+# restart that costs the agent its context) waits much longer. Tune both to
+# your own rhythm — someone who messages all day can safely halve them.
+INBOUND_STALE_SECS=21600          # 6h with nothing received at all -> alert
+INBOUND_RESTART_SECS=43200        # 12h -> assume the socket is half-dead, restart
+INBOUND_ALERT_COOLDOWN_SECS=10800 # don't re-alert one-way silence more than once per 3h
 
 now=$(date +%s)
 
@@ -130,6 +142,10 @@ hard_restart() {
 	echo "0" >"$STUCK_STREAK_FILE"
 	echo "$now" >"$RESTART_COOLDOWN_FILE"
 	echo "$now" >"$COOLDOWN_FILE"
+	# A fresh session hasn't had a chance to receive anything yet; without this
+	# the one-way-silence check below would still see the pre-restart timestamp
+	# and restart again on the very next run.
+	echo "$now" >"$INBOUND_BASELINE_FILE"
 	return 0
 }
 
@@ -156,6 +172,10 @@ if curl -fsS --max-time 5 -o /dev/null "$NET_PROBE_URL" 2>/dev/null; then
 			osascript -e "display notification \"$msg\" with title \"WhatsApp agent back online\" sound name \"Funk\"" 2>/dev/null || true
 		fi
 		rm -f "$NET_ALERT_FILE"
+		# Nothing could arrive while the uplink was down, so the inbound clock
+		# starts again here. Without this, a 10h outage would look like 10h of
+		# one-way silence the moment connectivity returns.
+		echo "$now" >"$INBOUND_BASELINE_FILE"
 	fi
 	echo "0" >"$NET_FAIL_FILE"
 else
@@ -214,6 +234,82 @@ if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
 		fi
 		exit 0
 	fi
+fi
+
+# ── One-way-silence detection ──
+# The failure this catches (2026-08-22): Baileys' socket stays open and keeps
+# writing creds/pre-keys, cron pushes keep firing and replies keep going out —
+# but messages.upsert never fires again, so nothing the user sends ever arrives.
+# Every other check in this file reads green during that state. The network
+# probe passes. pending/ is empty, because an inbound message that never
+# arrives can't create a pending file. Nothing is unreplied, because a message
+# has to be received before it can go unanswered. The tmux pane looks healthy
+# and the agent really is healthy — it just never hears anything again.
+# That cost 15h of one-way silence before a human noticed and asked.
+#
+# There is no clean signal here: a quiet night looks exactly like a half-dead
+# socket. So this alerts long before it restarts, and the clock is reset both
+# by a network recovery and by a restart, so neither can cascade.
+inbound_baseline=0
+if [ -f "$INBOUND_BASELINE_FILE" ]; then
+	inbound_baseline=$(cat "$INBOUND_BASELINE_FILE" 2>/dev/null || echo 0)
+	case "$inbound_baseline" in '' | *[!0-9]*) inbound_baseline=0 ;; esac
+else
+	# First run, or a fresh install with no inbound history to judge against.
+	echo "$now" >"$INBOUND_BASELINE_FILE"
+	inbound_baseline=$now
+fi
+
+last_inbound=0
+if [ -f "$MSG_LOG" ]; then
+	last_inbound=$(python3 -c "
+import json, os
+from datetime import datetime, timezone
+latest = 0
+try:
+  with open(os.path.expanduser(\"$MSG_LOG\")) as f:
+    for line in f:
+      try:
+        m = json.loads(line)
+        if m.get('direction') != 'in':
+          continue
+        ts = datetime.fromisoformat(m['ts'].replace('Z','+00:00')).timestamp()
+        if ts > latest:
+          latest = ts
+      except Exception:
+        continue
+except FileNotFoundError:
+  pass
+print(int(latest))
+" 2>/dev/null || echo 0)
+	case "$last_inbound" in '' | *[!0-9]*) last_inbound=0 ;; esac
+fi
+
+# The baseline wins whenever it is newer: it marks the last moment we know the
+# receive path was given a fair chance (restart, or network coming back).
+[ "$inbound_baseline" -gt "$last_inbound" ] && last_inbound=$inbound_baseline
+inbound_silence=$((now - last_inbound))
+
+if [ "$inbound_silence" -ge "$INBOUND_RESTART_SECS" ]; then
+	if hard_restart "nothing received for $((inbound_silence / 3600))h — inbound path presumed dead"; then
+		exit 0
+	fi
+elif [ "$inbound_silence" -ge "$INBOUND_STALE_SECS" ]; then
+	last_alert=0
+	[ -f "$INBOUND_ALERT_FILE" ] && last_alert=$(cat "$INBOUND_ALERT_FILE" 2>/dev/null || echo 0)
+	case "$last_alert" in '' | *[!0-9]*) last_alert=0 ;; esac
+	if [ $((now - last_alert)) -ge $INBOUND_ALERT_COOLDOWN_SECS ]; then
+		msg="WhatsApp agent on $(hostname -s) has received nothing for $((inbound_silence / 3600))h while still sending fine. Either it has been quiet or the Baileys socket is half-dead (open, sending, never receiving). Send it a message: if no reply arrives, it will auto-restart at ${INBOUND_RESTART_SECS}s of silence."
+		echo "[$(date -Iseconds)] INBOUND-SILENT-ALERT: $msg"
+		if [ -x "$NOTIFY_HOOK" ]; then
+			"$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
+		elif command -v osascript >/dev/null 2>&1; then
+			osascript -e "display notification \"$msg\" with title \"WhatsApp agent receiving nothing\" sound name \"Funk\"" 2>/dev/null || true
+		fi
+		echo "$now" >"$INBOUND_ALERT_FILE"
+	fi
+else
+	rm -f "$INBOUND_ALERT_FILE"
 fi
 
 # ── Dead-pane detection ──
