@@ -87,6 +87,7 @@ const INBOX_DIR = join(STATE_DIR, "inbox");
 const ENV_FILE = join(STATE_DIR, ".env");
 const GROUPS_DIR = join(STATE_DIR, "groups");
 const LID_MAP_FILE = join(STATE_DIR, "lid-map.json");
+const DIAG_LOG = join(STATE_DIR, "diag.log");
 const CONTACTS_FILE = join(STATE_DIR, "contacts.json");
 const GROUPS_META_FILE = join(STATE_DIR, "groups-meta.json");
 const DM_ACTIVITY_FILE = join(STATE_DIR, "dm-activity.json");
@@ -144,6 +145,33 @@ const SERVER_NAME = ACCOUNT_NAME ? `whatsapp-${ACCOUNT_NAME}` : "whatsapp";
 const LOG_PREFIX = ACCOUNT_NAME
   ? `whatsapp[${ACCOUNT_NAME}]`
   : "whatsapp channel";
+
+// Diagnostics have to reach a FILE, not just stderr: an MCP client captures a
+// server's stderr only while it is starting up (verified on Claude Code
+// 2026-08-22), so every line written after the handshake — dropped inbound,
+// handler errors, Baileys warnings — went nowhere. A 2026-08-22 outage where
+// group messages silently stopped arriving was undiagnosable for 20h for
+// exactly this reason. Keep writing to stderr too: standalone runs and the
+// startup window still show up there.
+const DIAG_MAX_BYTES = 20_000_000;
+// A server refused by the singleton lock must keep its hands off the shared
+// state dir, so the file half stays off until this process owns the lock.
+// Everything before that point is startup, which the client does capture.
+let diagFileEnabled = false;
+
+function logDiag(line: string): void {
+  process.stderr.write(line);
+  if (!diagFileEnabled) return;
+  try {
+    if (existsSync(DIAG_LOG) && statSync(DIAG_LOG).size > DIAG_MAX_BYTES)
+      writeFileSync(DIAG_LOG, "", { mode: 0o600 });
+    appendFileSync(DIAG_LOG, `${new Date().toISOString()} ${line}`, {
+      mode: 0o600,
+    });
+  } catch {
+    // Never let logging break the pipeline it is there to explain.
+  }
+}
 
 mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
 mkdirSync(INBOX_DIR, { recursive: true });
@@ -220,7 +248,7 @@ function acquireSingletonLock(quiet = false): LockHolder | null {
   let myStart = processStartTime(process.pid);
   if (myStart === undefined) myStart = processStartTime(process.pid); // one retry
   if (myStart === undefined && !quiet) {
-    process.stderr.write(
+    logDiag(
       `${LOG_PREFIX}: could not read own start time; lock will be written without one\n`,
     );
   }
@@ -270,7 +298,7 @@ function acquireSingletonLock(quiet = false): LockHolder | null {
           (lockedStart !== "" && currentStart === lockedStart))
       ) {
         if (!quiet) {
-          process.stderr.write(
+          logDiag(
             `${LOG_PREFIX}: another whatsapp server is already running (pid ${otherPid}). ` +
               `Not connecting — duplicate instances kick each other off Baileys. ` +
               `Lock file: ${LOCK_FILE}\n`,
@@ -286,7 +314,7 @@ function acquireSingletonLock(quiet = false): LockHolder | null {
       // deleting it now would remove a live server's lock. They are the
       // server; we go into conflict mode.
       if (!quiet) {
-        process.stderr.write(
+        logDiag(
           `${LOG_PREFIX}: lost the lock race to another starting server\n`,
         );
       }
@@ -326,6 +354,7 @@ const conflictReason = CONFLICT
 // primary exiting, never proactively, so this only ever goes false → true,
 // exactly once.
 let isPrimary = !CONFLICT;
+diagFileEnabled = isPrimary;
 
 // Written on every role transition so scripts/statusline-role.ts (a separate,
 // freshly-spawned process per render) has something to read — it cannot see
@@ -388,7 +417,7 @@ function handleIpcConnection(socket: NetSocket, token: string): void {
   let authed = false;
   let preAuthBytes = 0;
   const drop = (why: string) => {
-    process.stderr.write(`${LOG_PREFIX}: ipc: dropped connection (${why})\n`);
+    logDiag(`${LOG_PREFIX}: ipc: dropped connection (${why})\n`);
     socket.destroy(); // destroy, not end: fail closed, no half-open socket
   };
   // A peer that vanishes mid-write must not take the server down.
@@ -415,14 +444,14 @@ function handleIpcConnection(socket: NetSocket, token: string): void {
           encode({ type: "result", id: IPC_HELLO_ID, result: "ok" }),
         );
         secondarySockets.add(socket);
-        process.stderr.write(`${LOG_PREFIX}: ipc: secondary connected\n`);
+        logDiag(`${LOG_PREFIX}: ipc: secondary connected\n`);
         continue;
       }
       if (msg.type === "call") {
         // LineBuffer only checks the type tag (scripts/ipc.ts:82-85), so a
         // truncated call can arrive with no id/name.
         if (typeof msg.id !== "string" || typeof msg.name !== "string") {
-          process.stderr.write(`${LOG_PREFIX}: ipc: ignoring malformed call\n`);
+          logDiag(`${LOG_PREFIX}: ipc: ignoring malformed call\n`);
           continue;
         }
         const { id, name } = msg;
@@ -455,7 +484,7 @@ function handleIpcConnection(socket: NetSocket, token: string): void {
       }
       // A secondary is never expected to send `notify` (that's primary ->
       // secondary only, via broadcastToSecondaries) or a second `hello`.
-      process.stderr.write(
+      logDiag(
         `${LOG_PREFIX}: ipc: ignoring unexpected ${msg.type} from secondary\n`,
       );
     }
@@ -513,7 +542,7 @@ async function startIpcListener(): Promise<void> {
     // named pipe stops existing, so there is nothing stale to recover from.
     if (process.platform !== "win32" && existsSync(path)) {
       if (!isStaleSocket(await probeIpcSocket(path))) {
-        process.stderr.write(
+        logDiag(
           `${LOG_PREFIX}: ipc: ${path} is in use; continuing without an IPC listener\n`,
         );
         return;
@@ -529,7 +558,7 @@ async function startIpcListener(): Promise<void> {
     let token: string | null = null;
     const server = createServer((s) => {
       if (token === null) {
-        process.stderr.write(
+        logDiag(
           `${LOG_PREFIX}: ipc: dropped connection (listener not confirmed up)\n`,
         );
         s.destroy();
@@ -538,29 +567,27 @@ async function startIpcListener(): Promise<void> {
       handleIpcConnection(s, token);
     });
     server.on("error", (err) => {
-      process.stderr.write(`${LOG_PREFIX}: ipc: listener error: ${err}\n`);
+      logDiag(`${LOG_PREFIX}: ipc: listener error: ${err}\n`);
       ipcServer = null;
     });
     server.listen(path, () => {
       token = writeIpcToken();
-      process.stderr.write(`${LOG_PREFIX}: ipc: listening on ${path}\n`);
+      logDiag(`${LOG_PREFIX}: ipc: listening on ${path}\n`);
     });
     server.unref(); // same as every other background handle here (line 702,
     // line 1905): never the reason an orphan stays alive. Does not stop it
     // accepting connections.
     ipcServer = server;
   } catch (err) {
-    process.stderr.write(
-      `${LOG_PREFIX}: ipc: failed to start listener: ${err}\n`,
-    );
+    logDiag(`${LOG_PREFIX}: ipc: failed to start listener: ${err}\n`);
   }
 }
 
 process.on("unhandledRejection", (err) => {
-  process.stderr.write(`${LOG_PREFIX}: unhandled rejection: ${err}\n`);
+  logDiag(`${LOG_PREFIX}: unhandled rejection: ${err}\n`);
 });
 process.on("uncaughtException", (err) => {
-  process.stderr.write(`${LOG_PREFIX}: uncaught exception: ${err}\n`);
+  logDiag(`${LOG_PREFIX}: uncaught exception: ${err}\n`);
 });
 
 // ─── IPC relay (secondary) ─────────────────────────────────────────────
@@ -615,9 +642,7 @@ function connectToPrimary(
     const token = readIpcToken();
     if (!token) {
       if (!quiet) {
-        process.stderr.write(
-          `${LOG_PREFIX}: ipc: no usable token; staying in stub mode\n`,
-        );
+        logDiag(`${LOG_PREFIX}: ipc: no usable token; staying in stub mode\n`);
       }
       res(null);
       return;
@@ -655,9 +680,7 @@ function connectToPrimary(
       if (settled) return;
       settled = true;
       if (!quiet) {
-        process.stderr.write(
-          `${LOG_PREFIX}: ipc: ${why}; staying in stub mode\n`,
-        );
+        logDiag(`${LOG_PREFIX}: ipc: ${why}; staying in stub mode\n`);
       }
       s.destroy();
       res(null);
@@ -697,7 +720,7 @@ function connectToPrimary(
             continue;
           }
           void mcp.notification({ method: msg.method, params }).catch((err) => {
-            process.stderr.write(
+            logDiag(
               `${LOG_PREFIX}: ipc: failed to re-emit notification: ${err}\n`,
             );
           });
@@ -709,7 +732,7 @@ function connectToPrimary(
           settled = true;
           live = true;
           s.setTimeout(0); // idle timer would otherwise fire on a quiet session
-          process.stderr.write(`${LOG_PREFIX}: ipc: connected to primary\n`);
+          logDiag(`${LOG_PREFIX}: ipc: connected to primary\n`);
           res(relay);
           continue;
         }
@@ -765,7 +788,7 @@ let retryGen = 0;
 function onRelayLost(): void {
   if (isPrimary) return; // we closed it ourselves after promoting
   ipcRelay = null;
-  process.stderr.write(`${LOG_PREFIX}: ipc: lost the primary connection\n`);
+  logDiag(`${LOG_PREFIX}: ipc: lost the primary connection\n`);
   startRetryLoop();
 }
 
@@ -774,7 +797,7 @@ function startRetryLoop(): void {
   retrying = true;
   writeRoleFile("reconnecting");
   const gen = ++retryGen;
-  process.stderr.write(
+  logDiag(
     `${LOG_PREFIX}: ipc: no primary reachable; retrying (reconnect ` +
       `${RECONNECT_INTERVAL_MS}ms / lock ${LOCK_RETRY_INTERVAL_MS}ms)\n`,
   );
@@ -821,16 +844,14 @@ function queueLockRetry(gen: number): void {
       // Log once (deliberately not quiet-gated: a repeating FS failure is a
       // real fault, not the steady-state noise `quiet` exists to hide) and
       // keep the chain alive.
-      process.stderr.write(
+      logDiag(
         `${LOG_PREFIX}: lock retry failed (${err instanceof Error ? err.message : String(err)}); will retry\n`,
       );
       return queueLockRetry(gen);
     }
     if (won) return queueLockRetry(gen);
     retrying = false;
-    process.stderr.write(
-      `${LOG_PREFIX}: won the singleton lock; promoting to primary\n`,
-    );
+    logDiag(`${LOG_PREFIX}: won the singleton lock; promoting to primary\n`);
     void becomePrimary();
   }, LOCK_RETRY_INTERVAL_MS).unref();
 }
@@ -842,6 +863,7 @@ async function becomePrimary(): Promise<void> {
   // and a tool call arriving mid-promotion must fall through to the existing
   // `if (!sock) throw "WhatsApp not connected"` rather than the stub.
   isPrimary = true;
+  diagFileEnabled = true;
   writeRoleFile("primary");
   ipcRelay = null;
   // Primary-only background work, started once on becoming primary and never
@@ -953,7 +975,7 @@ function readAccessFile(): Access {
     try {
       renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`);
     } catch {}
-    process.stderr.write(
+    logDiag(
       `${LOG_PREFIX}: access.json is corrupt, moved aside. Starting fresh.\n`,
     );
     return defaultAccess();
@@ -964,7 +986,7 @@ const BOOT_ACCESS: Access | null = STATIC
   ? (() => {
       const a = readAccessFile();
       if (a.dmPolicy === "pairing") {
-        process.stderr.write(
+        logDiag(
           `${LOG_PREFIX}: static mode — dmPolicy "pairing" downgraded to "allowlist"\n`,
         );
         a.dmPolicy = "allowlist";
@@ -1104,7 +1126,7 @@ async function ensureLidResolved(jid: string): Promise<void> {
     const pn = await sock.signalRepository.lidMapping.getPNForLID(normalized);
     if (pn) recordLidMapping(normalized, pn);
   } catch (err) {
-    process.stderr.write(
+    logDiag(
       `${LOG_PREFIX}: active LID resolution failed for ${normalized}: ${err}\n`,
     );
   }
@@ -1525,9 +1547,7 @@ function checkApprovals(): void {
     void sock.sendMessage(senderId, { text: "Paired! Say hi to Claude." }).then(
       () => rmSync(file, { force: true }),
       (err) => {
-        process.stderr.write(
-          `${LOG_PREFIX}: failed to send approval confirm: ${err}\n`,
-        );
+        logDiag(`${LOG_PREFIX}: failed to send approval confirm: ${err}\n`);
         rmSync(file, { force: true });
       },
     );
@@ -1640,7 +1660,7 @@ let serverCrons: CronJob[] = [];
 function initServerCrons(): void {
   serverCrons = loadGroupCrons();
   if (serverCrons.length > 0) {
-    process.stderr.write(
+    logDiag(
       `${LOG_PREFIX}: loaded ${serverCrons.length} cron jobs from group configs\n`,
     );
   }
@@ -1657,7 +1677,7 @@ setInterval(() => {
     if (job.lastFired === minuteKey) continue;
     job.lastFired = minuteKey;
 
-    process.stderr.write(
+    logDiag(
       `${LOG_PREFIX}: cron firing for ${job.groupJid}: ${job.prompt.slice(0, 50)}...\n`,
     );
     mcp
@@ -1679,9 +1699,7 @@ setInterval(() => {
         },
       })
       .catch((err) => {
-        process.stderr.write(
-          `${LOG_PREFIX}: cron notification failed: ${err}\n`,
-        );
+        logDiag(`${LOG_PREFIX}: cron notification failed: ${err}\n`);
       });
   }
 }, 60_000).unref();
@@ -1834,7 +1852,7 @@ function persistMessage(entry: MessageLogEntry): void {
   try {
     appendFileSync(MESSAGE_LOG, JSON.stringify(entry) + "\n");
   } catch (err) {
-    process.stderr.write(`${LOG_PREFIX}: failed to persist message: ${err}\n`);
+    logDiag(`${LOG_PREFIX}: failed to persist message: ${err}\n`);
   }
 }
 
@@ -1857,7 +1875,7 @@ function markReplied(chat_id: string): void {
     });
     writeFileSync(MESSAGE_LOG, updated.join("\n") + "\n");
   } catch (err) {
-    process.stderr.write(`${LOG_PREFIX}: failed to mark replied: ${err}\n`);
+    logDiag(`${LOG_PREFIX}: failed to mark replied: ${err}\n`);
   }
 }
 
@@ -2128,9 +2146,7 @@ mcp.setNotificationHandler(
     const owner = access.allowFrom[0];
     if (sock && owner) {
       const sent = await sock.sendMessage(owner, { text }).catch((e) => {
-        process.stderr.write(
-          `permission_request send to ${owner} failed: ${e}\n`,
-        );
+        logDiag(`permission_request send to ${owner} failed: ${e}\n`);
         return undefined;
       });
       if (sent?.key?.id) {
@@ -2800,7 +2816,7 @@ await mcp.connect(new StdioServerTransport());
 mcpReady = true;
 for (const n of pendingSecondaryNotifications.splice(0)) {
   void mcp.notification(n).catch((err) => {
-    process.stderr.write(
+    logDiag(
       `${LOG_PREFIX}: ipc: failed to re-emit queued notification: ${err}\n`,
     );
   });
@@ -2812,7 +2828,7 @@ let shuttingDown = false;
 function shutdown(): void {
   if (shuttingDown) return;
   shuttingDown = true;
-  process.stderr.write(`${LOG_PREFIX}: shutting down\n`);
+  logDiag(`${LOG_PREFIX}: shutting down\n`);
   // Close the IPC listener BEFORE releasing the singleton lock: releasing
   // first would open a window where another process can acquire the lock
   // and start its own listener while this socket/pipe is still bound,
@@ -2876,25 +2892,44 @@ setInterval(() => {
   }
   parentMisses++;
   if (parentMisses >= 2) {
-    process.stderr.write(
+    logDiag(
       `${LOG_PREFIX}: parent process gone; shutting down orphaned server\n`,
     );
     shutdown();
   }
 }, 15_000).unref();
 
-// ─── Silent logger for Baileys ─────────────────────────────────────────
+// ─── Baileys logger ────────────────────────────────────────────────────
 
+// Baileys is the only component that can see why an inbound message never
+// became an event — a failed decryption, a retry receipt, a session being
+// rebuilt. Dropping all of that on the floor is what made the 2026-08-22
+// group-inbound outage invisible, so info and above now land in the diag log.
+// trace/debug stay off by default (trace serializes every frame); set
+// WHATSAPP_DIAG_DEBUG=1 to turn debug on while chasing something.
 const noop = () => {};
+const DIAG_DEBUG = process.env.WHATSAPP_DIAG_DEBUG === "1";
+
+const baileysLine = (lvl: string) => (a: any, b?: any) => {
+  let head: string;
+  try {
+    head = typeof a === "string" ? a : JSON.stringify(a);
+  } catch {
+    head = String(a);
+  }
+  logDiag(
+    `${LOG_PREFIX} baileys[${lvl}]: ${head}${b === undefined ? "" : ` :: ${b}`}\n`,
+  );
+};
+
 const silentLogger: any = {
-  level: "silent",
+  level: DIAG_DEBUG ? "debug" : "info",
   trace: noop,
-  debug: noop,
-  info: noop,
-  warn: noop,
-  error: (m: any) =>
-    process.stderr.write(`whatsapp channel baileys: ${JSON.stringify(m)}\n`),
-  fatal: noop,
+  debug: DIAG_DEBUG ? baileysLine("debug") : noop,
+  info: baileysLine("info"),
+  warn: baileysLine("warn"),
+  error: baileysLine("error"),
+  fatal: baileysLine("fatal"),
   child() {
     return silentLogger;
   },
@@ -2974,7 +3009,7 @@ async function transcribeCloud(
 ): Promise<string | null> {
   const apiKey = provider === "groq" ? GROQ_API_KEY : OPENAI_API_KEY;
   if (!apiKey) {
-    process.stderr.write(
+    logDiag(
       `${LOG_PREFIX}: ${provider} transcription requires ${provider === "groq" ? "GROQ_API_KEY" : "OPENAI_API_KEY"} env var\n`,
     );
     return null;
@@ -2999,7 +3034,7 @@ async function transcribeCloud(
     });
     if (!res.ok) {
       const errText = await res.text();
-      process.stderr.write(
+      logDiag(
         `${LOG_PREFIX}: ${provider} transcription failed (${res.status}): ${errText.slice(0, 500)}\n`,
       );
       return null;
@@ -3007,9 +3042,7 @@ async function transcribeCloud(
     const data = (await res.json()) as { text?: string };
     return data.text?.trim() || null;
   } catch (err) {
-    process.stderr.write(
-      `${LOG_PREFIX}: ${provider} transcription error: ${err}\n`,
-    );
+    logDiag(`${LOG_PREFIX}: ${provider} transcription error: ${err}\n`);
     return null;
   }
 }
@@ -3018,7 +3051,7 @@ function transcribeLocal(filePath: string): string | null {
   if (!existsSync(WHISPER_SCRIPT)) {
     if (!whisperMissingWarned) {
       whisperMissingWarned = true;
-      process.stderr.write(
+      logDiag(
         `${LOG_PREFIX}: whisper script missing at ${WHISPER_SCRIPT} — voice messages will be delivered untranscribed. ` +
           `See scripts/whisper-transcribe.sh for a reference.\n`,
       );
@@ -3034,9 +3067,7 @@ function transcribeLocal(filePath: string): string | null {
     });
     const trimmed = result.trim();
     if (!trimmed) {
-      process.stderr.write(
-        `${LOG_PREFIX}: whisper returned empty output for ${filePath}\n`,
-      );
+      logDiag(`${LOG_PREFIX}: whisper returned empty output for ${filePath}\n`);
       return null;
     }
     return trimmed;
@@ -3065,7 +3096,7 @@ function transcribeLocal(filePath: string): string | null {
     } else {
       parts.push(`message: ${e.message}`);
     }
-    process.stderr.write(parts.join(" | ") + "\n");
+    logDiag(parts.join(" | ") + "\n");
     return null;
   }
 }
@@ -3122,7 +3153,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
   const result = gate(remoteJid, senderJid, text, mentionedJids);
 
   if (result.action === "drop") {
-    process.stderr.write(
+    logDiag(
       `${LOG_PREFIX}: dropped inbound from ${senderJid}` +
         `${isLidUser(senderJid) ? ` (resolved: ${resolveToPhone(senderJid)})` : ""} chat=${remoteJid}\n`,
     );
@@ -3255,7 +3286,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
         writeFileSync(path, buffer);
         imagePath = path;
       } catch (err) {
-        process.stderr.write(`${LOG_PREFIX}: image download failed: ${err}\n`);
+        logDiag(`${LOG_PREFIX}: image download failed: ${err}\n`);
       }
     } else if (media.kind === "voice" || media.kind === "audio") {
       // Eager download + transcribe voice/audio messages
@@ -3287,9 +3318,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
           };
         }
       } catch (err) {
-        process.stderr.write(
-          `${LOG_PREFIX}: voice download/transcribe failed: ${err}\n`,
-        );
+        logDiag(`${LOG_PREFIX}: voice download/transcribe failed: ${err}\n`);
         attachment = {
           kind: media.kind,
           file_id: messageId,
@@ -3378,9 +3407,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
       params: notifyParams,
     })
     .catch((err) => {
-      process.stderr.write(
-        `${LOG_PREFIX}: failed to deliver inbound to Claude: ${err}\n`,
-      );
+      logDiag(`${LOG_PREFIX}: failed to deliver inbound to Claude: ${err}\n`);
     });
   broadcastToSecondaries("notifications/claude/channel", notifyParams);
 }
@@ -3433,7 +3460,7 @@ async function requestAndAnnouncePairingCode(
     `Open WhatsApp > Linked Devices > Link a Device\n` +
     `Tap "Link with phone number instead"\n` +
     `Enter the code above`;
-  process.stderr.write(`${LOG_PREFIX}: ${pairingMsg}\n`);
+  logDiag(`${LOG_PREFIX}: ${pairingMsg}\n`);
 
   // Re-registering an unchanged code is routine during pairing — only surface
   // it to the session when there is actually something new to type.
@@ -3482,7 +3509,7 @@ async function resolveWaWebVersion(): Promise<[number, number, number]> {
   // Stamp fetchedAt either way so reconnect loops don't hammer the network.
   const next = fetched ?? waVersion ?? PINNED_WA_VERSION;
   if (!waVersion || next.join(".") !== waVersion.join(".")) {
-    process.stderr.write(
+    logDiag(
       `${LOG_PREFIX}: using WA Web version ${next.join(".")} (${fetched ? "fetched" : "pinned fallback"})\n`,
     );
   }
@@ -3615,13 +3642,11 @@ async function connectWhatsApp(): Promise<void> {
       } catch (err) {
         // Will retry on next connectWhatsApp call
         if (myGeneration === pairingGeneration) pairingCodeRequested = false;
-        process.stderr.write(
-          `${LOG_PREFIX}: pairing code request failed: ${err}\n`,
-        );
+        logDiag(`${LOG_PREFIX}: pairing code request failed: ${err}\n`);
       }
     })();
   } else if (needsPairing && !PHONE_NUMBER) {
-    process.stderr.write(
+    logDiag(
       `${LOG_PREFIX}: no phone number configured for pairing code fallback.\n` +
         "  QR code pairing may not work in all runtimes (e.g. Bun).\n" +
         "  Set WHATSAPP_PHONE_NUMBER in ~/.whatsapp-channel/.env\n" +
@@ -3639,9 +3664,7 @@ async function connectWhatsApp(): Promise<void> {
         await requestAndAnnouncePairingCode(sock!);
       } catch (err) {
         if (myGeneration === pairingGeneration) pairingCodeRequested = false;
-        process.stderr.write(
-          `${LOG_PREFIX}: pairing code request failed: ${err}\n`,
-        );
+        logDiag(`${LOG_PREFIX}: pairing code request failed: ${err}\n`);
       }
     }
 
@@ -3650,7 +3673,7 @@ async function connectWhatsApp(): Promise<void> {
       pairingCodeRequested = false;
       ownJid = jidNormalizedUser(sock!.user?.id ?? "");
       const resolvedOwn = ownJid ? resolveToPhone(ownJid) : "";
-      process.stderr.write(`${LOG_PREFIX}: connected as ${ownJid}\n`);
+      logDiag(`${LOG_PREFIX}: connected as ${ownJid}\n`);
 
       // Auto-add owner to allowlist on first connection
       if (ownJid && !STATIC) {
@@ -3659,12 +3682,10 @@ async function connectWhatsApp(): Promise<void> {
           access.allowFrom.push(resolvedOwn);
           if (access.dmPolicy === "pairing" && access.allowFrom.length > 0) {
             access.dmPolicy = "allowlist";
-            process.stderr.write(
-              `${LOG_PREFIX}: auto-locked to allowlist mode\n`,
-            );
+            logDiag(`${LOG_PREFIX}: auto-locked to allowlist mode\n`);
           }
           saveAccess(access);
-          process.stderr.write(
+          logDiag(
             `${LOG_PREFIX}: auto-added owner ${resolvedOwn} to allowlist\n`,
           );
         }
@@ -3717,7 +3738,7 @@ async function connectWhatsApp(): Promise<void> {
       // regardless. skipIfRecent keeps a flaky-network reconnect storm from
       // re-fetching the full group list on every single reconnect.
       refreshGroupsMeta(sock!, { skipIfRecent: true }).catch((err) => {
-        process.stderr.write(
+        logDiag(
           `${LOG_PREFIX}: failed to warm groups-meta cache on connect: ${err}\n`,
         );
       });
@@ -3732,11 +3753,11 @@ async function connectWhatsApp(): Promise<void> {
       pairingCodeRequested = false;
       const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
       const reason = statusCode ?? "unknown";
-      process.stderr.write(`${LOG_PREFIX}: disconnected (reason: ${reason})\n`);
+      logDiag(`${LOG_PREFIX}: disconnected (reason: ${reason})\n`);
 
       if (statusCode === DisconnectReason.loggedOut) {
         // Device was unlinked — auth is invalid
-        process.stderr.write(
+        logDiag(
           `${LOG_PREFIX}: logged out — auth invalid.\n` +
             `  Run /whatsapp-claude-channel:configure reset-auth to clear and re-pair.\n`,
         );
@@ -3748,7 +3769,7 @@ async function connectWhatsApp(): Promise<void> {
       if (statusCode === 428) {
         reconnectAttempt++;
         const delay = Math.min(2000 * reconnectAttempt, 15000);
-        process.stderr.write(
+        logDiag(
           `${LOG_PREFIX}: pairing in progress, retrying in ${delay / 1000}s\n`,
         );
         setTimeout(connectWhatsApp, delay);
@@ -3762,9 +3783,7 @@ async function connectWhatsApp(): Promise<void> {
         statusCode === 440
           ? " (session conflict — another instance may be using this auth)"
           : "";
-      process.stderr.write(
-        `${LOG_PREFIX}: reconnecting in ${delay / 1000}s${detail}\n`,
-      );
+      logDiag(`${LOG_PREFIX}: reconnecting in ${delay / 1000}s${detail}\n`);
       setTimeout(connectWhatsApp, delay);
     }
   });
@@ -3772,14 +3791,23 @@ async function connectWhatsApp(): Promise<void> {
   sock.ev.on(
     "messages.upsert",
     async (ev: { messages: WAMessage[]; type: string }) => {
+      // The one line that answers "did it even get here?". JIDs only, never
+      // message text: this file is a debugging aid, not a second transcript.
+      // Logged before the notify filter so a batch dropped for arriving as
+      // "append" (offline backlog) is distinguishable from one that never came.
+      logDiag(
+        `${LOG_PREFIX}: inbound upsert type=${ev.type} n=${ev.messages.length} ` +
+          `decrypted=[${ev.messages.map((m) => (m.message ? "y" : "NULL")).join(",")}] ` +
+          `from=[${ev.messages
+            .map((m) => String(m.key?.participant ?? m.key?.remoteJid))
+            .join(",")}]\n`,
+      );
       if (ev.type !== "notify") return;
       for (const msg of ev.messages) {
         try {
           await handleMessage(msg);
         } catch (err) {
-          process.stderr.write(
-            `${LOG_PREFIX}: message handler error: ${err}\n`,
-          );
+          logDiag(`${LOG_PREFIX}: message handler error: ${err}\n`);
         }
       }
     },
@@ -3805,7 +3833,7 @@ async function connectWhatsApp(): Promise<void> {
             behavior: isApprove ? "allow" : "deny",
           },
         });
-        process.stderr.write(
+        logDiag(
           `${LOG_PREFIX}: permission ${requestId} ${isApprove ? "approved" : "denied"} via reaction ${emoji}\n`,
         );
       }
@@ -3814,16 +3842,16 @@ async function connectWhatsApp(): Promise<void> {
 }
 
 if (!CONFLICT) {
-  process.stderr.write(`${LOG_PREFIX}: starting\n`);
+  logDiag(`${LOG_PREFIX}: starting\n`);
   await becomePrimary();
 } else if (ipcRelay) {
-  process.stderr.write(
+  logDiag(
     `${LOG_PREFIX}: relaying tool calls to the primary (pid ${CONFLICT.pid})\n`,
   );
   writeRoleFile("secondary");
 } else {
   // Baileys is never touched here, so the one-connection invariant holds
   // exactly as it did when this path called process.exit(2).
-  process.stderr.write(`${LOG_PREFIX}: ${conflictReason}\n`);
+  logDiag(`${LOG_PREFIX}: ${conflictReason}\n`);
   startRetryLoop(); // Degraded, but never permanently
 }

@@ -57,6 +57,7 @@ NET_FAIL_FILE="$STATE_DIR/.watchdog-net-fail-streak"
 NET_ALERT_FILE="$STATE_DIR/.watchdog-net-alert"
 INBOUND_ALERT_FILE="$STATE_DIR/.watchdog-inbound-alert"
 INBOUND_BASELINE_FILE="$STATE_DIR/.watchdog-inbound-baseline"
+INBOUND_RESTART_FILE="$STATE_DIR/.watchdog-inbound-restart"
 # Optional: a full agent restart script (graceful /exit + relaunch), e.g. one
 # that ends with `tmux new-session -d -s whatsapp-agent ... claude ...`.
 # If absent, hard restarts fall back to a launchd kickstart.
@@ -82,9 +83,10 @@ NET_ALERT_COOLDOWN_SECS=1800             # don't re-alert an outage more than on
 # socket, so the cheap action (an alert) comes first and the expensive one (a
 # restart that costs the agent its context) waits much longer. Tune both to
 # your own rhythm — someone who messages all day can safely halve them.
-INBOUND_STALE_SECS=21600          # 6h with nothing received at all -> alert
-INBOUND_RESTART_SECS=43200        # 12h -> assume the socket is half-dead, restart
-INBOUND_ALERT_COOLDOWN_SECS=10800 # don't re-alert one-way silence more than once per 3h
+INBOUND_STALE_SECS=21600           # 6h with nothing received at all -> alert
+INBOUND_RESTART_SECS=43200         # 12h -> assume the socket is half-dead, restart
+INBOUND_ALERT_COOLDOWN_SECS=10800  # don't re-alert one-way silence more than once per 3h
+INBOUND_RESTART_BACKOFF_SECS=86400 # after one inbound restart fails, escalate instead of restarting again
 
 now=$(date +%s)
 
@@ -239,7 +241,9 @@ fi
 # ── One-way-silence detection ──
 # The failure this catches (2026-08-22): Baileys' socket stays open and keeps
 # writing creds/pre-keys, cron pushes keep firing and replies keep going out —
-# but messages.upsert never fires again, so nothing the user sends ever arrives.
+# but nothing the user sends arrives. It does not have to be the whole socket:
+# that day it was the group sender-key path alone, and DMs kept working the
+# entire time, which is why the alert below tells a human to test with a DM.
 # Every other check in this file reads green during that state. The network
 # probe passes. pending/ is empty, because an inbound message that never
 # arrives can't create a pending file. Nothing is unreplied, because a message
@@ -285,13 +289,45 @@ print(int(latest))
 	case "$last_inbound" in '' | *[!0-9]*) last_inbound=0 ;; esac
 fi
 
+# Keep the raw figure: it is the only evidence that something was genuinely
+# received, as opposed to the clock merely having been rebased.
+msg_last_inbound=$last_inbound
+
 # The baseline wins whenever it is newer: it marks the last moment we know the
 # receive path was given a fair chance (restart, or network coming back).
 [ "$inbound_baseline" -gt "$last_inbound" ] && last_inbound=$inbound_baseline
 inbound_silence=$((now - last_inbound))
 
-if [ "$inbound_silence" -ge "$INBOUND_RESTART_SECS" ]; then
+last_inbound_restart=0
+if [ -f "$INBOUND_RESTART_FILE" ]; then
+	last_inbound_restart=$(cat "$INBOUND_RESTART_FILE" 2>/dev/null || echo 0)
+	case "$last_inbound_restart" in '' | *[!0-9]*) last_inbound_restart=0 ;; esac
+fi
+
+if [ "$inbound_silence" -ge "$INBOUND_RESTART_SECS" ] &&
+	[ $((now - last_inbound_restart)) -lt $INBOUND_RESTART_BACKOFF_SECS ]; then
+	# A restart already failed to bring the receive path back — on 2026-08-22 a
+	# restart left the group path just as dead as before. Restarting again only
+	# adds downtime and rebases the baseline for another 12h, which is how that
+	# outage stayed invisible. Hand it to a human with the test that splits it.
+	last_alert=0
+	[ -f "$INBOUND_ALERT_FILE" ] && last_alert=$(cat "$INBOUND_ALERT_FILE" 2>/dev/null || echo 0)
+	case "$last_alert" in '' | *[!0-9]*) last_alert=0 ;; esac
+	if [ $((now - last_alert)) -ge $INBOUND_ALERT_COOLDOWN_SECS ]; then
+		msg="WhatsApp agent on $(hostname -s): still receiving nothing $((inbound_silence / 3600))h after a watchdog restart already failed to fix it. Not restarting again. Send it a DM: if the DM arrives but group messages do not, the group sender-key path is broken, not the socket. $STATE_DIR/diag.log shows whether anything reaches the server at all ('inbound upsert' lines)."
+		echo "[$(date -Iseconds)] INBOUND-RESTART-INEFFECTIVE: $msg"
+		if [ -x "$NOTIFY_HOOK" ]; then
+			"$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
+		elif command -v osascript >/dev/null 2>&1; then
+			osascript -e "display notification \"$msg\" with title \"WhatsApp agent still receiving nothing\" sound name \"Funk\"" 2>/dev/null || true
+		fi
+		echo "$now" >"$INBOUND_ALERT_FILE"
+	fi
+elif [ "$inbound_silence" -ge "$INBOUND_RESTART_SECS" ]; then
 	if hard_restart "nothing received for $((inbound_silence / 3600))h — inbound path presumed dead"; then
+		# Remembered so the branch above can tell "first attempt" from "that
+		# did not work". Cleared as soon as anything is received again.
+		echo "$now" >"$INBOUND_RESTART_FILE"
 		exit 0
 	fi
 elif [ "$inbound_silence" -ge "$INBOUND_STALE_SECS" ]; then
@@ -299,7 +335,7 @@ elif [ "$inbound_silence" -ge "$INBOUND_STALE_SECS" ]; then
 	[ -f "$INBOUND_ALERT_FILE" ] && last_alert=$(cat "$INBOUND_ALERT_FILE" 2>/dev/null || echo 0)
 	case "$last_alert" in '' | *[!0-9]*) last_alert=0 ;; esac
 	if [ $((now - last_alert)) -ge $INBOUND_ALERT_COOLDOWN_SECS ]; then
-		msg="WhatsApp agent on $(hostname -s) has received nothing for $((inbound_silence / 3600))h while still sending fine. Either it has been quiet or the Baileys socket is half-dead (open, sending, never receiving). Send it a message: if no reply arrives, it will auto-restart at ${INBOUND_RESTART_SECS}s of silence."
+		msg="WhatsApp agent on $(hostname -s) has received nothing for $((inbound_silence / 3600))h while still sending fine. Either it has been quiet or the receive path is dead. Test it with a DM first, then a group message — a DM that arrives while groups stay silent means the group sender-key path, not the socket. It auto-restarts once at ${INBOUND_RESTART_SECS}s of silence."
 		echo "[$(date -Iseconds)] INBOUND-SILENT-ALERT: $msg"
 		if [ -x "$NOTIFY_HOOK" ]; then
 			"$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
@@ -310,6 +346,12 @@ elif [ "$inbound_silence" -ge "$INBOUND_STALE_SECS" ]; then
 	fi
 else
 	rm -f "$INBOUND_ALERT_FILE"
+	# Only a genuinely received message retires the "a restart did not fix it"
+	# marker. A restart rebases the baseline, so silence looks like zero on the
+	# very next run — clearing the marker here unconditionally would erase it
+	# before it could ever be read, and the agent would restart-loop in silence.
+	[ "$msg_last_inbound" -gt "$last_inbound_restart" ] &&
+		rm -f "$INBOUND_RESTART_FILE"
 fi
 
 # ── Dead-pane detection ──
