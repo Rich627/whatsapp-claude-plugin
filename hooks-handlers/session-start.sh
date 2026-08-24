@@ -2,7 +2,7 @@
 
 # WhatsApp channel onboarding — checks setup state and guides user through next steps.
 
-STATE_DIR="${HOME}/.whatsapp-channel"
+STATE_DIR="${WHATSAPP_STATE_DIR:-${HOME}/.whatsapp-channel}"
 ENV_FILE="${STATE_DIR}/.env"
 AUTH_CREDS="${STATE_DIR}/.baileys_auth/creds.json"
 ACCESS_FILE="${STATE_DIR}/access.json"
@@ -20,11 +20,23 @@ if [ -f "$ENV_FILE" ] && grep -q 'WHATSAPP_PHONE_NUMBER=' "$ENV_FILE" 2>/dev/nul
 	has_phone=true
 fi
 
-if [ -f "$AUTH_CREDS" ] && grep -q '"registered":true' "$AUTH_CREDS" 2>/dev/null; then
+# Both JSON files are written pretty-printed (JSON.stringify with indent by
+# server.ts/scripts/access.ts; Baileys may do either), so a pattern must not
+# assume compact "key":value spacing — strip all whitespace before matching.
+# Grepping the file directly only ever matched compact JSON, which left
+# has_contacts false on every current install and buried the fully-configured
+# branch (and the update notice) below.
+json_has() {
+	local flat
+	flat="$(tr -d '[:space:]' <"${1}" 2>/dev/null)" || return 1
+	grep -q "${2}" <<<"${flat}"
+}
+
+if [[ -f ${AUTH_CREDS} ]] && json_has "${AUTH_CREDS}" '"registered":true'; then
 	has_auth=true
 fi
 
-if [ -f "$ACCESS_FILE" ] && grep -q '"allowFrom":\[".' "$ACCESS_FILE" 2>/dev/null; then
+if [[ -f ${ACCESS_FILE} ]] && json_has "${ACCESS_FILE}" '"allowFrom":\[".'; then
 	has_contacts=true
 fi
 
