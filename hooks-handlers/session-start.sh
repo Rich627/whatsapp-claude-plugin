@@ -6,44 +6,10 @@ STATE_DIR="${HOME}/.whatsapp-channel"
 ENV_FILE="${STATE_DIR}/.env"
 AUTH_CREDS="${STATE_DIR}/.baileys_auth/creds.json"
 ACCESS_FILE="${STATE_DIR}/access.json"
-LAST_SEEN_VERSION_FILE="${STATE_DIR}/.last-seen-version"
 
-# Plugin root relative to this script's own location (not CWD), same
-# reasoning server.ts uses import.meta.dir for: correct regardless of where
-# the hook was launched from.
+# Plugin root relative to this script's own location (not CWD): correct
+# regardless of where the hook was launched from.
 PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PLUGIN_JSON="${PLUGIN_ROOT}/.claude-plugin/plugin.json"
-
-# Absolute, not "bun scripts/access.ts wizard": a marketplace install runs
-# from ~/.claude/plugins/cache/.../whatsapp-claude-channel/<version>/, where
-# the relative form resolves to nothing. Quoted for install paths with
-# spaces; \" produces the JSON-escaped quote the heredoc below needs.
-WIZARD_CMD="bun \\\"${PLUGIN_ROOT}/scripts/access.ts\\\" wizard"
-
-# true if $1 > $2, comparing each dot-separated segment numerically (a plain
-# string compare gets "0.18.0" < "0.9.0" backwards).
-version_gt() {
-	local IFS=.
-	local -a a=($1) b=($2)
-	local i ai bi
-	for i in 0 1 2; do
-		ai="${a[i]:-0}"
-		bi="${b[i]:-0}"
-		[ "$ai" -gt "$bi" ] 2>/dev/null && return 0
-		[ "$ai" -lt "$bi" ] 2>/dev/null && return 1
-	done
-	return 1
-}
-
-# Hand-maintained: one entry per version worth telling a returning terminal
-# about (moved here from server.ts's old CHANGELOG/announceUpdateIfNeeded() —
-# a version bump is a session-start-shaped check against a file, unrelated to
-# the WhatsApp connection a role change comes from). Index-paired with
-# CHANGELOG_NOTES.
-CHANGELOG_VERSIONS=("0.18.0")
-CHANGELOG_NOTES=(
-	"- Proactive notifications: Claude now tells you about an inbound message, a role change, a pairing code, or this notice right away instead of waiting for its next natural reply. Set WHATSAPP_QUIET=1 on a terminal to turn that off.\n- There's a guided setup wizard (\`${WIZARD_CMD}\`) that shows a checkbox screen of your most recently active WhatsApp groups and DM contacts, so you can bulk-approve chats you already have instead of pairing them one at a time."
-)
 
 # Check setup state
 has_phone=false
@@ -70,44 +36,18 @@ elif [ "$has_auth" = false ]; then
 elif [ "$has_contacts" = false ]; then
 	msg="WhatsApp is paired but no contacts are allowlisted yet. The owner JID is auto-added on connection.\n\nIf the user needs to add other contacts:\n1. Run: /whatsapp-claude-channel:access policy pairing\n2. Have them DM the linked number\n3. Run: /whatsapp-claude-channel:access pair <code>\n4. Policy auto-locks back to allowlist after pairing"
 else
-	msg="WhatsApp channel is fully configured and ready. Paired contacts can message this session."
-
-	# One-time "what's new" notice, tracked per-account in
-	# .last-seen-version — same behavior server.ts's announceUpdateIfNeeded()
-	# used to provide, just triggered by session start instead of by the
-	# server booting. Skipped in static mode, which can't write local state
-	# (see ACCESS.md's WHATSAPP_ACCESS_MODE=static).
-	if [ "$WHATSAPP_ACCESS_MODE" != "static" ] &&
-		! { [ -f "$ENV_FILE" ] && grep -q 'WHATSAPP_ACCESS_MODE=static' "$ENV_FILE" 2>/dev/null; } &&
-		[ -f "$PLUGIN_JSON" ]; then
-		current_version="$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$PLUGIN_JSON" | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
-		last_seen=""
-		if [ -f "$LAST_SEEN_VERSION_FILE" ]; then
-			last_seen="$(cat "$LAST_SEEN_VERSION_FILE")"
-		fi
-
-		if [ -n "$current_version" ] && [ "$last_seen" != "$current_version" ]; then
-			notes=""
-			if [ -z "$last_seen" ]; then
-				# Never recorded: only the latest entry, not the whole history.
-				last_idx=$((${#CHANGELOG_VERSIONS[@]} - 1))
-				notes="${CHANGELOG_NOTES[$last_idx]}"
-			else
-				for i in "${!CHANGELOG_VERSIONS[@]}"; do
-					if version_gt "${CHANGELOG_VERSIONS[$i]}" "$last_seen"; then
-						notes="${notes:+${notes}\n}${CHANGELOG_NOTES[$i]}"
-					fi
-				done
-			fi
-
-			if [ -n "$notes" ]; then
-				from_suffix=""
-				[ -n "$last_seen" ] && from_suffix=" (from v${last_seen})"
-				msg="WhatsApp plugin updated to v${current_version}${from_suffix}.\n\nWhat's new:\n${notes}"
-				echo -n "$current_version" >"$LAST_SEEN_VERSION_FILE"
-			fi
-		fi
+	# Fully configured: check for a one-time "what's new" notice first. It
+	# prints its own complete, already-valid JSON (built with
+	# JSON.stringify, not hand-rolled here) when there's something new, and
+	# nothing otherwise — a real bun script rather than more bash so version
+	# compare and JSON escaping reuse localeCompare/JSON.stringify instead
+	# of reimplementing both (see scripts/update-notice.ts).
+	notice_json="$(bun "${PLUGIN_ROOT}/scripts/update-notice.ts" 2>/dev/null)"
+	if [ -n "$notice_json" ]; then
+		echo "$notice_json"
+		exit 0
 	fi
+	msg="WhatsApp channel is fully configured and ready. Paired contacts can message this session."
 fi
 
 cat <<EOF

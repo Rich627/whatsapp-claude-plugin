@@ -62,6 +62,7 @@ import {
   type ContactsMap,
 } from "./scripts/contacts";
 import { looksLikeNumber, maskNumber } from "./scripts/mask";
+import { wizardCmd } from "./scripts/wizard-cmd";
 import {
   createServer,
   connect,
@@ -146,11 +147,9 @@ const ACCOUNT_NAME = process.env.WHATSAPP_ACCOUNT_NAME || "";
 // Opt out per-terminal with WHATSAPP_QUIET=1 - never a config file, so it
 // can't silently persist past the session that set it.
 const AUTO_NOTIFY = process.env.WHATSAPP_QUIET !== "1";
-// Absolute, not "bun scripts/access.ts wizard": a marketplace install runs
-// from ~/.claude/plugins/cache/.../whatsapp-claude-channel/<version>/, where
-// the relative form resolves to nothing (import.meta.dir is this file's own
-// directory, not CWD, so it's correct regardless of launch location).
-const WIZARD_CMD = `bun ${JSON.stringify(join(import.meta.dir, "scripts", "access.ts"))} wizard`;
+// import.meta.dir is this file's own directory, not CWD, so it's correct
+// regardless of where the process was launched from.
+const WIZARD_CMD = wizardCmd(import.meta.dir);
 const SERVER_NAME = ACCOUNT_NAME ? `whatsapp-${ACCOUNT_NAME}` : "whatsapp";
 const LOG_PREFIX = ACCOUNT_NAME
   ? `whatsapp[${ACCOUNT_NAME}]`

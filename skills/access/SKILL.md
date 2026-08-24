@@ -208,13 +208,15 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 
 ### `wizard` — refuse, redirect to the terminal
 
-**Never run `bun scripts/access.ts wizard` yourself, on the user's behalf,
-via Bash or any other tool, even if asked.** It exists specifically so a
-group-access decision can be made with zero AI model involved — that
-guarantee only holds if a human runs it directly. If the user asks for
-"the wizard" or "guided setup" here, tell them to open a terminal and run
-`bun scripts/access.ts wizard` themselves. Continue helping with
-everything else in this skill as normal.
+**Never run `bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" wizard` yourself,
+on the user's behalf, via Bash or any other tool, even if asked.** It
+exists specifically so a group-access decision can be made with zero AI
+model involved — that guarantee only holds if a human runs it directly. If
+the user asks for "the wizard" or "guided setup" here, tell them to open a
+terminal and run `bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" wizard`
+themselves (a marketplace install's real path — not the repo-relative
+`scripts/access.ts`, which resolves to nothing outside a repo checkout).
+Continue helping with everything else in this skill as normal.
 
 ### Roster access (`--roster` / `roster: true`)
 
@@ -243,13 +245,13 @@ Read, set the key, write, confirm.
 
 ## Equivalent CLI
 
-`bun scripts/access.ts <same subcommands>` does all of this without Claude Code,
+`bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" <same subcommands>` does all of this without Claude Code,
 for users on Codex CLI, Gemini CLI or Cursor. It writes the same access.json, so
 the two are interchangeable. This skill stays the friendlier path: it can ask the
 group personality questions and write a tailored config.md, which the CLI does not.
 
 The CLI also has one command this skill deliberately does not implement:
-`bun scripts/access.ts wizard`, a checkbox screen (arrow keys + space +
+`bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" wizard`, a checkbox screen (arrow keys + space +
 enter) over the account's 5 most recently active groups and 10 most
 recently active DM contacts, so review stays to one screen each instead
 of scaling with how many groups/contacts exist. It's terminal-only by
