@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   contactKeyFor,
+  listConfiguredDms,
+  listConfiguredGroups,
   normalizeJid,
   rankDms,
   rankGroups,
@@ -238,5 +240,141 @@ describe("rankDms", () => {
       "c@s.whatsapp.net": 3,
     };
     expect(rankDms(activity, {}, [], {}, 2)).toHaveLength(2);
+  });
+});
+
+describe("listConfiguredGroups", () => {
+  test("empty state: no configured groups", () => {
+    expect(listConfiguredGroups({}, {})).toEqual([]);
+  });
+
+  test("empty state: meta alone is not configuration", () => {
+    const meta = { "a@g.us": group() };
+    expect(listConfiguredGroups({}, meta)).toEqual([]);
+  });
+
+  test("normal case: label matches rankGroups' exact format", () => {
+    const groups = { "a@g.us": {}, "b@g.us": {} };
+    const meta = {
+      "a@g.us": group({ name: "Alpha", memberCount: 6 }),
+      "b@g.us": group({ name: "Bravo", memberCount: 3 }),
+    };
+    const result = listConfiguredGroups(groups, meta);
+    expect(result.find((c) => c.jid === "a@g.us")?.label).toBe(
+      "Alpha  (6 member(s))",
+    );
+    expect(result.find((c) => c.jid === "b@g.us")?.label).toBe(
+      "Bravo  (3 member(s))",
+    );
+  });
+
+  test("sorted alphabetically regardless of insertion order", () => {
+    const groups = { "b@g.us": {}, "a@g.us": {} };
+    const meta = {
+      "b@g.us": group({ name: "Bravo" }),
+      "a@g.us": group({ name: "Alpha" }),
+    };
+    const result = listConfiguredGroups(groups, meta);
+    expect(result.map((c) => c.label)).toEqual([
+      "Alpha  (1 member(s))",
+      "Bravo  (1 member(s))",
+    ]);
+  });
+
+  test("an archived configured group is still listed, with the [archived] tag", () => {
+    const groups = { "a@g.us": {} };
+    const meta = { "a@g.us": group({ name: "Alpha", archived: true }) };
+    const result = listConfiguredGroups(groups, meta);
+    expect(result).toEqual([
+      { jid: "a@g.us", label: "Alpha  (1 member(s))  [archived]" },
+    ]);
+  });
+
+  test("a configured JID with no meta entry is listed with the raw JID as its label", () => {
+    const groups = { "unknown@g.us": {} };
+    const result = listConfiguredGroups(groups, {});
+    expect(result).toEqual([{ jid: "unknown@g.us", label: "unknown@g.us" }]);
+  });
+
+  test("a meta entry that is not configured is absent from the result", () => {
+    const groups = { "a@g.us": {} };
+    const meta = {
+      "a@g.us": group({ name: "Alpha" }),
+      "b@g.us": group({ name: "Bravo" }),
+    };
+    const result = listConfiguredGroups(groups, meta);
+    expect(result.map((c) => c.jid)).toEqual(["a@g.us"]);
+  });
+});
+
+describe("listConfiguredDms", () => {
+  test("empty state", () => {
+    expect(listConfiguredDms([], {}, {})).toEqual([]);
+  });
+
+  test("saved .name shown plain", () => {
+    const contacts: ContactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
+    const result = listConfiguredDms(["x@s.whatsapp.net"], contacts, {});
+    expect(result).toEqual([{ jid: "x@s.whatsapp.net", label: "Akash" }]);
+  });
+
+  test(".notify-only shows unverified paired with the masked number", () => {
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { notify: "Mum" },
+    };
+    const result = listConfiguredDms(
+      ["61403911675@s.whatsapp.net"],
+      contacts,
+      {},
+    );
+    expect(result).toEqual([
+      {
+        jid: "61403911675@s.whatsapp.net",
+        label: "Mum (unverified) - •••••1675",
+      },
+    ]);
+  });
+
+  test("number-shaped .notify is masked only", () => {
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { notify: "61403911675" },
+    };
+    const result = listConfiguredDms(
+      ["61403911675@s.whatsapp.net"],
+      contacts,
+      {},
+    );
+    expect(result).toEqual([
+      { jid: "61403911675@s.whatsapp.net", label: "•••••1675" },
+    ]);
+  });
+
+  test("no contact entry at all is masked only", () => {
+    const result = listConfiguredDms(["61403911675@s.whatsapp.net"], {}, {});
+    expect(result).toEqual([
+      { jid: "61403911675@s.whatsapp.net", label: "•••••1675" },
+    ]);
+  });
+
+  test("LID handling: label comes from the phone-keyed contact, jid stays the original @lid string", () => {
+    const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Akash" },
+    };
+    const result = listConfiguredDms(["184710990000999@lid"], contacts, lidMap);
+    expect(result).toEqual([{ jid: "184710990000999@lid", label: "Akash" }]);
+  });
+
+  test("sorted alphabetically by label regardless of allowFrom order", () => {
+    const contacts: ContactsMap = {
+      "b@s.whatsapp.net": { name: "Bravo" },
+      "a@s.whatsapp.net": { name: "Alpha" },
+    };
+    const result = listConfiguredDms(
+      ["b@s.whatsapp.net", "a@s.whatsapp.net"],
+      contacts,
+      {},
+    );
+    expect(result.map((c) => c.label)).toEqual(["Alpha", "Bravo"]);
   });
 });

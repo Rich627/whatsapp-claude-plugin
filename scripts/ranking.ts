@@ -44,6 +44,12 @@ export function contactKeyFor(
   return normalizeJid(lidMap[normalized] ?? normalized);
 }
 
+// Shared by rankGroups and listConfiguredGroups so the label format can
+// never drift between "what's new" and "what's already on".
+function groupLabel(g: GroupMeta): string {
+  return `${g.name}  (${g.memberCount} member(s))${g.archived ? "  [archived]" : ""}`;
+}
+
 // Same recency signal WhatsApp's own app sorts its chat list by
 // (conversationTimestamp, tracked into groupsMeta by server.ts - see
 // applyChatActivity there). Undefined/never-seen activity sorts last,
@@ -63,10 +69,21 @@ export function rankGroups(
       return diff !== 0 ? diff : x.name.localeCompare(y.name);
     })
     .slice(0, limit)
-    .map(([jid, g]) => ({
-      jid,
-      label: `${g.name}  (${g.memberCount} member(s))${g.archived ? "  [archived]" : ""}`,
-    }));
+    .map(([jid, g]) => ({ jid, label: groupLabel(g) }));
+}
+
+// Every group already in access.json's groups map, not just the top N new
+// ones - this is "what's already on" for a revoke screen, so no recency
+// sort, no archive filter and no limit (see listConfiguredGroups/manage in
+// skills/access/SKILL.md). A configured group with no meta.json entry still
+// has to appear (falls back to the raw JID) or it becomes unrevokable.
+export function listConfiguredGroups(
+  groups: Readonly<Record<string, unknown>>,
+  meta: Record<string, GroupMeta>,
+): Candidate[] {
+  return Object.keys(groups)
+    .map((jid) => ({ jid, label: meta[jid] ? groupLabel(meta[jid]) : jid }))
+    .sort((a, b) => a.label.localeCompare(b.label));
 }
 
 // A candidate is only ever a chat with real activity (dmActivity is only
@@ -86,7 +103,20 @@ export function rankGroups(
 // identically to an actually-saved contact. A `.name` entry only exists
 // because the account owner saved it themselves, so it's shown plain; a
 // `.notify`-only entry is marked unverified and paired with the masked
-// number, so approving it is a visibly different decision.
+// number, so approving it is a visibly different decision. Shared by
+// rankDms and listConfiguredDms below via dmLabel.
+function dmLabel(contacts: ContactsMap, key: string): string {
+  const entry = contacts[key];
+  const masked = maskNumber(key);
+  if (entry?.name && !looksLikeNumber(entry.name)) return entry.name;
+  if (entry?.notify && !looksLikeNumber(entry.notify)) {
+    return `${entry.notify} (unverified) - ${masked}`;
+  }
+  return masked;
+}
+
+// See dmLabel above for why a `.notify`-only label is marked unverified
+// rather than shown like a saved name.
 export function rankDms(
   activity: Record<string, number>,
   contacts: ContactsMap,
@@ -101,15 +131,28 @@ export function rankDms(
     .filter(([jid]) => !alreadyAllowed.has(jid))
     .sort(([, a], [, b]) => b - a)
     .slice(0, limit)
-    .map(([jid]) => {
-      const entry = contacts[jid];
-      const masked = maskNumber(jid);
-      if (entry?.name && !looksLikeNumber(entry.name)) {
-        return { jid, label: entry.name };
-      }
-      if (entry?.notify && !looksLikeNumber(entry.notify)) {
-        return { jid, label: `${entry.notify} (unverified) - ${masked}` };
-      }
-      return { jid, label: masked };
-    });
+    .map(([jid]) => ({ jid, label: dmLabel(contacts, jid) }));
+}
+
+// Every DM contact already in allowFrom, not just the top N new ones - the
+// revoke-screen counterpart to listConfiguredGroups. One candidate per
+// allowFrom entry, no filtering, no dedupe: if both a @lid and a phone form
+// of the same contact are allowlisted, they are two separate revokable
+// strings and both must appear.
+export function listConfiguredDms(
+  allowFrom: readonly string[],
+  contacts: ContactsMap,
+  lidMap: Record<string, string>,
+): Candidate[] {
+  return allowFrom
+    .map((jid) => {
+      const key = contactKeyFor(lidMap, jid);
+      // Candidate.jid stays the original, unresolved allowFrom string
+      // (not the LID-resolved key used for the label lookup): revoke
+      // filters allowFrom by exact string match, so returning the
+      // resolved key here would silently fail to remove a @lid-form
+      // entry.
+      return { jid, label: dmLabel(contacts, key) };
+    })
+    .sort((a, b) => a.label.localeCompare(b.label));
 }
