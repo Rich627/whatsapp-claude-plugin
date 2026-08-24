@@ -7,6 +7,10 @@ ENV_FILE="${STATE_DIR}/.env"
 AUTH_CREDS="${STATE_DIR}/.baileys_auth/creds.json"
 ACCESS_FILE="${STATE_DIR}/access.json"
 
+# Plugin root relative to this script's own location (not CWD): correct
+# regardless of where the hook was launched from.
+PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 # Check setup state
 has_phone=false
 has_auth=false
@@ -32,6 +36,17 @@ elif [ "$has_auth" = false ]; then
 elif [ "$has_contacts" = false ]; then
 	msg="WhatsApp is paired but no contacts are allowlisted yet. The owner JID is auto-added on connection.\n\nIf the user needs to add other contacts:\n1. Run: /whatsapp-claude-channel:access policy pairing\n2. Have them DM the linked number\n3. Run: /whatsapp-claude-channel:access pair <code>\n4. Policy auto-locks back to allowlist after pairing"
 else
+	# Fully configured: check for a one-time "what's new" notice first. It
+	# prints its own complete, already-valid JSON (built with
+	# JSON.stringify, not hand-rolled here) when there's something new, and
+	# nothing otherwise — a real bun script rather than more bash so version
+	# compare and JSON escaping reuse localeCompare/JSON.stringify instead
+	# of reimplementing both (see scripts/update-notice.ts).
+	notice_json="$(bun "${PLUGIN_ROOT}/scripts/update-notice.ts" 2>/dev/null)"
+	if [[ -n ${notice_json} ]]; then
+		echo "${notice_json}"
+		exit 0
+	fi
 	msg="WhatsApp channel is fully configured and ready. Paired contacts can message this session."
 fi
 

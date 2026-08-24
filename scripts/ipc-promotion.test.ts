@@ -51,7 +51,10 @@ type Rig = {
 // real number here would fire a real pairing-code request against the
 // developer's own WhatsApp account. The temp WHATSAPP_STATE_DIR has no
 // Baileys auth state, so it can only sit unpaired.
-async function startSecondaryRig(dirPrefix: string): Promise<Rig> {
+async function startSecondaryRig(
+  dirPrefix: string,
+  extraEnv: Record<string, string> = {},
+): Promise<Rig> {
   const dir = mkdtempSync(join(tmpdir(), dirPrefix));
   const token = "a".repeat(64);
   writeFileSync(join(dir, ".ipc-token"), token + "\n", { mode: 0o600 });
@@ -67,6 +70,7 @@ async function startSecondaryRig(dirPrefix: string): Promise<Rig> {
       WHATSAPP_STATE_DIR: dir,
       WHATSAPP_PHONE_NUMBER: "",
       WHATSAPP_ACCOUNT_NAME: "",
+      ...extraEnv,
     },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
@@ -143,6 +147,24 @@ function listTools(rig: Rig): number {
 }
 
 describe("ipc promotion/degradation (secondary)", () => {
+  // Regression: the initial role a process boots into isn't a "change" from
+  // anything (server.ts's pastInitialRole flag) - only announce from the
+  // second writeRoleFile() call on, i.e. a real transition. A prior version
+  // of this fix only special-cased the primary startup branch and missed the
+  // secondary one (this rig's own boot path), which kept firing "now a
+  // secondary" on every ordinary secondary startup.
+  test("boots as a secondary without announcing the initial role", async () => {
+    const rig = await startSecondaryRig("wa-promo-quiet-boot-");
+    try {
+      expect(rig.stdout()).not.toContain("This terminal is now a secondary");
+    } finally {
+      rig.child.kill();
+      try {
+        rig.primary.close();
+      } catch {}
+    }
+  }, 30_000);
+
   test("degrades when the primary vanishes and the lock is unwinnable", async () => {
     const rig = await startSecondaryRig("wa-promo-degrade-");
     try {
@@ -164,6 +186,21 @@ describe("ipc promotion/degradation (secondary)", () => {
         await waitFor(
           () => rig.stderr().includes("no primary reachable; retrying"),
           40,
+          250,
+        ),
+      ).toBe(true);
+
+      // AUTO_NOTIFY (default on): a real disconnect (onRelayLost) writes the
+      // "reconnecting" role with everConnected=true, so the wording is the
+      // past-tense "lost" variant, not the degraded-startup "couldn't reach".
+      expect(
+        await waitFor(
+          () =>
+            rig
+              .stdout()
+              .includes("Lost the primary WhatsApp connection; retrying.") &&
+            rig.stdout().includes("notifications/claude/channel"),
+          20,
           250,
         ),
       ).toBe(true);
@@ -224,6 +261,11 @@ describe("ipc promotion/degradation (secondary)", () => {
         250,
       );
 
+      // Snapshot stdout *before* the reconnect so the notification check
+      // below can't be satisfied by the initial-boot "secondary" notification
+      // startSecondaryRig() already triggered — it must be the reconnect's own.
+      const beforeReconnect = rig.stdout().length;
+
       // A restarted primary writes a fresh token and rebinds the socket path
       // (unlink first on non-win32, matching startIpcListener()'s own
       // stale-socket handling).
@@ -244,6 +286,20 @@ describe("ipc promotion/degradation (secondary)", () => {
                 .split("ipc: connected to primary").length;
               return matches - 1 >= 2; // second occurrence = the reconnect
             },
+            20,
+            250,
+          ),
+        ).toBe(true);
+
+        // The reconnect restores the "secondary" role — writeRoleFile("secondary")
+        // in queueReconnect() — which fires its own AUTO_NOTIFY notification.
+        expect(
+          await waitFor(
+            () =>
+              rig
+                .stdout()
+                .slice(beforeReconnect)
+                .includes("This terminal is now a secondary"),
             20,
             250,
           ),
@@ -434,6 +490,38 @@ describe("ipc promotion/degradation (secondary)", () => {
       ).toBe(true);
       const tokenAfter = readFileSync(join(rig.dir, ".ipc-token"), "utf8");
       expect(tokenAfter).not.toBe(tokenBefore);
+
+      // writeRoleFile("primary") on promotion fires the AUTO_NOTIFY notification.
+      expect(
+        rig
+          .stdout()
+          .includes("This terminal is now the primary WhatsApp connection."),
+      ).toBe(true);
+    } finally {
+      rig.child.kill();
+      try {
+        rig.primary.close();
+      } catch {}
+    }
+  }, 60_000);
+
+  test("WHATSAPP_QUIET=1 suppresses the role-change notification", async () => {
+    const rig = await startSecondaryRig("wa-promo-quiet-", {
+      WHATSAPP_QUIET: "1",
+    });
+    try {
+      rig.primary.close();
+      expect(
+        await waitFor(
+          () => rig.stderr().includes("no primary reachable; retrying"),
+          40,
+          250,
+        ),
+      ).toBe(true);
+      // Give the (suppressed) notification the same window the "on" test
+      // above uses, then assert it never showed up on stdout.
+      await sleep(1_000);
+      expect(rig.stdout()).not.toContain("notifications/claude/channel");
     } finally {
       rig.child.kill();
       try {
