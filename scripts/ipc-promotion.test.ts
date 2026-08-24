@@ -54,12 +54,8 @@ type Rig = {
 async function startSecondaryRig(
   dirPrefix: string,
   extraEnv: Record<string, string> = {},
-  lastSeenVersion?: string,
 ): Promise<Rig> {
   const dir = mkdtempSync(join(tmpdir(), dirPrefix));
-  if (lastSeenVersion !== undefined) {
-    writeFileSync(join(dir, ".last-seen-version"), lastSeenVersion);
-  }
   const token = "a".repeat(64);
   writeFileSync(join(dir, ".ipc-token"), token + "\n", { mode: 0o600 });
   writeFileSync(
@@ -160,9 +156,6 @@ describe("ipc promotion/degradation (secondary)", () => {
   test("boots as a secondary without announcing the initial role", async () => {
     const rig = await startSecondaryRig("wa-promo-quiet-boot-");
     try {
-      // Not a blanket "no notification at all": a fresh temp state dir also
-      // has no .last-seen-version, so announceUpdateIfNeeded() legitimately
-      // fires its own (unrelated) one-time notice on this same boot.
       expect(rig.stdout()).not.toContain("This terminal is now a secondary");
     } finally {
       rig.child.kill();
@@ -536,74 +529,4 @@ describe("ipc promotion/degradation (secondary)", () => {
       } catch {}
     }
   }, 60_000);
-});
-
-const PLUGIN_VERSION: string = JSON.parse(
-  readFileSync(
-    join(import.meta.dir, "..", ".claude-plugin", "plugin.json"),
-    "utf8",
-  ),
-).version;
-
-describe("update notice (announceUpdateIfNeeded)", () => {
-  // "0.9.0" is deliberately not "0.1.0": versionGt() must compare
-  // numerically ("0.18.0" > "0.9.0"), not as strings (where "0.18.0" <
-  // "0.9.0" because "1" < "9"). A naive string compare would wrongly treat
-  // 0.9.0 as newer and skip the notice entirely.
-  test("announces once when the recorded version is older", async () => {
-    const rig = await startSecondaryRig("wa-promo-update-old-", {}, "0.9.0");
-    try {
-      expect(
-        await waitFor(
-          () =>
-            rig
-              .stdout()
-              .includes(
-                `WhatsApp plugin updated to v${PLUGIN_VERSION} (from v0.9.0)`,
-              ),
-          20,
-          250,
-        ),
-      ).toBe(true);
-      // The point of this notice for an already-paired user is that it
-      // actually tells them the wizard exists and how to run it - a header
-      // line alone doesn't verify that; the CHANGELOG note text must be in
-      // what they're shown, not just tracked internally.
-      expect(rig.stdout()).toContain("bun scripts/access.ts wizard");
-      expect(
-        await waitFor(
-          () =>
-            readFileSync(join(rig.dir, ".last-seen-version"), "utf8") ===
-            PLUGIN_VERSION,
-          20,
-          250,
-        ),
-      ).toBe(true);
-    } finally {
-      rig.child.kill();
-      try {
-        rig.primary.close();
-      } catch {}
-    }
-  }, 30_000);
-
-  test("stays quiet when the recorded version already matches", async () => {
-    const rig = await startSecondaryRig(
-      "wa-promo-update-current-",
-      {},
-      PLUGIN_VERSION,
-    );
-    try {
-      // Same settle-then-assert-absence shape as the WHATSAPP_QUIET test
-      // above: a bare check right after startup can't tell "never fires"
-      // from "fires a moment late".
-      await sleep(1_000);
-      expect(rig.stdout()).not.toContain("WhatsApp plugin updated to v");
-    } finally {
-      rig.child.kill();
-      try {
-        rig.primary.close();
-      } catch {}
-    }
-  }, 30_000);
 });
