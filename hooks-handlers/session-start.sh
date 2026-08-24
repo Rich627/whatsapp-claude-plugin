@@ -43,8 +43,8 @@ else
 	# compare and JSON escaping reuse localeCompare/JSON.stringify instead
 	# of reimplementing both (see scripts/update-notice.ts).
 	notice_json="$(bun "${PLUGIN_ROOT}/scripts/update-notice.ts" 2>/dev/null)"
-	if [ -n "$notice_json" ]; then
-		echo "$notice_json"
+	if [[ -n "${notice_json}" ]]; then
+		echo "${notice_json}"
 		exit 0
 	fi
 	msg="WhatsApp channel is fully configured and ready. Paired contacts can message this session."
