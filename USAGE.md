@@ -234,16 +234,24 @@ glance which terminal holds the real connection:
 }
 ```
 
-It finds the server in three steps. A statusLine setting is a compound
-command, so the script runs under a shell that the CLI spawned separately
-from the plugin - a sibling of what it is looking for, not a descendant.
-So it first climbs the parent chain (a few hops) to the CLI that owns this
-terminal, then looks for the plugin's own wrapper process among that CLI's
-descendants, then `server.ts` among that wrapper's children. Several
-processes can carry the plugin dir name in their command line, including
-the statusline shell itself, so every wrapper candidate is tried and the
-one with a `server.ts` under it wins. Same-machine, read-only, never throws:
-a miss just means no segment, not a broken statusline.
+Each server records which Claude Code session owns it, so the segment reads
+ownership rather than guessing at it: the script climbs its own parent chain
+a few hops and takes the role file stamped with one of those pids. Another
+terminal's server can never match, and a leftover file from a dead session
+cannot either, since a dead process is nobody's parent.
+
+A server started before this shipped, or one whose client does not identify
+itself, has no stamp. For those the script falls back to the process tree:
+climb to the CLI that owns this terminal (a statusLine setting is a compound
+command, so the script runs under a shell that is the plugin's sibling, not
+its parent), find the plugin's wrapper among that CLI's descendants, then
+`server.ts` under the wrapper. Several processes can carry the plugin dir
+name - the statusline shell itself does - so every candidate is tried and
+the one with a `server.ts` under it wins. Restarting the session upgrades it
+to the stamped path.
+
+Same-machine, read-only, never throws: a miss just means no segment, not a
+broken statusline.
 
 ## Known limitations
 

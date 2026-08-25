@@ -381,7 +381,14 @@ function writeRoleFile(
   everConnected = false,
 ): void {
   try {
-    writeFileSync(ROLE_FILE, role);
+    // Line 1 is the role, unchanged, so any older reader keeps working.
+    // Line 2 stamps the Claude Code session that owns this server, when it
+    // told us (CLIENT_ID is CLAUDE_PID). The statusline used to infer
+    // ownership by walking the process tree, which cannot distinguish this
+    // terminal's server from a sibling terminal's once a shared ancestor is
+    // in range - it would show someone else's role as yours. Stamped, the
+    // reader just checks whether the owner is one of its own ancestors.
+    writeFileSync(ROLE_FILE, CLIENT_ID ? `${role}\n${CLIENT_ID}\n` : role);
   } catch {}
   if (pastInitialRole) notifyRoleChange(role, everConnected);
   pastInitialRole = true;

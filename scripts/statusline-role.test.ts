@@ -4,9 +4,11 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  ancestorChain,
   findServerPid,
   findServerPidForTerminal,
   formatSegment,
+  roleFromOwnerStamp,
   type ProcRow,
 } from "./statusline-role";
 
@@ -101,6 +103,35 @@ describe("end-to-end (real processes)", () => {
       },
     });
   }
+
+  // The stamped path, end to end through the real script: no wrapper and no
+  // server process exist here at all, so this can only pass by reading the
+  // owner pid out of the file. The decoy is a second terminal's server, which
+  // the process tree alone would have no way to rule out.
+  test("reads the stamped owner instead of hunting the process tree", () => {
+    const dir = freshStateDir();
+    writeFileSync(join(dir, ".role-4242"), `secondary\n${process.pid}\n`);
+    writeFileSync(join(dir, ".role-4243"), "primary\n999999\n");
+    const out = runStatusline(
+      dir,
+      process.pid,
+      "no-such-wrapper",
+      "no-such-server",
+    );
+    expect(out).toContain("WA:secondary");
+    expect(out).not.toContain("primary");
+  });
+
+  // Same fixture minus the stamp: nothing matches, and with no wrapper or
+  // server process to fall back to the script stays silent rather than
+  // picking the only file it can see.
+  test("stays silent when the only files belong to someone else", () => {
+    const dir = freshStateDir();
+    writeFileSync(join(dir, ".role-4243"), "primary\n999999\n");
+    expect(
+      runStatusline(dir, process.pid, "no-such-wrapper", "no-such-server"),
+    ).toBe("");
+  });
 
   // Spawns a real two-hop process chain (this test -> "wrapper" -> "server")
   // mirroring the real CLI -> plugin wrapper -> server.ts topology, and
@@ -359,5 +390,66 @@ describe("findServerPidForTerminal", () => {
         "server.ts",
       ),
     ).toBeNull();
+  });
+});
+
+describe("roleFromOwnerStamp", () => {
+  // The whole point: two terminals, two servers, and the only thing telling
+  // them apart is which session each server says it belongs to. The process
+  // tree cannot decide this once a shared ancestor is in range.
+  const files = [
+    { content: "primary\n100\n" },
+    { content: "secondary\n200\n" },
+  ];
+
+  test("takes the file stamped with one of our own ancestors", () => {
+    expect(roleFromOwnerStamp(files, [400, 300, 200])).toBe("secondary");
+    expect(roleFromOwnerStamp(files, [900, 100])).toBe("primary");
+  });
+
+  test("a sibling terminal's server is never ours", () => {
+    expect(roleFromOwnerStamp(files, [700, 800])).toBeNull();
+  });
+
+  test("nearest ancestor wins when a session runs inside another", () => {
+    expect(roleFromOwnerStamp(files, [200, 100])).toBe("secondary");
+  });
+
+  // A dead pid is nobody's ancestor, so a leftover file from a crashed
+  // session drops out with no liveness check of its own.
+  test("stale files from dead sessions cannot match", () => {
+    expect(
+      roleFromOwnerStamp([{ content: "primary\n999999\n" }], [1, 2]),
+    ).toBeNull();
+  });
+
+  // Pre-stamp servers write the bare role with no line 2. Unusable here on
+  // purpose - main() falls back to the tree search for exactly this case.
+  test("ignores an unstamped file rather than guessing it is ours", () => {
+    expect(roleFromOwnerStamp([{ content: "primary" }], [100])).toBeNull();
+    expect(
+      roleFromOwnerStamp([{ content: "primary\nnot-a-pid\n" }], [100]),
+    ).toBeNull();
+    expect(roleFromOwnerStamp([{ content: "" }], [100])).toBeNull();
+  });
+});
+
+describe("ancestorChain", () => {
+  const rows: ProcRow[] = [
+    { pid: 10, ppid: 1, command: "host" },
+    { pid: 20, ppid: 10, command: "claude" },
+    { pid: 30, ppid: 20, command: "shell" },
+  ];
+
+  test("lists self then parents, nearest first", () => {
+    expect(ancestorChain(rows, 30)).toEqual([30, 20, 10, 1]);
+  });
+
+  test("stops at the hop bound", () => {
+    expect(ancestorChain(rows, 30, 1)).toEqual([30, 20]);
+  });
+
+  test("stops at a pid that is not in the table", () => {
+    expect(ancestorChain(rows, 999)).toEqual([999]);
   });
 });
