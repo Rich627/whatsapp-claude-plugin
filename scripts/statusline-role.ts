@@ -28,7 +28,7 @@ const STATE_DIR =
 // name (unique across the process tree) and walks up to this script's real
 // parent, the Claude Code CLI.
 const WRAPPER_MATCH =
-  process.env.WA_STATUSLINE_WRAPPER_MATCH ?? "whatsapp-claude-channel";
+  process.env.WA_STATUSLINE_WRAPPER_MATCH ?? "whatsapp-channel";
 const SERVER_MATCH = process.env.WA_STATUSLINE_MATCH ?? "server.ts";
 const PARENT_PID = Number(process.env.WA_STATUSLINE_PARENT_PID ?? process.ppid);
 

@@ -219,7 +219,7 @@ describe("optional features", () => {
   test("watchdog absent → message points at setup for install", () => {
     const out = runDoctor(freshStateDir());
     expect(out).toContain(
-      "run /whatsapp-claude-channel:setup to install auto-recovery",
+      "run /whatsapp-channel:setup to install auto-recovery",
     );
   });
 });

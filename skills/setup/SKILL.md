@@ -34,7 +34,7 @@ Check the connection status by calling the `whatsapp_status` tool.
 
 - Tell the user the server needs to start first. They should restart Claude Code with the WhatsApp channel enabled:
   ```sh
-  claude --dangerously-load-development-channels plugin:whatsapp-claude-channel@whatsapp-claude-plugin
+  claude --dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin
   ```
   Explain that this flag is required every launch — it registers the plugin as a channel so incoming messages wake the session in real time. Without it, tools load but messages sit unanswered until something prompts Claude to check.
 
@@ -59,7 +59,7 @@ If no, skip to Phase 4.
 
 Explain the access model:
 
-> "By default, when someone DMs your WhatsApp account, they'll get a pairing code. You approve them by running `/whatsapp-claude-channel:access pair <code>` here. This prevents random people from talking to your Claude session."
+> "By default, when someone DMs your WhatsApp account, they'll get a pairing code. You approve them by running `/whatsapp-channel:access pair <code>` here. This prevents random people from talking to your Claude session."
 
 Ask:
 
@@ -95,7 +95,7 @@ Explain briefly:
 4. Verify: run the `status` subcommand again and show the user both checks pass. If the script reports a WARN about local modifications, relay it verbatim — it means their existing watchdog.sh was preserved, not replaced.
 5. If the user does not appear to be running inside tmux, remind them: start the agent as `tmux new-session -s whatsapp-agent claude` for the watchdog's nudge/restart to work.
 
-**If no:** one sentence — they can re-run `/whatsapp-claude-channel:setup` anytime to install it. If they later want failure notifications on their phone, the notify-hook option is documented in the header of `watchdog.sh`.
+**If no:** one sentence — they can re-run `/whatsapp-channel:setup` anytime to install it. If they later want failure notifications on their phone, the notify-hook option is documented in the header of `watchdog.sh`.
 
 To undo later: `bun "${CLAUDE_PLUGIN_ROOT}/scripts/install-watchdog.ts" uninstall` removes the cron entry.
 
@@ -106,7 +106,7 @@ Summarize:
 - Connection status (connected as [JID] or waiting for scan)
 - Access policy (pairing / allowlist)
 - Allowed contacts (if any)
-- How to manage access later: `/whatsapp-claude-channel:access`
-- How to reset auth if needed: `/whatsapp-claude-channel:configure reset-auth`
+- How to manage access later: `/whatsapp-channel:access`
+- How to reset auth if needed: `/whatsapp-channel:configure reset-auth`
 
 Tell the user they're all set. Messages from approved contacts will now appear in their Claude Code session.

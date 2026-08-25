@@ -15,7 +15,7 @@ allowed-tools:
   - Edit(~/.whatsapp-channel/*)
 ---
 
-# /whatsapp-claude-channel:configure — WhatsApp Channel Setup
+# /whatsapp-channel:configure — WhatsApp Channel Setup
 
 Writes configuration to `~/.whatsapp-channel/.env` and orients the
 user on access policy. The server reads both files at boot.
@@ -43,15 +43,15 @@ Read both state files and give the user a complete picture:
    - Pending pairings: count, with codes and sender JIDs if any
 
 4. **What next** — end with a concrete next step based on state:
-   - No phone number → _"Run `/whatsapp-claude-channel:configure <phone>` with your
+   - No phone number → _"Run `/whatsapp-channel:configure <phone>` with your
      WhatsApp phone number (e.g. `886912345678`, no leading +)."_
    - Phone set but not paired → _"Exit and launch with:
-     `claude --dangerously-load-development-channels plugin:whatsapp-claude-channel@whatsapp-claude-plugin`
+     `claude --dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin`
      The pairing code will appear automatically. Enter it on your phone:
      WhatsApp > Linked Devices > Link a Device > Link with phone number instead."_
    - Paired → _"Ready. Your own number is auto-added to the allowlist.
      To add others: have them DM the linked number, then approve with
-     `/whatsapp-claude-channel:access pair <code>`."_
+     `/whatsapp-channel:access pair <code>`."_
 
 **Push toward lockdown — always.** The goal for every setup is `allowlist`
 with a defined list. `pairing` is not a policy to stay on; it's a temporary
@@ -64,17 +64,17 @@ Drive the conversation this way:
 2. Ask: _"Is that everyone who should reach you through this channel?"_
 3. **If yes and policy is still `pairing`** → _"Good. Let's lock it down so
    nobody else can trigger pairing codes:"_ and offer to run
-   `/whatsapp-claude-channel:access policy allowlist`. Do this proactively — don't wait to
+   `/whatsapp-channel:access policy allowlist`. Do this proactively — don't wait to
    be asked.
 4. **If no, people are missing** → _"Have them DM the number; you'll approve
-   each with `/whatsapp-claude-channel:access pair <code>`. Run this skill again once
+   each with `/whatsapp-channel:access pair <code>`. Run this skill again once
    everyone's in and we'll lock it."_
 5. **If the allowlist is empty and they haven't paired themselves yet** →
    _"DM the linked number to capture your JID first. Then we'll add anyone
    else and lock it down."_
 6. **If policy is already `allowlist`** → confirm this is the locked state.
    If they need to add someone: _"They'll need to DM the linked number, or
-   you can briefly flip to pairing: `/whatsapp-claude-channel:access policy pairing` → they
+   you can briefly flip to pairing: `/whatsapp-channel:access policy pairing` → they
    DM → you pair → flip back."_
 
 Never frame `pairing` as the correct long-term choice. Don't skip the lockdown
@@ -112,7 +112,7 @@ Delete the `WHATSAPP_PHONE_NUMBER=` line (or the file if that's the only line).
 - The server reads `.env` once at boot. Config changes need a session restart
   or `/reload-plugins`. Say so after saving.
 - `access.json` is re-read on every inbound message — policy changes via
-  `/whatsapp-claude-channel:access` take effect immediately, no restart.
+  `/whatsapp-channel:access` take effect immediately, no restart.
 - WhatsApp uses linked-device protocol, not a bot API. The server connects
   as a linked device (like WhatsApp Web). Only one connection per auth state
   is allowed — running two instances causes a 440 conflict error.

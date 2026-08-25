@@ -48,7 +48,7 @@ if (!isStaticMode()) {
     {
       version: "0.19.0",
       notes: [
-        "Access review now works without leaving the chat: `/whatsapp-claude-channel:access review` shows a checkbox list of your most recently active groups and contacts to approve, and `manage` shows what is already approved so you can take it back. The terminal wizard is still there when you want a decision made with no AI model in the room.",
+        "Access review now works without leaving the chat: `/whatsapp-channel:access review` shows a checkbox list of your most recently active groups and contacts to approve, and `manage` shows what is already approved so you can take it back. The terminal wizard is still there when you want a decision made with no AI model in the room.",
       ],
     },
     {

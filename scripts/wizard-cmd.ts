@@ -1,7 +1,7 @@
 import { join } from "node:path";
 
 // Absolute, not "bun scripts/access.ts wizard": a marketplace install runs
-// from ~/.claude/plugins/cache/.../whatsapp-claude-channel/<version>/, where
+// from ~/.claude/plugins/cache/.../whatsapp-channel/<version>/, where
 // the relative form resolves to nothing. JSON.stringify quotes the path
 // (safe for install locations with spaces) and escapes any backslashes in a
 // Windows path. pluginRoot is the caller's own repo-root directory

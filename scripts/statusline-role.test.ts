@@ -12,12 +12,12 @@ describe("findServerPid", () => {
       {
         pid: 200,
         ppid: 100,
-        command: "bun run --cwd plugin/whatsapp-claude-channel/0.1 start",
+        command: "bun run --cwd plugin/whatsapp-channel/0.1 start",
       }, // wrapper
       { pid: 300, ppid: 200, command: "bun.exe server.ts" }, // real server
     ];
     expect(
-      findServerPid(chain, 100, "whatsapp-claude-channel", "server.ts"),
+      findServerPid(chain, 100, "whatsapp-channel", "server.ts"),
     ).toBe(300);
   });
 
@@ -27,17 +27,17 @@ describe("findServerPid", () => {
       { pid: 300, ppid: 200, command: "bun.exe server.ts" },
     ];
     expect(
-      findServerPid(chain, 100, "whatsapp-claude-channel", "server.ts"),
+      findServerPid(chain, 100, "whatsapp-channel", "server.ts"),
     ).toBeNull();
   });
 
   test("returns null when the wrapper has no server.ts child", () => {
     const chain: ProcRow[] = [
-      { pid: 200, ppid: 100, command: "whatsapp-claude-channel wrapper" },
+      { pid: 200, ppid: 100, command: "whatsapp-channel wrapper" },
       { pid: 300, ppid: 200, command: "unrelated child" },
     ];
     expect(
-      findServerPid(chain, 100, "whatsapp-claude-channel", "server.ts"),
+      findServerPid(chain, 100, "whatsapp-channel", "server.ts"),
     ).toBeNull();
   });
 
@@ -50,11 +50,11 @@ describe("findServerPid", () => {
     const rows: ProcRow[] = [
       { pid: 900, ppid: 1, command: "some-other-plugin wrapper" },
       { pid: 901, ppid: 900, command: "bun.exe server.ts" }, // decoy, found first
-      { pid: 200, ppid: 100, command: "whatsapp-claude-channel wrapper" },
+      { pid: 200, ppid: 100, command: "whatsapp-channel wrapper" },
       { pid: 300, ppid: 200, command: "bun.exe server.ts" }, // the real one
     ];
     expect(
-      findServerPid(rows, 100, "whatsapp-claude-channel", "server.ts"),
+      findServerPid(rows, 100, "whatsapp-channel", "server.ts"),
     ).toBe(300);
   });
 });
