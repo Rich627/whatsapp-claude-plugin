@@ -117,7 +117,7 @@ Both fail with a clear error if the group's `roster` flag isn't granted.
 - Revoking a contact also forgets their cached name and recency — unless another allowlist entry still resolves to the same person (someone allowlisted under both their `@lid` and phone form), in which case the cache is kept, because the surviving grant still needs it.
 - Ctrl-C cancels cleanly, and nothing is written until every question on screen has been answered.
 
-It reads the same two functions the in-session `/whatsapp-claude-channel:access manage` screen reads, so the terminal and the chat path cannot disagree about what is configured or what a revoke cleans up.
+It reads the same two functions the in-session `/whatsapp-channel:access manage` screen reads, so the terminal and the chat path cannot disagree about what is configured or what a revoke cleans up.
 
 Group/contact names and recency come from caches (`~/.whatsapp-channel/groups-meta.json`, `dm-activity.json`, `contacts.json`) that only the running server writes — automatically, as WhatsApp reports chat activity, no manual step needed once the account has connected at least once. If it's never connected yet, the wizard has nothing to show; pair it first. `groups-meta.json` is always written; `dm-activity.json` and `contacts.json` follow `WHATSAPP_CACHE_CONTACTS` (see "Names and privacy" above) — with it off (the default), the DM screen has nothing to rank until you turn it on.
 

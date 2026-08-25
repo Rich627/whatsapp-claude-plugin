@@ -70,8 +70,8 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
    them: a release note is seen once at most, and someone who has not read
    one cannot guess the word `review`. Print these three:
 
-   - Add groups or contacts: `/whatsapp-claude-channel:access review`
-   - Take access back: `/whatsapp-claude-channel:access manage`
+   - Add groups or contacts: `/whatsapp-channel:access review`
+   - Take access back: `/whatsapp-channel:access manage`
    - Same screens with no AI model involved: run the wizard (or
      `wizard --revoke`) in your own terminal
 

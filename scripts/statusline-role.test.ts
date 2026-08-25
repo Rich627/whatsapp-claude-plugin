@@ -246,7 +246,7 @@ describe("findServerPidForTerminal", () => {
   // The fixture above dodges this by giving its shell a command with no
   // plugin path in it, which is why 295 passing tests never caught it.
   const realWiring = (shellFirst: boolean): ProcRow[] => {
-    const plugin = "plugins/cache/wa/whatsapp-claude-channel/0.20.0";
+    const plugin = "plugins/cache/wa/whatsapp-channel/0.21.0";
     const cli: ProcRow = { pid: 100, ppid: 1, command: "claude.exe" };
     const shell: ProcRow = {
       pid: 400,
@@ -270,7 +270,7 @@ describe("findServerPidForTerminal", () => {
         findServerPidForTerminal(
           realWiring(shellFirst),
           400,
-          "whatsapp-claude-channel",
+          "whatsapp-channel",
           "server.ts",
         ),
       ).toBe(300);

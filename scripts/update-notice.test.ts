@@ -142,7 +142,7 @@ describe("update available", () => {
   function fakeInstall(
     installed: string,
     marketplacePlugins: { name?: string; version?: string }[] | null,
-    pluginName = "whatsapp-claude-channel",
+    pluginName = "whatsapp-channel",
     marketplaceName = "whatsapp-claude-plugin",
   ): string {
     const root = mkdtempSync(join(tmpdir(), "wa-install-"));
@@ -205,18 +205,18 @@ describe("update available", () => {
 
   test("announces a newer version that is on offer but not installed", () => {
     const script = fakeInstall("0.19.0", [
-      { name: "whatsapp-claude-channel", version: "0.20.0" },
+      { name: "whatsapp-channel", version: "0.20.0" },
     ]);
     const ctx = JSON.parse(runInstalled(script, currentState("0.19.0")))
       .systemMessage as string;
     expect(ctx).toContain("v0.20.0");
     expect(ctx).toContain("v0.19.0");
-    expect(ctx).toContain("claude plugin update whatsapp-claude-channel");
+    expect(ctx).toContain("claude plugin update whatsapp-channel");
   });
 
   test("says nothing when the installed version is already the offered one", () => {
     const script = fakeInstall("0.19.0", [
-      { name: "whatsapp-claude-channel", version: "0.19.0" },
+      { name: "whatsapp-channel", version: "0.19.0" },
     ]);
     expect(runInstalled(script, currentState("0.19.0"))).toBe("");
   });
@@ -224,14 +224,14 @@ describe("update available", () => {
   test("says nothing when the install is AHEAD of the marketplace", () => {
     // A local dev build, or a marketplace clone that has not refreshed yet.
     const script = fakeInstall("0.20.0", [
-      { name: "whatsapp-claude-channel", version: "0.19.0" },
+      { name: "whatsapp-channel", version: "0.19.0" },
     ]);
     expect(runInstalled(script, currentState("0.20.0"))).toBe("");
   });
 
   test("numeric version compare, so 0.9.0 is not treated as newer than 0.19.0", () => {
     const script = fakeInstall("0.19.0", [
-      { name: "whatsapp-claude-channel", version: "0.9.0" },
+      { name: "whatsapp-channel", version: "0.9.0" },
     ]);
     expect(runInstalled(script, currentState("0.19.0"))).toBe("");
   });
@@ -239,7 +239,7 @@ describe("update available", () => {
   test("picks its OWN entry, not whichever plugin the marketplace lists first", () => {
     const script = fakeInstall("0.19.0", [
       { name: "some-other-plugin", version: "9.9.9" },
-      { name: "whatsapp-claude-channel", version: "0.20.0" },
+      { name: "whatsapp-channel", version: "0.20.0" },
     ]);
     const ctx = JSON.parse(runInstalled(script, currentState("0.19.0")))
       .systemMessage as string;
@@ -254,7 +254,7 @@ describe("update available", () => {
 
   test("a marketplace file that is not valid JSON is silent, not a crash", () => {
     const script = fakeInstall("0.19.0", [
-      { name: "whatsapp-claude-channel", version: "0.20.0" },
+      { name: "whatsapp-channel", version: "0.20.0" },
     ]);
     // script is <root>/plugins/cache/<mkt>/<plugin>/<ver>/scripts/x.ts, so
     // six hops up lands on <root>/plugins.
@@ -280,7 +280,7 @@ describe("update available", () => {
   // the model failed to relay it would be the only session that ever had it.
   test("repeats every session - it is not gated on the seen-version marker", () => {
     const script = fakeInstall("0.19.0", [
-      { name: "whatsapp-claude-channel", version: "0.20.0" },
+      { name: "whatsapp-channel", version: "0.20.0" },
     ]);
     const dir = currentState("0.19.0");
     expect(runInstalled(script, dir)).not.toBe("");
@@ -292,7 +292,7 @@ describe("update available", () => {
   // and only seen if the model chooses to repeat it).
   test("the notice goes to the user channel, never into model context", () => {
     const script = fakeInstall("0.19.0", [
-      { name: "whatsapp-claude-channel", version: "0.20.0" },
+      { name: "whatsapp-channel", version: "0.20.0" },
     ]);
     const out = JSON.parse(runInstalled(script, currentState("0.19.0")));
     expect(out.systemMessage).toContain("v0.20.0");
@@ -306,7 +306,7 @@ describe("update available", () => {
   // session that happens to see a notice would brief the model with nothing.
   test("carries the caller's model-facing message through untouched", () => {
     const script = fakeInstall("0.19.0", [
-      { name: "whatsapp-claude-channel", version: "0.20.0" },
+      { name: "whatsapp-channel", version: "0.20.0" },
     ]);
     const out = JSON.parse(
       runInstalled(script, currentState("0.19.0"), "briefing for the model"),
