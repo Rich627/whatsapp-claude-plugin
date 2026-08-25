@@ -60,7 +60,8 @@ if (!isStaticMode()) {
       version: "0.20.0",
       notes: [
         `The guided setup wizard can now take access back, not just hand it out: \`${WIZARD_CMD} --revoke\` lists everything currently configured and you tick what should lose access. Leaving everything unticked removes nothing.`,
-        "You will now be told when a newer version of this plugin is available, instead of only hearing about one after you had already installed it.",
+        "You will now be told when a newer version of this plugin is available, instead of only hearing about one after you had already installed it. Notices like this one now print straight to your terminal rather than being passed to the assistant and hoping it mentions them.",
+        "`/whatsapp-claude-channel:access` with no arguments now ends by telling you how to add groups and contacts, how to take access back, and how to do either with no AI model involved.",
         "Fixed: the WA:<role> statusline segment never appeared. It was looking for the server in the wrong branch of the process tree, and failing silently when it did not find it.",
       ],
     },
@@ -179,18 +180,31 @@ if (!isStaticMode()) {
   }
 
   if (sections.length > 0) {
-    // SessionStart output reaches the MODEL, not the user's screen, so a
-    // notice that is not relayed is a notice nobody read. Say so explicitly
-    // rather than hoping it gets mentioned.
-    const content =
-      "Tell the user the following in your next message - it is a notice for them, not background context for you:\n\n" +
-      sections.join("\n\n");
+    // systemMessage, NOT hookSpecificOutput.additionalContext (issue #5).
+    // additionalContext is the channel for things the MODEL needs to know: it
+    // is folded into the session context, costs input tokens every time it
+    // fires, and reaches the human only if the model chooses to mention it.
+    // This is a notice FOR the human and of no use to the model, so it goes
+    // on the channel that shows it to them - which also means no "please
+    // relay this" preamble, the workaround that channel forced.
+    //
+    // The caller passes its own model-facing message through as argv[2],
+    // because printing this notice REPLACES the handler's whole JSON output.
+    // Carrying it here rather than restating it means the session that sees a
+    // notice still briefs the model exactly like every other session, and the
+    // wording lives in one place (hooks-handlers/session-start.sh).
+    const modelContext = process.argv[2];
     process.stdout.write(
       JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "SessionStart",
-          additionalContext: content,
-        },
+        systemMessage: sections.join("\n\n"),
+        ...(modelContext
+          ? {
+              hookSpecificOutput: {
+                hookEventName: "SessionStart",
+                additionalContext: modelContext,
+              },
+            }
+          : {}),
       }),
     );
   }

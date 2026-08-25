@@ -36,7 +36,7 @@ describe("update-notice.ts", () => {
     const dir = mkdtempSync(join(tmpdir(), "wa-notice-old-"));
     writeFileSync(join(dir, ".last-seen-version"), "0.9.0");
     const parsed = JSON.parse(run(dir));
-    const ctx = parsed.hookSpecificOutput.additionalContext as string;
+    const ctx = parsed.systemMessage as string;
     expect(ctx).toContain(
       `WhatsApp plugin updated to v${PLUGIN_VERSION} (from v0.9.0)`,
     );
@@ -55,7 +55,7 @@ describe("update-notice.ts", () => {
   test("first-ever run (never recorded) still writes the marker and shows only the latest entry", () => {
     const dir = mkdtempSync(join(tmpdir(), "wa-notice-first-"));
     const parsed = JSON.parse(run(dir));
-    const ctx = parsed.hookSpecificOutput.additionalContext as string;
+    const ctx = parsed.systemMessage as string;
     expect(ctx).toContain(`WhatsApp plugin updated to v${PLUGIN_VERSION}`);
     expect(ctx).not.toContain("(from v");
     expect(readFileSync(join(dir, ".last-seen-version"), "utf8")).toBe(
@@ -70,8 +70,7 @@ describe("update-notice.ts", () => {
   // is exactly why that went unnoticed.
   test("first-ever run shows the NEWEST changelog entry, not the oldest", () => {
     const dir = mkdtempSync(join(tmpdir(), "wa-notice-newest-"));
-    const ctx = JSON.parse(run(dir)).hookSpecificOutput
-      .additionalContext as string;
+    const ctx = JSON.parse(run(dir)).systemMessage as string;
     expect(ctx).toContain("--revoke");
     expect(ctx).not.toContain("Proactive notifications");
   });
@@ -164,11 +163,19 @@ describe("update available", () => {
     return join(pluginDir, "scripts", "update-notice.ts");
   }
 
-  function runInstalled(script: string, stateDir: string): string {
-    return execFileSync("bun", [script], {
-      env: { ...process.env, WHATSAPP_STATE_DIR: stateDir },
-      encoding: "utf8",
-    });
+  function runInstalled(
+    script: string,
+    stateDir: string,
+    modelContext?: string,
+  ): string {
+    return execFileSync(
+      "bun",
+      modelContext ? [script, modelContext] : [script],
+      {
+        env: { ...process.env, WHATSAPP_STATE_DIR: stateDir },
+        encoding: "utf8",
+      },
+    );
   }
 
   function currentState(version: string): string {
@@ -184,7 +191,7 @@ describe("update available", () => {
       { name: "whatsapp-claude-channel", version: "0.20.0" },
     ]);
     const ctx = JSON.parse(runInstalled(script, currentState("0.19.0")))
-      .hookSpecificOutput.additionalContext as string;
+      .systemMessage as string;
     expect(ctx).toContain("v0.20.0");
     expect(ctx).toContain("v0.19.0");
     expect(ctx).toContain("claude plugin update whatsapp-claude-channel");
@@ -218,7 +225,7 @@ describe("update available", () => {
       { name: "whatsapp-claude-channel", version: "0.20.0" },
     ]);
     const ctx = JSON.parse(runInstalled(script, currentState("0.19.0")))
-      .hookSpecificOutput.additionalContext as string;
+      .systemMessage as string;
     expect(ctx).toContain("v0.20.0");
     expect(ctx).not.toContain("9.9.9");
   });
@@ -263,12 +270,34 @@ describe("update available", () => {
     expect(runInstalled(script, dir)).not.toBe("");
   });
 
-  test("the notice tells the model to relay it, since this output never reaches the screen", () => {
+  // The notice is for the human, so it must ride on systemMessage (shown to
+  // them) and NOT on additionalContext (folded into model context, billed,
+  // and only seen if the model chooses to repeat it).
+  test("the notice goes to the user channel, never into model context", () => {
     const script = fakeInstall("0.19.0", [
       { name: "whatsapp-claude-channel", version: "0.20.0" },
     ]);
-    const ctx = JSON.parse(runInstalled(script, currentState("0.19.0")))
-      .hookSpecificOutput.additionalContext as string;
-    expect(ctx.startsWith("Tell the user")).toBe(true);
+    const out = JSON.parse(runInstalled(script, currentState("0.19.0")));
+    expect(out.systemMessage).toContain("v0.20.0");
+    expect(JSON.stringify(out.hookSpecificOutput ?? {})).not.toContain(
+      "v0.20.0",
+    );
+  });
+
+  // The notice replaces the calling hook's entire JSON output, so the caller
+  // hands its model-facing message over to be carried through. Without it a
+  // session that happens to see a notice would brief the model with nothing.
+  test("carries the caller's model-facing message through untouched", () => {
+    const script = fakeInstall("0.19.0", [
+      { name: "whatsapp-claude-channel", version: "0.20.0" },
+    ]);
+    const out = JSON.parse(
+      runInstalled(script, currentState("0.19.0"), "briefing for the model"),
+    );
+    expect(out.hookSpecificOutput.additionalContext).toBe(
+      "briefing for the model",
+    );
+    expect(out.hookSpecificOutput.hookEventName).toBe("SessionStart");
+    expect(out.systemMessage).toContain("v0.20.0");
   });
 });

@@ -54,12 +54,17 @@ else
 	# nothing otherwise — a real bun script rather than more bash so version
 	# compare and JSON escaping reuse localeCompare/JSON.stringify instead
 	# of reimplementing both (see scripts/update-notice.ts).
-	notice_json="$(bun "${PLUGIN_ROOT}/scripts/update-notice.ts" 2>/dev/null)"
+	msg="WhatsApp channel is fully configured and ready. Paired contacts can message this session."
+	# Passed in because the notice REPLACES this handler's output: the script
+	# carries this same message through on its own hookSpecificOutput, so a
+	# session that gets a notice still briefs the model identically to one
+	# that does not. The notice itself rides on systemMessage, which goes to
+	# the user's screen instead of costing model context.
+	notice_json="$(bun "${PLUGIN_ROOT}/scripts/update-notice.ts" "${msg}" 2>/dev/null)"
 	if [[ -n ${notice_json} ]]; then
 		echo "${notice_json}"
 		exit 0
 	fi
-	msg="WhatsApp channel is fully configured and ready. Paired contacts can message this session."
 fi
 
 cat <<EOF

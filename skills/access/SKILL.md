@@ -1,6 +1,6 @@
 ---
 name: access
-description: Manage WhatsApp channel access — approve pairings, edit allowlists, set DM/group policy. Use when the user asks to pair, approve someone, check who's allowed, or change policy for the WhatsApp channel.
+description: Manage WhatsApp channel access — approve pairings, edit allowlists, set DM/group policy. Use when the user asks to pair, approve someone, check who's allowed, or change policy for the WhatsApp channel, and equally when they ask to add contacts or groups, set up or bulk-approve access, or take someone's access away — those are this skill's `review` and `manage` screens, not something to hand-edit.
 user-invocable: true
 allowed-tools:
   - Read
@@ -66,6 +66,18 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 1. Read `~/.whatsapp-channel/access.json` (handle missing file).
 2. Show: dmPolicy, allowFrom count and list, pending count with codes +
    sender IDs + age, groups count.
+3. End with the three things a person can do next. Nothing else advertises
+   them: a release note is seen once at most, and someone who has not read
+   one cannot guess the word `review`. Print exactly:
+
+   - Add groups or contacts: `/whatsapp-claude-channel:access review`
+   - Take access back: `/whatsapp-claude-channel:access manage`
+   - Same screens with no AI model involved: run
+     `bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" wizard` (or
+     `wizard --revoke`) in your own terminal
+
+   Do not run any of them off the back of showing this list — it is a
+   signpost, not a prompt. Wait for the user to pick.
 
 ### `pair <code>`
 
