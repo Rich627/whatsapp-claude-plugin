@@ -14,7 +14,13 @@ export type GroupMeta = {
   updatedAt: number;
 };
 
-export type Candidate = { jid: string; label: string };
+// `description` is the identity anchor rendered under the label on the
+// in-session review/manage screens: the raw JID for a group (a g.us id is
+// not personal data), the MASKED number for a contact (a raw one is
+// exactly what mask.ts exists to keep out of a transcript). Built here,
+// next to the label, so no caller has to re-derive the rule and get it
+// wrong - the old prose spec in skills/access/SKILL.md did.
+export type Candidate = { jid: string; label: string; description: string };
 
 // No live WhatsApp connection here (see access.ts's file header) and
 // deliberately no Baileys import just for its JID string utilities -
@@ -44,6 +50,66 @@ export function contactKeyFor(
   return normalizeJid(lidMap[normalized] ?? normalized);
 }
 
+// A group name and a self-reported contact name are both attacker-chosen
+// and unbounded, and a label too long for its option used to be the
+// caller's problem to truncate - which broke the one thing the label has to
+// guarantee, since disambiguate() APPENDS its suffix and truncating the end
+// removes it. Clipping the name here instead keeps every label inside a
+// predictable bound (name + count + tags + suffix stays under ~90 chars),
+// runs BEFORE disambiguate() so two names that clip to the same string are
+// still separated, and leaves no truncation rule for a caller to get wrong.
+const NAME_LIMIT = 40;
+function clip(name: string): string {
+  return name.length <= NAME_LIMIT ? name : name.slice(0, NAME_LIMIT - 1) + "…";
+}
+
+// Shared by rankGroups and listConfiguredGroups so the label format can
+// never drift between "what's new" and "what's already on".
+function groupLabel(g: GroupMeta): string {
+  return `${clip(g.name)}  (${g.memberCount} member(s))${g.archived ? "  [archived]" : ""}`;
+}
+
+// A modern group JID is a random `120363…@g.us` and carries nothing
+// personal, which is why a group's anchor shows it in full. A LEGACY one is
+// `<creator-phone>-<created-at>@g.us`, so the same field would put a real
+// phone number on screen and into the transcript - exactly what mask.ts
+// exists to stop. The hyphen is what tells the two apart: mask only the
+// segment before it, leaving the timestamp (and the whole modern form)
+// intact, so the anchor still identifies one group unambiguously.
+export function groupAnchor(jid: string): string {
+  const at = jid.indexOf("@");
+  const user = at < 0 ? jid : jid.slice(0, at);
+  const dash = user.indexOf("-");
+  if (dash < 0) return jid;
+  return maskNumber(user.slice(0, dash)) + user.slice(dash) + jid.slice(at);
+}
+
+// AskUserQuestion - the checkbox UI behind the in-session `review`/`manage`
+// screens - returns a selection BY ITS LABEL, so two candidates that render
+// identically cannot be told apart once ticked: the wrong one gets revoked,
+// or both do. Three real ways they collide: two contacts saved under the
+// same name, two groups sharing a name and member count, and the @lid and
+// phone forms of ONE contact in allowFrom (both resolve to the same key, so
+// dmLabel returns the same string by construction - see listConfiguredDms).
+// Appends the masked JID, so a human can see which row is which, plus an
+// ordinal, so the label is unique even when two JIDs share their last four
+// digits. Never the raw JID - that is the whole point of mask.ts. Applied
+// to every list this module returns rather than at the call site, so a new
+// caller cannot forget it.
+function disambiguate(candidates: Candidate[]): Candidate[] {
+  const counts = new Map<string, number>();
+  for (const c of candidates) {
+    counts.set(c.label, (counts.get(c.label) ?? 0) + 1);
+  }
+  const seen = new Map<string, number>();
+  return candidates.map((c) => {
+    if ((counts.get(c.label) ?? 0) < 2) return c;
+    const n = (seen.get(c.label) ?? 0) + 1;
+    seen.set(c.label, n);
+    return { ...c, label: `${c.label}  [${n}: ${maskNumber(c.jid)}]` };
+  });
+}
+
 // Same recency signal WhatsApp's own app sorts its chat list by
 // (conversationTimestamp, tracked into groupsMeta by server.ts - see
 // applyChatActivity there). Undefined/never-seen activity sorts last,
@@ -55,18 +121,50 @@ export function rankGroups(
   includeArchived: boolean,
   limit: number,
 ): Candidate[] {
-  return Object.entries(meta)
+  const ranked = Object.entries(meta)
     .filter(([jid]) => !alreadyConfigured.has(jid))
     .filter(([, g]) => includeArchived || !g.archived)
-    .sort(([, x], [, y]) => {
+    .sort(([xj, x], [yj, y]) => {
       const diff = (y.lastActivityAt ?? 0) - (x.lastActivityAt ?? 0);
-      return diff !== 0 ? diff : x.name.localeCompare(y.name);
+      // JID last: two groups can share a name as well as a timestamp, and
+      // an order that then falls back to object key iteration is not
+      // deterministic - which matters here, because disambiguate() numbers
+      // colliding labels by position.
+      return diff !== 0
+        ? diff
+        : x.name.localeCompare(y.name) || xj.localeCompare(yj);
     })
     .slice(0, limit)
     .map(([jid, g]) => ({
       jid,
-      label: `${g.name}  (${g.memberCount} member(s))${g.archived ? "  [archived]" : ""}`,
+      label: groupLabel(g),
+      description: groupAnchor(jid),
     }));
+  return disambiguate(ranked);
+}
+
+// Every group already in access.json's groups map, not just the top N new
+// ones - this is "what's already on" for a revoke screen, so no recency
+// sort, no archive filter and no limit (see listConfiguredGroups/manage in
+// skills/access/SKILL.md). A configured group with no meta.json entry still
+// has to appear (falls back to the raw JID) or it becomes unrevokable.
+export function listConfiguredGroups(
+  groups: Readonly<Record<string, unknown>>,
+  meta: Record<string, GroupMeta>,
+): Candidate[] {
+  const listed = Object.keys(groups)
+    .map((jid) => ({
+      jid,
+      // The no-meta fallback shows the anchor too, not the raw JID: a
+      // configured legacy group with nothing cached about it would
+      // otherwise print its creator's phone number as its label.
+      label: meta[jid] ? groupLabel(meta[jid]) : groupAnchor(jid),
+      description: groupAnchor(jid),
+    }))
+    .sort(
+      (a, b) => a.label.localeCompare(b.label) || a.jid.localeCompare(b.jid),
+    );
+  return disambiguate(listed);
 }
 
 // A candidate is only ever a chat with real activity (dmActivity is only
@@ -86,7 +184,20 @@ export function rankGroups(
 // identically to an actually-saved contact. A `.name` entry only exists
 // because the account owner saved it themselves, so it's shown plain; a
 // `.notify`-only entry is marked unverified and paired with the masked
-// number, so approving it is a visibly different decision.
+// number, so approving it is a visibly different decision. Shared by
+// rankDms and listConfiguredDms below via dmLabel.
+function dmLabel(contacts: ContactsMap, key: string): string {
+  const entry = contacts[key];
+  const masked = maskNumber(key);
+  if (entry?.name && !looksLikeNumber(entry.name)) return clip(entry.name);
+  if (entry?.notify && !looksLikeNumber(entry.notify)) {
+    return `${clip(entry.notify)} (unverified) - ${masked}`;
+  }
+  return masked;
+}
+
+// See dmLabel above for why a `.notify`-only label is marked unverified
+// rather than shown like a saved name.
 export function rankDms(
   activity: Record<string, number>,
   contacts: ContactsMap,
@@ -97,19 +208,46 @@ export function rankDms(
   const alreadyAllowed = new Set(
     allowFrom.map((jid) => contactKeyFor(lidMap, jid)),
   );
-  return Object.entries(activity)
+  const ranked = Object.entries(activity)
     .filter(([jid]) => !alreadyAllowed.has(jid))
-    .sort(([, a], [, b]) => b - a)
+    .sort(([aj, a], [bj, b]) => b - a || aj.localeCompare(bj))
     .slice(0, limit)
-    .map(([jid]) => {
-      const entry = contacts[jid];
-      const masked = maskNumber(jid);
-      if (entry?.name && !looksLikeNumber(entry.name)) {
-        return { jid, label: entry.name };
-      }
-      if (entry?.notify && !looksLikeNumber(entry.notify)) {
-        return { jid, label: `${entry.notify} (unverified) - ${masked}` };
-      }
-      return { jid, label: masked };
-    });
+    .map(([jid]) => ({
+      jid,
+      label: dmLabel(contacts, jid),
+      description: maskNumber(jid),
+    }));
+  return disambiguate(ranked);
+}
+
+// Every DM contact already in allowFrom, not just the top N new ones - the
+// revoke-screen counterpart to listConfiguredGroups. One candidate per
+// allowFrom entry, no filtering, no dedupe: if both a @lid and a phone form
+// of the same contact are allowlisted, they are two separate revokable
+// strings and both must appear.
+export function listConfiguredDms(
+  allowFrom: readonly string[],
+  contacts: ContactsMap,
+  lidMap: Record<string, string>,
+): Candidate[] {
+  const listed = allowFrom
+    .map((jid) => {
+      const key = contactKeyFor(lidMap, jid);
+      // Candidate.jid stays the original, unresolved allowFrom string
+      // (not the LID-resolved key used for the label lookup): revoke
+      // filters allowFrom by exact string match, so returning the
+      // resolved key here would silently fail to remove a @lid-form
+      // entry. The description masks the RESOLVED key, since that is the
+      // identity being revoked; disambiguate() masks the raw entry, which
+      // is what tells the @lid row apart from the phone one.
+      return {
+        jid,
+        label: dmLabel(contacts, key),
+        description: maskNumber(key),
+      };
+    })
+    .sort(
+      (a, b) => a.label.localeCompare(b.label) || a.jid.localeCompare(b.jid),
+    );
+  return disambiguate(listed);
 }
