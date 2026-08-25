@@ -13,8 +13,9 @@
  *    it as line 2 of its role file, so we climb our own ppid chain and take
  *    the file whose owner is one of our ancestors. Ownership is read, not
  *    guessed, so a sibling terminal's server can never be mistaken for ours.
- *    Files whose server pid (from the filename) is no longer running are
- *    dropped first, so a killed server's file cannot keep printing a role.
+ *    Files whose server pid (from the filename) is not currently running a
+ *    server are dropped first, so neither a killed server's file nor one
+ *    whose pid has since been recycled can keep printing a role.
  * 2. The process tree, for a server that predates the stamp or a client that
  *    never identified itself: climb the ppid chain to the Claude Code CLI
  *    (this script does NOT run as its direct child — see
@@ -273,13 +274,28 @@ export function formatSegment(role: string): string {
 // only a graceful exit removes one, so a killed server leaves a file whose
 // owning session is still alive and still our ancestor, and the stamp would
 // keep printing a role for a server that is gone. server.ts's startup sweep
-// cannot cover it - nothing starts. A non-numeric name is not in the set
-// either and drops out the same way.
-function readRoleFiles(livePids: Set<number>): string[] {
+// cannot cover it - nothing starts.
+//
+// A live pid is not enough on its own, though. A pid names a slot, not a
+// process: once the killed server's pid is recycled by any unrelated process
+// the file passes a liveness test again, and the segment goes back to
+// printing a role for a server that does not exist - a statusline that
+// claims a connection is live is worse than one that says nothing, since
+// telling the two terminals apart is the whole reason it is on screen. So
+// the process holding that pid must also LOOK like the server (confirmed
+// against a live one: its command line is `bun server.ts`). What is left is
+// a recycled pid that happens to be another server.ts whose file is also
+// stamped with one of our own ancestors, which does not happen in practice.
+//
+// A non-numeric name has no entry either and drops out the same way.
+function readRoleFiles(liveCommands: Map<number, string>): string[] {
   try {
     return readdirSync(STATE_DIR)
       .filter((f) => f.startsWith(".role-"))
-      .filter((f) => livePids.has(Number(f.slice(".role-".length))))
+      .filter((f) => {
+        const command = liveCommands.get(Number(f.slice(".role-".length)));
+        return command !== undefined && command.includes(SERVER_MATCH);
+      })
       .map((f) => {
         try {
           return readFileSync(join(STATE_DIR, f), "utf8");
@@ -301,7 +317,7 @@ function main(): void {
     // does not identify itself - it can confuse a sibling terminal's server
     // for ours, which is exactly what the stamp exists to prevent.
     const stamped = roleFromOwnerStamp(
-      readRoleFiles(new Set(rows.map((r) => r.pid))),
+      readRoleFiles(new Map(rows.map((r) => [r.pid, r.command]))),
       ancestors,
     );
     if (stamped) {

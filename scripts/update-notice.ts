@@ -57,6 +57,12 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.21.2",
+      notes: [
+        "Fixed: the WA:<role> statusline segment could still show a role for a server that had been killed, if the operating system had since handed that process id to something else. It now checks that the process really is a running server before believing the file.",
+      ],
+    },
+    {
       version: "0.21.1",
       notes: [
         "Fixed: the WA:<role> statusline segment could keep showing a role after its server had been killed, because the file it reads is only removed on a clean shutdown. It now checks the server is still running before believing the file.",

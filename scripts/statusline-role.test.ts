@@ -104,28 +104,83 @@ describe("end-to-end (real processes)", () => {
     });
   }
 
-  // The stamped path, end to end through the real script: no wrapper and no
-  // server process exist here at all, so this can only pass by reading the
+  // A live process carrying `marker` in its command line, so a role file
+  // named after it survives the liveness filter the way a real server's does.
+  // `ps` shows the command only once the exec has landed, so wait for it
+  // rather than racing it.
+  async function spawnFakeServer(
+    marker: string,
+  ): Promise<ReturnType<typeof spawn>> {
+    const child = spawn(
+      "bun",
+      ["-e", `/*${marker}*/ setTimeout(() => {}, 30000)`],
+      { stdio: "ignore" },
+    );
+    for (let i = 0; i < 100; i++) {
+      try {
+        const out = execFileSync(
+          "ps",
+          ["-p", String(child.pid), "-o", "command="],
+          {
+            encoding: "utf8",
+          },
+        );
+        if (out.includes(marker)) return child;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    child.kill();
+    throw new Error(`fake server ${marker} never showed up in ps`);
+  }
+
+  // The stamped path, end to end through the real script: no wrapper exists,
+  // so the tree search cannot fire and this can only pass by reading the
   // owner pid out of the file. The decoy is a second terminal's server, which
-  // the process tree alone would have no way to rule out. Both filenames use
-  // live pids (this test and its parent) so the liveness filter cannot be
-  // what decides it - the stamp has to.
-  test("reads the stamped owner instead of hunting the process tree", () => {
-    const dir = freshStateDir();
-    writeFileSync(
-      join(dir, `.role-${process.pid}`),
-      `secondary\n${process.pid}\n`,
-    );
-    writeFileSync(join(dir, `.role-${process.ppid}`), "primary\n999999\n");
-    const out = runStatusline(
-      dir,
-      process.pid,
-      "no-such-wrapper",
-      "no-such-server",
-    );
-    expect(out).toContain("WA:secondary");
-    expect(out).not.toContain("primary");
-  });
+  // the process tree alone would have no way to rule out. Both files are
+  // named after live processes that look like servers, so neither the
+  // liveness filter nor the command check can be what decides it - the stamp
+  // has to.
+  test("reads the stamped owner instead of hunting the process tree", async () => {
+    const marker = `WA_FAKE_${process.pid}_a`;
+    const mine = await spawnFakeServer(marker);
+    const theirs = await spawnFakeServer(marker);
+    try {
+      const dir = freshStateDir();
+      writeFileSync(
+        join(dir, `.role-${mine.pid}`),
+        `secondary\n${process.pid}\n`,
+      );
+      writeFileSync(join(dir, `.role-${theirs.pid}`), "primary\n999999\n");
+      const out = runStatusline(dir, process.pid, "no-such-wrapper", marker);
+      expect(out).toContain("WA:secondary");
+      expect(out).not.toContain("primary");
+    } finally {
+      mine.kill();
+      theirs.kill();
+    }
+  }, 30_000);
+
+  // The other half of "only a graceful exit removes a role file": a pid names
+  // a slot, not a process. Once the killed server's pid is recycled by
+  // something unrelated, a liveness check alone passes again and the stamp
+  // goes back to printing a role for a server that is not there. Here the
+  // file is named after a live process that is NOT a server, which is what
+  // a recycled pid looks like.
+  test("ignores a stamped file whose pid was recycled by an unrelated process", async () => {
+    const impostor = await spawnFakeServer(`WA_NOT_A_SERVER_${process.pid}`);
+    try {
+      const dir = freshStateDir();
+      writeFileSync(
+        join(dir, `.role-${impostor.pid}`),
+        `secondary\n${process.pid}\n`,
+      );
+      expect(
+        runStatusline(dir, process.pid, "no-such-wrapper", "no-such-server"),
+      ).toBe("");
+    } finally {
+      impostor.kill();
+    }
+  }, 30_000);
 
   // A server that was killed without a graceful exit leaves its role file
   // behind, and the owning session named on line 2 is still alive and still
@@ -142,16 +197,22 @@ describe("end-to-end (real processes)", () => {
 
   // Same fixture minus the stamp: nothing matches, and with no wrapper or
   // server process to fall back to the script stays silent rather than
-  // picking the only file it can see.
-  // Live server pid on purpose, so the silence is the owner mismatch talking
-  // and not the liveness filter above.
-  test("stays silent when the only files belong to someone else", () => {
-    const dir = freshStateDir();
-    writeFileSync(join(dir, `.role-${process.pid}`), "primary\n999999\n");
-    expect(
-      runStatusline(dir, process.pid, "no-such-wrapper", "no-such-server"),
-    ).toBe("");
-  });
+  // picking the only file it can see. Named after a live process that looks
+  // like a server on purpose, so the silence is the owner mismatch talking
+  // and not the filters above.
+  test("stays silent when the only files belong to someone else", async () => {
+    const marker = `WA_FAKE_${process.pid}_b`;
+    const theirs = await spawnFakeServer(marker);
+    try {
+      const dir = freshStateDir();
+      writeFileSync(join(dir, `.role-${theirs.pid}`), "primary\n999999\n");
+      expect(runStatusline(dir, process.pid, "no-such-wrapper", marker)).toBe(
+        "",
+      );
+    } finally {
+      theirs.kill();
+    }
+  }, 30_000);
 
   // Spawns a real two-hop process chain (this test -> "wrapper" -> "server")
   // mirroring the real CLI -> plugin wrapper -> server.ts topology, and
