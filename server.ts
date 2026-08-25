@@ -97,8 +97,10 @@ const TASKS_FILE = join(STATE_DIR, "tasks.md");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
 const IPC_TOKEN_FILE = join(STATE_DIR, ".ipc-token");
 // Read by scripts/statusline-role.ts. PID-scoped so two terminals never
-// collide on one file; a stale one from a dead process is harmless, the
-// reader only ever looks up a pid it just found alive in the process list.
+// collide on one file. A stale one from a dead process cannot be misread -
+// the reader matches on the owning session stamped inside, and a dead pid is
+// nobody's ancestor - but it is still swept at startup, see
+// sweepStaleRoleFiles.
 const ROLE_FILE = join(STATE_DIR, `.role-${process.pid}`);
 // resolve(): two terminals can pass the same directory spelled differently
 // (trailing separator, relative path) and ipcSocketPath hashes the raw
@@ -249,6 +251,31 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+// shutdown() removes this process's own role file, but only on a graceful
+// exit - stdin close, SIGTERM, SIGINT. A SIGKILL, a crash, an OOM kill or a
+// power loss all skip it by definition, and nothing else ever looked at the
+// directory, so the files accumulated for the life of the install (issue #4:
+// six files for three live servers on one machine).
+//
+// Runs before the singleton lock is taken, so a process that goes on to
+// refuse and exit still tidies up on its way through. Deleting another
+// server's file is safe by construction: the pid is in the name, and a pid
+// that answers no signal has no process to be confused with.
+function sweepStaleRoleFiles(): void {
+  try {
+    for (const name of readdirSync(STATE_DIR)) {
+      if (!name.startsWith(".role-")) continue;
+      const pid = Number(name.slice(".role-".length));
+      // A name that is not .role-<number> is not ours to delete.
+      if (!Number.isInteger(pid) || pid <= 0 || pidAlive(pid)) continue;
+      try {
+        rmSync(join(STATE_DIR, name), { force: true });
+      } catch {}
+    }
+  } catch {}
+}
+sweepStaleRoleFiles();
+
 // Who holds the connection when we cannot. `client` is the CLAUDE_PID the
 // holder recorded, "" when started by something that does not set one.
 type LockHolder = { pid: number; client: string };
@@ -381,7 +408,14 @@ function writeRoleFile(
   everConnected = false,
 ): void {
   try {
-    writeFileSync(ROLE_FILE, role);
+    // Line 1 is the role, unchanged, so any older reader keeps working.
+    // Line 2 stamps the Claude Code session that owns this server, when it
+    // told us (CLIENT_ID is CLAUDE_PID). The statusline used to infer
+    // ownership by walking the process tree, which cannot distinguish this
+    // terminal's server from a sibling terminal's once a shared ancestor is
+    // in range - it would show someone else's role as yours. Stamped, the
+    // reader just checks whether the owner is one of its own ancestors.
+    writeFileSync(ROLE_FILE, CLIENT_ID ? `${role}\n${CLIENT_ID}\n` : role);
   } catch {}
   if (pastInitialRole) notifyRoleChange(role, everConnected);
   pastInitialRole = true;

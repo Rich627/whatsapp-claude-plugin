@@ -7,7 +7,8 @@ import { join } from "node:path";
 // Drives the real SessionStart hook (bash), not a reimplementation, against
 // a scratch WHATSAPP_STATE_DIR — the same override server.ts and
 // update-notice.ts honor. The hook always exits 0 and prints one JSON
-// object; what varies is additionalContext.
+// object; what varies is additionalContext (model-facing) and, when there is
+// an update to announce, systemMessage (user-facing).
 const HOOK = join(import.meta.dir, "..", "hooks-handlers", "session-start.sh");
 const PLUGIN_VERSION: string = JSON.parse(
   readFileSync(
@@ -16,12 +17,17 @@ const PLUGIN_VERSION: string = JSON.parse(
   ),
 ).version;
 
+function runHookRaw(dir: string): Record<string, any> {
+  return JSON.parse(
+    execFileSync("bash", [HOOK], {
+      env: { ...process.env, WHATSAPP_STATE_DIR: dir },
+      encoding: "utf8",
+    }),
+  );
+}
+
 function runHook(dir: string): string {
-  const out = execFileSync("bash", [HOOK], {
-    env: { ...process.env, WHATSAPP_STATE_DIR: dir },
-    encoding: "utf8",
-  });
-  return JSON.parse(out).hookSpecificOutput.additionalContext as string;
+  return runHookRaw(dir).hookSpecificOutput.additionalContext as string;
 }
 
 // A state dir as the current code actually writes it: pretty-printed JSON
@@ -92,8 +98,14 @@ describe("session-start.sh", () => {
       allowFrom: ["886900000000@s.whatsapp.net"],
     });
     writeFileSync(join(dir, ".last-seen-version"), "0.9.0");
-    expect(runHook(dir)).toContain(
+    const out = runHookRaw(dir);
+    // The notice itself is user-facing, and the model still gets the same
+    // briefing it would have had with no notice at all.
+    expect(out.systemMessage).toContain(
       `WhatsApp plugin updated to v${PLUGIN_VERSION}`,
+    );
+    expect(out.hookSpecificOutput.additionalContext).toContain(
+      "fully configured and ready",
     );
   });
 });

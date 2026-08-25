@@ -1,6 +1,6 @@
 ---
 name: access
-description: Manage WhatsApp channel access — approve pairings, edit allowlists, set DM/group policy. Use when the user asks to pair, approve someone, check who's allowed, or change policy for the WhatsApp channel.
+description: Manage WhatsApp channel access — approve pairings, edit allowlists, set DM/group policy. Use when the user asks to pair, approve someone, check who's allowed, or change policy for the WhatsApp channel, and equally when they ask to add contacts or groups, set up or bulk-approve access, or take someone's access away — those are this skill's `review` and `manage` screens, not something to hand-edit.
 user-invocable: true
 allowed-tools:
   - Read
@@ -66,6 +66,23 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 1. Read `~/.whatsapp-channel/access.json` (handle missing file).
 2. Show: dmPolicy, allowFrom count and list, pending count with codes +
    sender IDs + age, groups count.
+3. End with the three things a person can do next. Nothing else advertises
+   them: a release note is seen once at most, and someone who has not read
+   one cannot guess the word `review`. Print these three:
+
+   - Add groups or contacts: `/whatsapp-channel:access review`
+   - Take access back: `/whatsapp-channel:access manage`
+   - Same screens with no AI model involved: run the wizard (or
+     `wizard --revoke`) in your own terminal
+
+   In that last line write the **resolved absolute path** to
+   `scripts/access.ts`, never the literal `${CLAUDE_PLUGIN_ROOT}` — Claude
+   Code substitutes that variable, a user's shell does not, so pasting it
+   verbatim runs `bun "/scripts/access.ts"` and fails. Same rule as the
+   `wizard` section below.
+
+   Do not run any of them off the back of showing this list — it is a
+   signpost, not a prompt. Wait for the user to pick.
 
 ### `pair <code>`
 
@@ -225,10 +242,12 @@ themselves (a marketplace install's real path — not the repo-relative
 `scripts/access.ts`, which resolves to nothing outside a repo checkout).
 Continue helping with everything else in this skill as normal.
 
-`wizard` is the ONLY subcommand of that script you may not run. The `review`
-and `manage` flows below do run it, for `candidates`, `configured`, `allow`,
-`remove`, `group add` and `group rm` — none of which is interactive, and
-none of which decides anything on its own.
+The same applies to `wizard --revoke`, its revoke screen: same terminal-only
+guarantee, same refusal here. `wizard` in either mode is the ONLY subcommand
+of that script you may not run. The `review` and `manage` flows below do run
+it, for `candidates`, `configured`, `allow`, `remove`, `group add` and
+`group rm` — none of which is interactive, and none of which decides
+anything on its own.
 
 ### Running `access.ts` from `review` and `manage`
 
@@ -447,7 +466,8 @@ The CLI also has one command this skill deliberately does not implement:
 `bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" wizard`, a checkbox screen (arrow keys + space +
 enter) over the account's 5 most recently active groups and 10 most
 recently active DM contacts, so review stays to one screen each instead
-of scaling with how many groups/contacts exist. It's terminal-only by
+of scaling with how many groups/contacts exist. Its `--revoke` mode is the
+same screen over everything already configured, uncapped. It's terminal-only by
 design (see the `wizard` entry above) so the decision can be made with a
 verifiable guarantee that no AI model was involved in making it. Point
 the user at it for setting up several groups or contacts at once; use
