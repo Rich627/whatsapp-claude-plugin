@@ -182,9 +182,15 @@ export function findServerPid(
 //
 // ponytail: bounded climb, 3 hops. Ceiling: if this terminal has no server
 // of its own AND a host process (a terminal app owning several tabs) sits
-// within 3 hops, the climb can reach a sibling terminal's wrapper and show
-// its role. 3 covers shell -> [shell] -> CLI with one hop spare and stops
-// short of a tab host in the layouts seen so far. Real fix if that ever
+// within 3 hops, the climb reaches a sibling terminal's wrapper and shows
+// ITS role. Note this is now the deterministic outcome, not a coincidence:
+// findServerPid tries every candidate, so once a sibling's wrapper is in
+// range its live server.ts always wins over this terminal's own wrapper that
+// has none (still starting, or shut down). A confident wrong label, where
+// the first-match version would more often have rendered nothing. Blank was
+// the honest answer, so this trade is only acceptable because the reach
+// needs a tab host inside 3 hops, which no layout seen so far has.
+// 3 covers shell -> [shell] -> CLI with one hop spare. Real fix when it
 // bites: have server.ts record the owning CLI pid in the role file and match
 // on it, instead of inferring ownership from the process tree.
 const ANCESTOR_MAX_HOPS = 3;

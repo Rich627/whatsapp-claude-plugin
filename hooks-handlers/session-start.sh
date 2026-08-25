@@ -54,6 +54,12 @@ else
 	# nothing otherwise — a real bun script rather than more bash so version
 	# compare and JSON escaping reuse localeCompare/JSON.stringify instead
 	# of reimplementing both (see scripts/update-notice.ts).
+	# Keep this one message free of backslash escapes, unlike the three
+	# branches above. They are interpolated raw into the heredoc's JSON string,
+	# so their "\n" has to be pre-escaped; this one ALSO goes through
+	# JSON.stringify in update-notice.ts, which would escape the backslash
+	# again and ship a literal \n to the model. Plain prose reads identically
+	# down both paths.
 	msg="WhatsApp channel is fully configured and ready. Paired contacts can message this session."
 	# Passed in because the notice REPLACES this handler's output: the script
 	# carries this same message through on its own hookSpecificOutput, so a

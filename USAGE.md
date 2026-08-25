@@ -242,9 +242,8 @@ terminal, then looks for the plugin's own wrapper process among that CLI's
 descendants, then `server.ts` among that wrapper's children. Several
 processes can carry the plugin dir name in their command line, including
 the statusline shell itself, so every wrapper candidate is tried and the
-one with a `server.ts` under it wins. Same-machine, read-only, never throws
-
-- a miss just means no segment, not a broken statusline.
+one with a `server.ts` under it wins. Same-machine, read-only, never throws:
+a miss just means no segment, not a broken statusline.
 
 ## Known limitations
 

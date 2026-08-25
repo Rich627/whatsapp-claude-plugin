@@ -68,13 +68,18 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
    sender IDs + age, groups count.
 3. End with the three things a person can do next. Nothing else advertises
    them: a release note is seen once at most, and someone who has not read
-   one cannot guess the word `review`. Print exactly:
+   one cannot guess the word `review`. Print these three:
 
    - Add groups or contacts: `/whatsapp-claude-channel:access review`
    - Take access back: `/whatsapp-claude-channel:access manage`
-   - Same screens with no AI model involved: run
-     `bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" wizard` (or
+   - Same screens with no AI model involved: run the wizard (or
      `wizard --revoke`) in your own terminal
+
+   In that last line write the **resolved absolute path** to
+   `scripts/access.ts`, never the literal `${CLAUDE_PLUGIN_ROOT}` — Claude
+   Code substitutes that variable, a user's shell does not, so pasting it
+   verbatim runs `bun "/scripts/access.ts"` and fails. Same rule as the
+   `wizard` section below.
 
    Do not run any of them off the back of showing this list — it is a
    signpost, not a prompt. Wait for the user to pick.

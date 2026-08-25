@@ -89,6 +89,23 @@ describe("update-notice.ts", () => {
     );
   });
 
+  // The head-of-CHANGELOG fallback above is only truthful while the head IS
+  // the shipping version. Bump plugin.json without adding an entry and the
+  // first-run notice says "updated to v0.21.0" over v0.20.0's bullets - the
+  // same header/body mismatch, one version narrower. Nothing else enforces
+  // the pairing, so this test is the enforcement: it fails at release time,
+  // when adding the missing entry is trivial.
+  test("the newest CHANGELOG entry is the version actually shipping", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wa-notice-invariant-"));
+    const ctx = JSON.parse(run(dir)).systemMessage as string;
+    const source = readFileSync(join(import.meta.dir, "update-notice.ts"), {
+      encoding: "utf8",
+    });
+    const firstEntry = source.match(/version:\s*"([^"]+)"/)?.[1];
+    expect(firstEntry).toBe(PLUGIN_VERSION);
+    expect(ctx).toContain(`updated to v${PLUGIN_VERSION}`);
+  });
+
   test("skipped entirely in static mode (env var) — no output, no write", () => {
     const dir = mkdtempSync(join(tmpdir(), "wa-notice-static-env-"));
     writeFileSync(join(dir, ".last-seen-version"), "0.1.0");
