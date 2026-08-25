@@ -225,10 +225,12 @@ themselves (a marketplace install's real path — not the repo-relative
 `scripts/access.ts`, which resolves to nothing outside a repo checkout).
 Continue helping with everything else in this skill as normal.
 
-`wizard` is the ONLY subcommand of that script you may not run. The `review`
-and `manage` flows below do run it, for `candidates`, `configured`, `allow`,
-`remove`, `group add` and `group rm` — none of which is interactive, and
-none of which decides anything on its own.
+The same applies to `wizard --revoke`, its revoke screen: same terminal-only
+guarantee, same refusal here. `wizard` in either mode is the ONLY subcommand
+of that script you may not run. The `review` and `manage` flows below do run
+it, for `candidates`, `configured`, `allow`, `remove`, `group add` and
+`group rm` — none of which is interactive, and none of which decides
+anything on its own.
 
 ### Running `access.ts` from `review` and `manage`
 
@@ -447,7 +449,8 @@ The CLI also has one command this skill deliberately does not implement:
 `bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" wizard`, a checkbox screen (arrow keys + space +
 enter) over the account's 5 most recently active groups and 10 most
 recently active DM contacts, so review stays to one screen each instead
-of scaling with how many groups/contacts exist. It's terminal-only by
+of scaling with how many groups/contacts exist. Its `--revoke` mode is the
+same screen over everything already configured, uncapped. It's terminal-only by
 design (see the `wizard` entry above) so the decision can be made with a
 verifiable guarantee that no AI model was involved in making it. Point
 the user at it for setting up several groups or contacts at once; use

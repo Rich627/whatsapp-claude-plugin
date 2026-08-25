@@ -108,6 +108,17 @@ Both fail with a clear error if the group's `roster` flag isn't granted.
 - Ctrl-C cancels cleanly at any point; nothing is written until every question on screen has been answered.
 - A group the wizard adds gets `requireMention: true` (only reply when addressed) — a more cautious default than `group add`'s own CLI default of `false` (reply to everything), deliberately: the wizard is the guided path for a less technical setup, the CLI is for someone already comfortable with explicit flags. Change it after the fact with `group add --mention` or `--no-mention`.
 
+### Taking access back (`wizard --revoke`)
+
+`bun scripts/access.ts wizard --revoke` is the same screen in reverse: it lists **everything currently configured** — every group in `access.json`'s `groups`, every contact in `allowFrom` — and you tick what should lose access. Unlike the grant screen it is never capped or ranked: a revoke list that left entries off could leave them permanently unrevokable.
+
+- **Leaving everything unticked removes nothing.** An empty selection is never read as "remove all".
+- Revoking a group keeps its `config.md` and `memory.md`, same as `group rm`, in case you add it back.
+- Revoking a contact also forgets their cached name and recency — unless another allowlist entry still resolves to the same person (someone allowlisted under both their `@lid` and phone form), in which case the cache is kept, because the surviving grant still needs it.
+- Ctrl-C cancels cleanly, and nothing is written until every question on screen has been answered.
+
+It reads the same two functions the in-session `/whatsapp-claude-channel:access manage` screen reads, so the terminal and the chat path cannot disagree about what is configured or what a revoke cleans up.
+
 Group/contact names and recency come from caches (`~/.whatsapp-channel/groups-meta.json`, `dm-activity.json`, `contacts.json`) that only the running server writes — automatically, as WhatsApp reports chat activity, no manual step needed once the account has connected at least once. If it's never connected yet, the wizard has nothing to show; pair it first. `groups-meta.json` is always written; `dm-activity.json` and `contacts.json` follow `WHATSAPP_CACHE_CONTACTS` (see "Names and privacy" above) — with it off (the default), the DM screen has nothing to rank until you turn it on.
 
 It's a terminal command, deliberately not a Claude Code skill: running it yourself, outside any chat, is what makes this true —
@@ -160,7 +171,11 @@ This only controls whether Claude _announces_ a role change. The underlying prim
 
 ### Update notice
 
-The first Claude Code session that starts after the plugin's version has changed since it last recorded one (tracked per account in `~/.whatsapp-channel/.last-seen-version`) gets a one-time notice listing what changed, including a nudge toward the [guided setup wizard](#guided-bulk-setup-wizard) if you haven't run it yet — the wizard itself has always required running manually, this notice is just what tells you it exists. Shown once per version, not on every session start of the same version. Delivered by the SessionStart hook (`hooks-handlers/session-start.sh`, calling `scripts/update-notice.ts`), the same hook that guides first-time setup — a version bump has nothing to do with the WhatsApp connection itself, so it doesn't come from `server.ts`. Skipped in `WHATSAPP_ACCESS_MODE=static`, which can't write local state (see above).
+Two different notices, from the same script (`scripts/update-notice.ts`):
+
+**"What's new"** — the first Claude Code session that starts after the plugin's version has changed since it last recorded one (tracked per account in `~/.whatsapp-channel/.last-seen-version`) gets a one-time notice listing what changed, including a nudge toward the [guided setup wizard](#guided-bulk-setup-wizard) if you haven't run it yet — the wizard itself has always required running manually, this notice is just what tells you it exists. Shown once per version, not on every session start of the same version. Delivered by the SessionStart hook (`hooks-handlers/session-start.sh`, calling `scripts/update-notice.ts`), the same hook that guides first-time setup — a version bump has nothing to do with the WhatsApp connection itself, so it doesn't come from `server.ts`. Skipped in `WHATSAPP_ACCESS_MODE=static`, which can't write local state (see above).
+
+**"Update available"** — tells you a newer version exists that you have **not** installed yet, which the notice above can never do (it reads the running plugin's own `plugin.json`, so by the time it fires you already have the update). It compares the running version against what your marketplace clone advertises — both already on disk, refreshed by Claude Code itself, so there is no network call and nothing to configure. Unlike the one-time notice it is not gated on `.last-seen-version`: it repeats every session until you actually update, and goes quiet by itself once you do. Also skipped in static mode.
 
 ## Skill reference
 

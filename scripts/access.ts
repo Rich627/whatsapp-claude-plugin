@@ -129,6 +129,8 @@ const USAGE = `Usage: bun scripts/access.ts <command>
   group rm <groupJid>             stop responding in a group (files kept)
   wizard [--include-archived]     guided group setup: can-act / can-see-roster,
                                    per group, from names cached by list_groups
+  wizard --revoke                 the same screen in reverse: tick what to
+                                   take access AWAY from
   candidates [--include-archived] JSON: groups/contacts not configured yet
   configured                      JSON: groups/contacts already configured
   set <key> <value>               ${SET_KEYS.join(", ")}
@@ -475,6 +477,91 @@ async function wizard(args: string[]): Promise<void> {
   process.stdout.write(`\n${highlight(PRIVACY_DISCLOSURE)}\n`);
 }
 
+// The revoke half of the terminal wizard (issue #1). Until this existed the
+// only supported way to take access back was `remove`/`group rm` one JID at
+// a time, or editing access.json by hand - while the wizard's own update
+// notice pointed users at it as though it were the access screen.
+//
+// Reuses listConfiguredGroups/listConfiguredDms, the same two functions the
+// in-session `manage` screen reads through `configured`, so the terminal and
+// the in-session path cannot disagree about what is configured, how a row is
+// labelled, or what a revoke cleans up.
+//
+// Same terminal-only, no-model guarantee as the grant screen above, and the
+// same rule in both: an empty selection removes NOTHING. A revoke screen
+// that read "no ticks" as "remove all" would be a catastrophe on a mis-Enter.
+async function wizardRevoke(): Promise<void> {
+  const a = load();
+  const groups = listConfiguredGroups(a.groups, loadGroupsMeta());
+  const dms = listConfiguredDms(a.allowFrom, loadContacts(), loadLidMap());
+
+  if (groups.length === 0 && dms.length === 0) {
+    die("Nothing is configured yet - there is no access to take away.");
+  }
+
+  let dropGroups: string[] = [];
+  let dropDms: string[] = [];
+  try {
+    if (groups.length > 0) {
+      dropGroups = await checkbox({
+        message:
+          "Which groups should Claude STOP replying in? (leave all unticked to keep everything)",
+        choices: groups.map((c) => ({ name: c.label, value: c.jid })),
+      });
+    }
+    if (dms.length > 0) {
+      dropDms = await checkbox({
+        message:
+          "Which contacts should lose DM access? (leave all unticked to keep everything)",
+        choices: dms.map((c) => ({ name: c.label, value: c.jid })),
+      });
+    }
+  } catch (err) {
+    if (err instanceof Error && err.name === "ExitPromptError") {
+      process.stdout.write("\nCancelled - nothing was changed.\n");
+      return;
+    }
+    throw err;
+  }
+
+  if (dropGroups.length === 0 && dropDms.length === 0) {
+    process.stdout.write("\nNothing selected - nothing was changed.\n");
+    process.stdout.write(`\n${highlight(PRIVACY_DISCLOSURE)}\n`);
+    return;
+  }
+
+  // Re-load for the same reason the grant screen does: the checkbox prompts
+  // block on the user for an unbounded time and the server can write
+  // access.json in that window.
+  const fresh = load();
+  for (const jid of dropGroups) delete fresh.groups[jid];
+  // Filtered by exact string, never a LID-resolved substitute - the
+  // candidate's jid is the untouched allowFrom entry precisely so this
+  // matches (see listConfiguredDms).
+  fresh.allowFrom = fresh.allowFrom.filter((j) => !dropDms.includes(j));
+  save(fresh);
+
+  const lines: string[] = [];
+  for (const jid of dropGroups) {
+    const label = groups.find((c) => c.jid === jid)?.label ?? jid;
+    lines.push(`- ${label}: Claude will not reply there any more.`);
+  }
+  for (const jid of dropDms) {
+    const label = dms.find((c) => c.jid === jid)?.label ?? jid;
+    lines.push(
+      `- ${label}: DM access removed.${CACHE_NOTE[revokeCachedIdentity(fresh.allowFrom, jid)]}`,
+    );
+  }
+
+  process.stdout.write(`\n${lines.join("\n")}\n`);
+  if (dropGroups.length > 0) {
+    process.stdout.write(
+      "\nTheir config.md and memory.md are kept, in case you add them back.\n",
+    );
+  }
+  process.stdout.write(`\n${highlight(PRIVACY_DISCLOSURE)}\n`);
+}
+
 // Read-only JSON for the in-session `review` and `manage` screens in
 // skills/access/SKILL.md. The skill EXECUTES these instead of restating
 // the ranking and labelling rules in prose: every drift a review has caught
@@ -561,6 +648,39 @@ function forgetCachedIdentity(jid: string): boolean {
   return forgot || forgotActivity;
 }
 
+// What revoking ONE allowlist entry should do to that contact's cached
+// name and recency. Shared by `remove` and the wizard's revoke screen so
+// the rule cannot drift between them - it has two edges that are easy to
+// get wrong separately:
+//
+//  - One person can sit in allowFrom TWICE, under both their @lid and their
+//    phone form, and both resolve to the same cache key. Revoking one form
+//    while the other still grants access must keep the cache, or the
+//    surviving grant goes on working while the contact silently degrades to
+//    a bare masked number everywhere.
+//  - Claiming to have forgotten (or kept) a cached name that never existed
+//    is a false statement to the user either way, so "nothing" is a distinct
+//    answer from both.
+//
+// `remaining` is allowFrom AFTER the entry has been taken out.
+type CacheOutcome = "forgot" | "kept" | "nothing";
+const CACHE_NOTE: Record<CacheOutcome, string> = {
+  forgot: " Forgot their cached name too.",
+  kept: " Kept their cached name - another allowlist entry still resolves to the same contact.",
+  nothing: "",
+};
+function revokeCachedIdentity(
+  remaining: readonly string[],
+  jid: string,
+): CacheOutcome {
+  const lidMap = loadLidMap();
+  const key = contactKeyFor(lidMap, jid);
+  const stillAllowed = remaining.some((j) => contactKeyFor(lidMap, j) === key);
+  if (!stillAllowed) return forgetCachedIdentity(jid) ? "forgot" : "nothing";
+  const cached = key in loadContacts() || key in loadDmActivity();
+  return cached ? "kept" : "nothing";
+}
+
 function set(key: string, rawValue: string): void {
   if (!SET_KEYS.includes(key)) {
     die(`Unknown key "${key}". Supported: ${SET_KEYS.join(", ")}`);
@@ -626,32 +746,8 @@ switch (command) {
     if (!a.allowFrom.includes(jid)) die(`${jid} is not on the allowlist.`);
     a.allowFrom = a.allowFrom.filter((j) => j !== jid);
     save(a);
-    // One contact can sit in allowFrom twice, under both its @lid and its
-    // phone form, and BOTH resolve to the same contacts.json /
-    // dm-activity.json key. Revoking one form while the other still grants
-    // access must not wipe that shared cache: the surviving grant would go
-    // on working while the contact silently degraded to a bare masked
-    // number everywhere, and this command would report them "forgotten"
-    // while they could still message Claude.
-    const lidMap = loadLidMap();
-    const key = contactKeyFor(lidMap, jid);
-    const stillAllowed = a.allowFrom.some(
-      (j) => contactKeyFor(lidMap, j) === key,
-    );
-    // Guarded on something actually being cached, the same way the
-    // "Forgot" half is: a contact allowlisted by JID who has never DMed
-    // has no cached name, and claiming one was KEPT is as wrong as
-    // claiming one was forgotten.
-    const cached = key in loadContacts() || key in loadDmActivity();
-    const forgot = stillAllowed ? false : forgetCachedIdentity(jid);
-    process.stdout.write(
-      `Removed ${jid}.` +
-        (forgot ? " Forgot their cached name too." : "") +
-        (stillAllowed && cached
-          ? " Kept their cached name - another allowlist entry still resolves to the same contact."
-          : "") +
-        "\n",
-    );
+    const outcome = revokeCachedIdentity(a.allowFrom, jid);
+    process.stdout.write(`Removed ${jid}.` + CACHE_NOTE[outcome] + "\n");
     break;
   }
   case "forget": {
@@ -684,7 +780,8 @@ switch (command) {
     group(rest);
     break;
   case "wizard":
-    await wizard(rest);
+    if (rest.includes("--revoke")) await wizardRevoke();
+    else await wizard(rest);
     break;
   case "candidates":
     candidates(rest);

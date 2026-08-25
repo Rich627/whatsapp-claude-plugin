@@ -3,7 +3,12 @@ import { execFileSync, spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { findServerPid, formatSegment, type ProcRow } from "./statusline-role";
+import {
+  findServerPid,
+  findServerPidForTerminal,
+  formatSegment,
+  type ProcRow,
+} from "./statusline-role";
 
 describe("findServerPid", () => {
   test("matches the real CLI -> plugin wrapper -> server.ts chain", () => {
@@ -162,5 +167,155 @@ describe("end-to-end (real processes)", () => {
       "server.ts",
     );
     expect(out).toBe("");
+  });
+});
+
+// Issue #3. Every fixture above hands findServerPid the CLI pid directly,
+// which is why they all passed while the segment never rendered on a real
+// machine: a statusLine setting is a compound command, so the script runs
+// under a shell that is the wrapper's SIBLING, and a downward search from
+// there can never reach it.
+describe("findServerPidForTerminal", () => {
+  // claude.exe(100) ├── wrapper(200) ── server(300)
+  //                 └── statusline shell(400)   <- process.ppid
+  const siblingShell: ProcRow[] = [
+    { pid: 100, ppid: 1, command: "claude.exe" },
+    {
+      pid: 200,
+      ppid: 100,
+      command: "bun run --cwd plugin/whatsapp-claude-channel/0.1 start",
+    },
+    { pid: 300, ppid: 200, command: "bun.exe server.ts" },
+    { pid: 400, ppid: 100, command: "sh -c statusline-command.sh && bun ..." },
+  ];
+
+  test("finds the server when it starts at a SIBLING of the wrapper", () => {
+    // The regression: searching down from 400 alone returns null.
+    expect(
+      findServerPid(siblingShell, 400, "whatsapp-claude-channel", "server.ts"),
+    ).toBeNull();
+    expect(
+      findServerPidForTerminal(
+        siblingShell,
+        400,
+        "whatsapp-claude-channel",
+        "server.ts",
+      ),
+    ).toBe(300);
+  });
+
+  test("still works when started at the CLI itself, no climb needed", () => {
+    expect(
+      findServerPidForTerminal(
+        siblingShell,
+        100,
+        "whatsapp-claude-channel",
+        "server.ts",
+      ),
+    ).toBe(300);
+  });
+
+  test("climbs through an extra shell hop", () => {
+    const nested: ProcRow[] = [
+      ...siblingShell,
+      { pid: 500, ppid: 400, command: "bun statusline-role.ts" },
+    ];
+    expect(
+      findServerPidForTerminal(
+        nested,
+        500,
+        "whatsapp-claude-channel",
+        "server.ts",
+      ),
+    ).toBe(300);
+  });
+
+  // The climb is bounded on purpose: with two terminals there are two CLIs,
+  // each with its own wrapper, and climbing far enough to reach a shared
+  // host would show the OTHER terminal's role.
+  test("stops climbing at the hop limit rather than reaching further up", () => {
+    const deep: ProcRow[] = [
+      { pid: 1, ppid: 0, command: "host" },
+      {
+        pid: 2,
+        ppid: 1,
+        command: "bun run --cwd plugin/whatsapp-claude-channel/0.1 start",
+      },
+      { pid: 3, ppid: 2, command: "bun.exe server.ts" },
+      { pid: 10, ppid: 1, command: "a" },
+      { pid: 11, ppid: 10, command: "b" },
+      { pid: 12, ppid: 11, command: "c" },
+      { pid: 13, ppid: 12, command: "d" },
+      { pid: 14, ppid: 13, command: "statusline" },
+    ];
+    expect(
+      findServerPidForTerminal(
+        deep,
+        14,
+        "whatsapp-claude-channel",
+        "server.ts",
+        1,
+      ),
+    ).toBeNull();
+  });
+
+  test("nearest ancestor wins, so a sibling terminal's server is not picked", () => {
+    const twoTerminals: ProcRow[] = [
+      { pid: 1, ppid: 0, command: "terminal host" },
+      // Terminal A, further up.
+      { pid: 10, ppid: 1, command: "claude.exe A" },
+      {
+        pid: 11,
+        ppid: 10,
+        command: "bun run --cwd plugin/whatsapp-claude-channel/0.1 start",
+      },
+      { pid: 12, ppid: 11, command: "bun.exe server.ts" },
+      // Terminal B, ours.
+      { pid: 20, ppid: 1, command: "claude.exe B" },
+      {
+        pid: 21,
+        ppid: 20,
+        command: "bun run --cwd plugin/whatsapp-claude-channel/0.1 start",
+      },
+      { pid: 22, ppid: 21, command: "bun.exe server.ts" },
+      { pid: 23, ppid: 20, command: "sh -c statusline" },
+    ];
+    expect(
+      findServerPidForTerminal(
+        twoTerminals,
+        23,
+        "whatsapp-claude-channel",
+        "server.ts",
+      ),
+    ).toBe(22);
+  });
+
+  test("a self-parenting row or a pid 0 parent terminates instead of spinning", () => {
+    // Both shapes turn up in real Win32_Process output.
+    const loop: ProcRow[] = [
+      { pid: 7, ppid: 7, command: "self-parenting" },
+      { pid: 8, ppid: 0, command: "orphan" },
+    ];
+    expect(
+      findServerPidForTerminal(loop, 7, "whatsapp-claude-channel", "server.ts"),
+    ).toBeNull();
+    expect(
+      findServerPidForTerminal(loop, 8, "whatsapp-claude-channel", "server.ts"),
+    ).toBeNull();
+  });
+
+  test("returns null when nothing in the chain owns a wrapper", () => {
+    const none: ProcRow[] = [
+      { pid: 100, ppid: 1, command: "claude.exe" },
+      { pid: 400, ppid: 100, command: "sh -c statusline" },
+    ];
+    expect(
+      findServerPidForTerminal(
+        none,
+        400,
+        "whatsapp-claude-channel",
+        "server.ts",
+      ),
+    ).toBeNull();
   });
 });

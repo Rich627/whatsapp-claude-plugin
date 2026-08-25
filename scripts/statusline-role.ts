@@ -7,15 +7,17 @@
  * already prints, e.g.:
  *   your-existing-statusline-command && bun <plugin-dir>/scripts/statusline-role.ts
  *
- * Finds the server in two steps: first the plugin's own wrapper process
- * (a descendant of the Claude Code CLI that spawned this statusline command,
- * identified by the plugin dir name — unique even when another plugin's
- * server also happens to be named server.ts, which is common enough that
- * matching "server.ts" against the whole process tree picks the wrong one),
- * then server.ts among *that wrapper's* children specifically. Reads the
- * matched pid's role file (written by server.ts on every role change — see
- * ROLE_FILE there). Never throws, never writes: prints nothing and exits 0
- * on any miss, same contract as the tool it's meant to sit quietly next to.
+ * Finds the server in three steps: climb the ppid chain to the Claude Code
+ * CLI that owns this terminal (this script does NOT run as its direct child
+ * — see findServerPidForTerminal), then the plugin's own wrapper process
+ * among that CLI's descendants (identified by the plugin dir name — unique
+ * even when another plugin's server also happens to be named server.ts,
+ * which is common enough that matching "server.ts" against the whole process
+ * tree picks the wrong one), then server.ts among *that wrapper's* children
+ * specifically. Reads the matched pid's role file (written by server.ts on
+ * every role change — see ROLE_FILE there). Never throws, never writes:
+ * prints nothing and exits 0 on any miss, same contract as the tool it's
+ * meant to sit quietly next to.
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
@@ -25,8 +27,10 @@ import { join } from "node:path";
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
 // Overridable for tests only — production matches this plugin's own dir
-// name (unique across the process tree) and walks up to this script's real
-// parent, the Claude Code CLI.
+// name, which is unique across the process tree. NOTE process.ppid is NOT
+// the Claude Code CLI: a statusLine setting is a compound command, so this
+// runs under a shell the CLI spawned separately. findServerPidForTerminal
+// is what gets from here to the CLI.
 const WRAPPER_MATCH =
   process.env.WA_STATUSLINE_WRAPPER_MATCH ?? "whatsapp-channel";
 const SERVER_MATCH = process.env.WA_STATUSLINE_MATCH ?? "server.ts";
@@ -121,6 +125,56 @@ export function findServerPid(
   return findDescendant(rows, wrapperPid, serverMatch, SERVER_MAX_DEPTH);
 }
 
+// The bug this exists for (issue #3): a statusLine setting is a compound
+// command, so this script runs under a shell that the CLI spawned SEPARATELY
+// from the plugin wrapper. The shell is the wrapper's SIBLING, not its
+// ancestor:
+//
+//   claude.exe (CLI)
+//   ├── bun run --cwd <plugin> start   (wrapper)
+//   │   └── bun server.ts              <- the role file lives here
+//   └── sh -c "<statusline command>"   <- process.ppid, where we start
+//
+// So searching down from process.ppid could never reach the wrapper, and
+// the segment silently never rendered from PR #18 until now. Climb to the
+// first common ancestor instead, retrying the wrapper search at each hop,
+// nearest first.
+//
+// Deliberately NOT a scan of the whole process table: two terminals means
+// two CLIs each with their own wrapper, and an arbitrary pick would show the
+// OTHER terminal's role — the one thing this segment exists to tell apart.
+//
+// ponytail: bounded climb, 3 hops. Ceiling: if this terminal has no server
+// of its own AND a host process (a terminal app owning several tabs) sits
+// within 3 hops, the climb can reach a sibling terminal's wrapper and show
+// its role. 3 covers shell -> [shell] -> CLI with one hop spare and stops
+// short of a tab host in the layouts seen so far. Real fix if that ever
+// bites: have server.ts record the owning CLI pid in the role file and match
+// on it, instead of inferring ownership from the process tree.
+const ANCESTOR_MAX_HOPS = 3;
+
+export function findServerPidForTerminal(
+  rows: ProcRow[],
+  startPid: number,
+  wrapperMatch: string,
+  serverMatch: string,
+  maxHops: number = ANCESTOR_MAX_HOPS,
+): number | null {
+  const byPid = new Map(rows.map((r) => [r.pid, r]));
+  const visited = new Set<number>();
+  let pid: number | undefined = startPid;
+  for (let hop = 0; hop <= maxHops; hop++) {
+    // pid 0 and a self-parenting row both appear in real Win32_Process
+    // output; either would spin this loop forever without the guards.
+    if (pid === undefined || pid <= 0 || visited.has(pid)) return null;
+    visited.add(pid);
+    const found = findServerPid(rows, pid, wrapperMatch, serverMatch);
+    if (found !== null) return found;
+    pid = byPid.get(pid)?.ppid;
+  }
+  return null;
+}
+
 export function formatSegment(role: string): string {
   const color = COLOR[role];
   return color ? `${color}WA:${role}${RESET}` : "";
@@ -128,7 +182,7 @@ export function formatSegment(role: string): string {
 
 function main(): void {
   try {
-    const pid = findServerPid(
+    const pid = findServerPidForTerminal(
       listProcesses(),
       PARENT_PID,
       WRAPPER_MATCH,

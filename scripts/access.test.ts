@@ -814,3 +814,103 @@ describe("configured (JSON for the in-session manage/revoke screen)", () => {
     expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
   });
 });
+
+// Issue #1: until this existed the wizard could only ever GRANT, so an
+// existing user pointed at it by the update notice found no way to take
+// access back short of editing access.json by hand.
+describe("wizard --revoke", () => {
+  test("nothing configured: refuses with a clear message, writes nothing", () => {
+    const dir = freshStateDir();
+    const res = run(dir, "wizard", "--revoke");
+    expect(res.code).toBe(1);
+    expect(res.out).toContain("no access to take away");
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
+  });
+
+  test.skipIf(!!process.env.CI)(
+    "select none: an empty selection removes NOTHING, never everything",
+    () => {
+      const dir = freshStateDir();
+      run(dir, "allow", "61403911675@s.whatsapp.net");
+      const before = readFileSync(join(dir, "access.json"), "utf8");
+      const res = runWithInput(dir, "\n", "wizard", "--revoke");
+      expect(res.code).toBe(0);
+      expect(res.out).toContain("Nothing selected");
+      expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
+    },
+  );
+
+  test.skipIf(!!process.env.CI)(
+    "select the one contact: dropped from the allowlist and forgotten",
+    () => {
+      const dir = freshStateDir();
+      writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
+      writeDmActivity(dir, { "61403911675@s.whatsapp.net": 1000 });
+      run(dir, "allow", "61403911675@s.whatsapp.net");
+      const res = runWithInput(dir, " \n", "wizard", "--revoke");
+      expect(res.code).toBe(0);
+      // Labelled, not raw-numbered.
+      expect(res.out).toContain("Rohan");
+      expect(res.out).toContain("Forgot their cached name");
+      expect(access(dir).allowFrom).toEqual([]);
+      expect(readContacts(dir)["61403911675@s.whatsapp.net"]).toBeUndefined();
+    },
+  );
+
+  test.skipIf(!!process.env.CI)(
+    "select the one group: dropped, but its config.md and memory.md are kept",
+    () => {
+      const dir = freshStateDir();
+      writeGroupsMeta(dir, {
+        "1@g.us": {
+          name: "Family",
+          memberCount: 4,
+          archived: false,
+          updatedAt: 0,
+        },
+      });
+      run(dir, "group", "add", "1@g.us");
+      const config = join(dir, "groups", "1@g.us", "config.md");
+      expect(existsSync(config)).toBe(true);
+      const res = runWithInput(dir, " \n", "wizard", "--revoke");
+      expect(res.code).toBe(0);
+      expect(res.out).toContain("Family");
+      expect(access(dir).groups["1@g.us"]).toBeUndefined();
+      expect(existsSync(config)).toBe(true);
+    },
+  );
+
+  test.skipIf(!!process.env.CI)(
+    "revoking one form of a doubly-allowlisted contact keeps the shared cache",
+    () => {
+      // Same guard `remove` applies - shared through revokeCachedIdentity so
+      // the two screens cannot drift apart on it.
+      const dir = freshStateDir();
+      writeLidMap(dir, {
+        "228896205193224@lid": "61432609386@s.whatsapp.net",
+      });
+      writeContacts(dir, { "61432609386@s.whatsapp.net": { name: "Soham" } });
+      run(dir, "allow", "228896205193224@lid");
+      run(dir, "allow", "61432609386@s.whatsapp.net");
+      // Rows sort by label then JID, so the @lid form is first; space ticks
+      // it, enter submits.
+      const res = runWithInput(dir, " \n", "wizard", "--revoke");
+      expect(res.code).toBe(0);
+      expect(res.out).toContain("Kept their cached name");
+      expect(access(dir).allowFrom).toEqual(["61432609386@s.whatsapp.net"]);
+      expect(readContacts(dir)["61432609386@s.whatsapp.net"]).toEqual({
+        name: "Soham",
+      });
+    },
+  );
+
+  test.skipIf(!!process.env.CI)(
+    "still prints the no-AI disclosure - a revoke is as terminal-only as a grant",
+    () => {
+      const dir = freshStateDir();
+      run(dir, "allow", "1@s.whatsapp.net");
+      const res = runWithInput(dir, "\n", "wizard", "--revoke");
+      expect(res.out).toContain("No group or contact data was sent to any AI");
+    },
+  );
+});
