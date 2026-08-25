@@ -57,6 +57,12 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.21.1",
+      notes: [
+        "Fixed: the WA:<role> statusline segment could keep showing a role after its server had been killed, because the file it reads is only removed on a clean shutdown. It now checks the server is still running before believing the file.",
+      ],
+    },
+    {
       version: "0.21.0",
       notes: [
         `The guided setup wizard can now take access back, not just hand it out: \`${WIZARD_CMD} --revoke\` lists everything currently configured and you tick what should lose access. Leaving everything unticked removes nothing.`,
