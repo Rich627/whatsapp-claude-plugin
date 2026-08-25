@@ -46,6 +46,12 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.19.0",
+      notes: [
+        "Access review now works without leaving the chat: `/whatsapp-claude-channel:access review` shows a checkbox list of your most recently active groups and contacts to approve, and `manage` shows what is already approved so you can take it back. The terminal wizard is still there when you want a decision made with no AI model in the room.",
+      ],
+    },
+    {
       version: "0.18.0",
       notes: [
         "Proactive notifications: Claude now tells you about an inbound message, a role change, a pairing code, or this notice right away instead of waiting for its next natural reply. Set WHATSAPP_QUIET=1 on a terminal to turn that off.",

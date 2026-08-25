@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   contactKeyFor,
+  groupAnchor,
   listConfiguredDms,
   listConfiguredGroups,
   normalizeJid,
@@ -185,14 +186,20 @@ describe("rankDms", () => {
     const activity = { "x@s.whatsapp.net": 100 };
     const contacts: ContactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
     const result = rankDms(activity, contacts, [], {}, 10);
-    expect(result).toEqual([{ jid: "x@s.whatsapp.net", label: "Akash" }]);
+    expect(result).toEqual([
+      { jid: "x@s.whatsapp.net", label: "Akash", description: "•••••" },
+    ]);
   });
 
   test("shows a masked number when no name is known", () => {
     const activity = { "61403911675@s.whatsapp.net": 100 };
     const result = rankDms(activity, {}, [], {}, 10);
     expect(result).toEqual([
-      { jid: "61403911675@s.whatsapp.net", label: "•••••1675" },
+      {
+        jid: "61403911675@s.whatsapp.net",
+        label: "•••••1675",
+        description: "•••••1675",
+      },
     ]);
   });
 
@@ -203,7 +210,11 @@ describe("rankDms", () => {
     };
     const result = rankDms(activity, contacts, [], {}, 10);
     expect(result).toEqual([
-      { jid: "61403911675@s.whatsapp.net", label: "•••••1675" },
+      {
+        jid: "61403911675@s.whatsapp.net",
+        label: "•••••1675",
+        description: "•••••1675",
+      },
     ]);
   });
 
@@ -220,6 +231,7 @@ describe("rankDms", () => {
       {
         jid: "61403911675@s.whatsapp.net",
         label: "Mum (unverified) - •••••1675",
+        description: "•••••1675",
       },
     ]);
   });
@@ -230,7 +242,9 @@ describe("rankDms", () => {
       "x@s.whatsapp.net": { name: "Akash", notify: "some other name" },
     };
     const result = rankDms(activity, contacts, [], {}, 10);
-    expect(result).toEqual([{ jid: "x@s.whatsapp.net", label: "Akash" }]);
+    expect(result).toEqual([
+      { jid: "x@s.whatsapp.net", label: "Akash", description: "•••••" },
+    ]);
   });
 
   test("respects the limit", () => {
@@ -286,14 +300,24 @@ describe("listConfiguredGroups", () => {
     const meta = { "a@g.us": group({ name: "Alpha", archived: true }) };
     const result = listConfiguredGroups(groups, meta);
     expect(result).toEqual([
-      { jid: "a@g.us", label: "Alpha  (1 member(s))  [archived]" },
+      {
+        jid: "a@g.us",
+        label: "Alpha  (1 member(s))  [archived]",
+        description: "a@g.us",
+      },
     ]);
   });
 
   test("a configured JID with no meta entry is listed with the raw JID as its label", () => {
     const groups = { "unknown@g.us": {} };
     const result = listConfiguredGroups(groups, {});
-    expect(result).toEqual([{ jid: "unknown@g.us", label: "unknown@g.us" }]);
+    expect(result).toEqual([
+      {
+        jid: "unknown@g.us",
+        label: "unknown@g.us",
+        description: "unknown@g.us",
+      },
+    ]);
   });
 
   test("a meta entry that is not configured is absent from the result", () => {
@@ -315,7 +339,9 @@ describe("listConfiguredDms", () => {
   test("saved .name shown plain", () => {
     const contacts: ContactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
     const result = listConfiguredDms(["x@s.whatsapp.net"], contacts, {});
-    expect(result).toEqual([{ jid: "x@s.whatsapp.net", label: "Akash" }]);
+    expect(result).toEqual([
+      { jid: "x@s.whatsapp.net", label: "Akash", description: "•••••" },
+    ]);
   });
 
   test(".notify-only shows unverified paired with the masked number", () => {
@@ -331,6 +357,7 @@ describe("listConfiguredDms", () => {
       {
         jid: "61403911675@s.whatsapp.net",
         label: "Mum (unverified) - •••••1675",
+        description: "•••••1675",
       },
     ]);
   });
@@ -345,14 +372,22 @@ describe("listConfiguredDms", () => {
       {},
     );
     expect(result).toEqual([
-      { jid: "61403911675@s.whatsapp.net", label: "•••••1675" },
+      {
+        jid: "61403911675@s.whatsapp.net",
+        label: "•••••1675",
+        description: "•••••1675",
+      },
     ]);
   });
 
   test("no contact entry at all is masked only", () => {
     const result = listConfiguredDms(["61403911675@s.whatsapp.net"], {}, {});
     expect(result).toEqual([
-      { jid: "61403911675@s.whatsapp.net", label: "•••••1675" },
+      {
+        jid: "61403911675@s.whatsapp.net",
+        label: "•••••1675",
+        description: "•••••1675",
+      },
     ]);
   });
 
@@ -362,7 +397,13 @@ describe("listConfiguredDms", () => {
       "61403911675@s.whatsapp.net": { name: "Akash" },
     };
     const result = listConfiguredDms(["184710990000999@lid"], contacts, lidMap);
-    expect(result).toEqual([{ jid: "184710990000999@lid", label: "Akash" }]);
+    expect(result).toEqual([
+      {
+        jid: "184710990000999@lid",
+        label: "Akash",
+        description: "•••••1675",
+      },
+    ]);
   });
 
   test("sorted alphabetically by label regardless of allowFrom order", () => {
@@ -376,5 +417,231 @@ describe("listConfiguredDms", () => {
       {},
     );
     expect(result.map((c) => c.label)).toEqual(["Alpha", "Bravo"]);
+  });
+});
+
+// AskUserQuestion (the in-session review/manage screens) hands a selection
+// back BY ITS LABEL, so a label shared by two candidates cannot be mapped
+// to one JID - the wrong grant gets revoked, or both do. These cover every
+// way two rows can render identically.
+describe("label disambiguation", () => {
+  test("the @lid and phone forms of ONE allowlisted contact get distinct labels", () => {
+    const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Akash" },
+    };
+    const result = listConfiguredDms(
+      ["184710990000999@lid", "61403911675@s.whatsapp.net"],
+      contacts,
+      lidMap,
+    );
+    expect(new Set(result.map((c) => c.label)).size).toBe(2);
+    // Both rows still name the same person and both stay revokable under
+    // the exact string that is in allowFrom.
+    expect(result.every((c) => c.label.startsWith("Akash"))).toBe(true);
+    expect(result.map((c) => c.jid).sort()).toEqual([
+      "184710990000999@lid",
+      "61403911675@s.whatsapp.net",
+    ]);
+  });
+
+  test("two groups sharing a name and member count get distinct labels", () => {
+    const groups = { "111999@g.us": {}, "222888@g.us": {} };
+    const meta = {
+      "111999@g.us": group({ name: "Team", memberCount: 4 }),
+      "222888@g.us": group({ name: "Team", memberCount: 4 }),
+    };
+    const result = listConfiguredGroups(groups, meta);
+    expect(new Set(result.map((c) => c.label)).size).toBe(2);
+  });
+
+  test("two contacts saved under the same name get distinct labels", () => {
+    const activity = {
+      "61403911675@s.whatsapp.net": 200,
+      "61432609386@s.whatsapp.net": 100,
+    };
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Alex" },
+      "61432609386@s.whatsapp.net": { name: "Alex" },
+    };
+    const result = rankDms(activity, contacts, [], {}, 10);
+    expect(new Set(result.map((c) => c.label)).size).toBe(2);
+  });
+
+  test("JIDs sharing their last four digits are still told apart, by ordinal", () => {
+    // The masked suffix alone collides here - only the ordinal saves it.
+    const contacts: ContactsMap = {
+      "6111111675@s.whatsapp.net": { name: "Akash" },
+      "6122221675@s.whatsapp.net": { name: "Akash" },
+    };
+    const result = listConfiguredDms(
+      ["6111111675@s.whatsapp.net", "6122221675@s.whatsapp.net"],
+      contacts,
+      {},
+    );
+    expect(result.map((c) => c.label)).toEqual([
+      "Akash  [1: •••••1675]",
+      "Akash  [2: •••••1675]",
+    ]);
+  });
+
+  test("a raw number never leaks into a disambiguated label", () => {
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Akash" },
+      "61432609386@s.whatsapp.net": { name: "Akash" },
+    };
+    const result = listConfiguredDms(
+      ["61403911675@s.whatsapp.net", "61432609386@s.whatsapp.net"],
+      contacts,
+      {},
+    );
+    for (const c of result) {
+      expect(c.label).not.toContain("61403911675");
+      expect(c.label).not.toContain("61432609386");
+    }
+  });
+
+  test("labels that do not collide are left exactly as they were", () => {
+    const contacts: ContactsMap = {
+      "a@s.whatsapp.net": { name: "Alpha" },
+      "b@s.whatsapp.net": { name: "Bravo" },
+    };
+    const result = listConfiguredDms(
+      ["a@s.whatsapp.net", "b@s.whatsapp.net"],
+      contacts,
+      {},
+    );
+    expect(result.map((c) => c.label)).toEqual(["Alpha", "Bravo"]);
+  });
+
+  test("colliding rows are ordered deterministically, not by insertion order", () => {
+    const contacts: ContactsMap = {
+      "6111111675@s.whatsapp.net": { name: "Akash" },
+      "6122221675@s.whatsapp.net": { name: "Akash" },
+    };
+    const forward = listConfiguredDms(
+      ["6111111675@s.whatsapp.net", "6122221675@s.whatsapp.net"],
+      contacts,
+      {},
+    );
+    const reversed = listConfiguredDms(
+      ["6122221675@s.whatsapp.net", "6111111675@s.whatsapp.net"],
+      contacts,
+      {},
+    );
+    expect(reversed).toEqual(forward);
+  });
+
+  test("group candidates tying on name and recency are ordered deterministically", () => {
+    const meta = {
+      "222888@g.us": group({ name: "Team", memberCount: 4 }),
+      "111999@g.us": group({ name: "Team", memberCount: 4 }),
+    };
+    const result = rankGroups(meta, new Set(), false, 5);
+    expect(result.map((c) => c.jid)).toEqual(["111999@g.us", "222888@g.us"]);
+  });
+});
+
+// The identity anchor the in-session screens render under each label. Built
+// in this module so no caller has to re-derive it - the rule the skill's
+// prose used to carry got this wrong twice (see PR #24 review).
+describe("candidate descriptions", () => {
+  test("a group's description is its raw JID - a g.us id is not personal data", () => {
+    const meta = { "120363424405607157@g.us": group({ name: "Team" }) };
+    const result = rankGroups(meta, new Set(), false, 5);
+    expect(result[0].description).toBe("120363424405607157@g.us");
+  });
+
+  test("a contact's description is the MASKED number, never the raw one", () => {
+    const activity = { "61403911675@s.whatsapp.net": 100 };
+    const result = rankDms(activity, {}, [], {}, 10);
+    expect(result[0].description).toBe("•••••1675");
+    expect(result[0].description).not.toContain("61403911675");
+  });
+
+  test("a @lid allowFrom entry describes the resolved contact, still masked", () => {
+    const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
+    const result = listConfiguredDms(["184710990000999@lid"], {}, lidMap);
+    expect(result[0].description).toBe("•••••1675");
+  });
+});
+
+// A group name and a self-reported contact name are attacker-chosen and
+// unbounded. Clipping them here is what lets the option rule be "use the
+// label as given" - a caller truncating a label itself would cut off the
+// disambiguate() suffix, which is appended, and hand back two identical
+// options for two different JIDs.
+describe("long names", () => {
+  const long = "W".repeat(80);
+
+  test("a long group name is clipped, so the label stays inside a known bound", () => {
+    const meta = { "a@g.us": group({ name: long, memberCount: 3 }) };
+    const result = rankGroups(meta, new Set(), false, 5);
+    expect(result[0].label.length).toBeLessThan(70);
+    expect(result[0].label).toContain("…");
+    expect(result[0].label).toContain("(3 member(s))");
+  });
+
+  test("a long .notify is clipped but keeps its unverified marker and mask", () => {
+    const activity = { "61403911675@s.whatsapp.net": 100 };
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { notify: long },
+    };
+    const result = rankDms(activity, contacts, [], {}, 10);
+    expect(result[0].label).toContain("(unverified) - •••••1675");
+    expect(result[0].label.length).toBeLessThan(80);
+  });
+
+  test("two names that clip to the SAME string are still told apart", () => {
+    // Clipping runs before disambiguation for exactly this case.
+    const contacts: ContactsMap = {
+      "6111111675@s.whatsapp.net": { name: long + "-one" },
+      "6122221675@s.whatsapp.net": { name: long + "-two" },
+    };
+    const result = listConfiguredDms(
+      ["6111111675@s.whatsapp.net", "6122221675@s.whatsapp.net"],
+      contacts,
+      {},
+    );
+    expect(new Set(result.map((c) => c.label)).size).toBe(2);
+    // The suffix that separates them is at the END, which is why nothing
+    // downstream may truncate there.
+    expect(result[0].label.endsWith("]")).toBe(true);
+  });
+});
+
+// A modern group JID is a random id; a LEGACY one is
+// `<creator-phone>-<created-at>@g.us`, so showing it raw would put a real
+// phone number on screen - the thing mask.ts exists to stop.
+describe("groupAnchor", () => {
+  test("a modern group JID is shown in full - it carries nothing personal", () => {
+    expect(groupAnchor("120363424405607157@g.us")).toBe(
+      "120363424405607157@g.us",
+    );
+  });
+
+  test("a legacy group JID has its creator's number masked, timestamp kept", () => {
+    expect(groupAnchor("61403911675-1443627404@g.us")).toBe(
+      "•••••1675-1443627404@g.us",
+    );
+  });
+
+  test("a legacy group's description never carries the raw creator number", () => {
+    const meta = {
+      "61403911675-1443627404@g.us": group({ name: "Old Crew" }),
+    };
+    const result = rankGroups(meta, new Set(), false, 5);
+    expect(result[0].description).not.toContain("61403911675");
+    // The JID itself is untouched - it is what group add/rm act on.
+    expect(result[0].jid).toBe("61403911675-1443627404@g.us");
+  });
+
+  test("the no-meta label fallback masks it too, not just the description", () => {
+    const result = listConfiguredGroups(
+      { "61403911675-1443627404@g.us": {} },
+      {},
+    );
+    expect(result[0].label).toBe("•••••1675-1443627404@g.us");
+    expect(result[0].jid).toBe("61403911675-1443627404@g.us");
   });
 });

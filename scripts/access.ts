@@ -30,7 +30,14 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { checkbox } from "@inquirer/prompts";
 import { forgetContact, type ContactsMap } from "./contacts";
-import { contactKeyFor, rankDms, rankGroups, type GroupMeta } from "./ranking";
+import {
+  contactKeyFor,
+  listConfiguredDms,
+  listConfiguredGroups,
+  rankDms,
+  rankGroups,
+  type GroupMeta,
+} from "./ranking";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -122,6 +129,8 @@ const USAGE = `Usage: bun scripts/access.ts <command>
   group rm <groupJid>             stop responding in a group (files kept)
   wizard [--include-archived]     guided group setup: can-act / can-see-roster,
                                    per group, from names cached by list_groups
+  candidates [--include-archived] JSON: groups/contacts not configured yet
+  configured                      JSON: groups/contacts already configured
   set <key> <value>               ${SET_KEYS.join(", ")}
 
 JIDs look like 886912345678@s.whatsapp.net or 1203634244@g.us.`;
@@ -466,6 +475,71 @@ async function wizard(args: string[]): Promise<void> {
   process.stdout.write(`\n${highlight(PRIVACY_DISCLOSURE)}\n`);
 }
 
+// Read-only JSON for the in-session `review` and `manage` screens in
+// skills/access/SKILL.md. The skill EXECUTES these instead of restating
+// the ranking and labelling rules in prose: every drift a review has caught
+// so far - a dropped `[archived]` tag, a label rule that lost its
+// looksLikeNumber() guard, a candidate cap that disagreed with the real
+// limits - came from the paraphrase, not from the code.
+//
+// Neither command writes anything, and neither is interactive, so this does
+// not touch the `wizard` guarantee: the wizard is still the only path where
+// a group/contact decision is made with no AI model in the room. These two
+// only tell a model what the code already computes; a human still ticks the
+// boxes, and every write still goes through `allow`/`group add`/`remove`/
+// `group rm` below.
+//
+// Shape is the same for both, so the skill has one rule to follow:
+//   { groups: { items: Candidate[], total: n }, dms: { ... } }
+// `total` is the size of the whole pool, so a caller can say how many did
+// not fit; `items` is what to show.
+function emitJson(payload: unknown): void {
+  process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
+}
+
+// Not yet configured: the grant screen. Uncapped, for the same reason
+// `configured` is - a caller that shows four at a time and re-asks for a
+// fresh first page would offer the same top four forever, so a candidate
+// the user DECLINES once could never be reached again (approving one drops
+// it from the pool; declining one does not). The caller batches the list it
+// gets back. Still ranked most-recently-active first, so the four that
+// matter are the four it shows first.
+function candidates(args: string[]): void {
+  const includeArchived = args.includes("--include-archived");
+  const a = load();
+  const groups = rankGroups(
+    loadGroupsMeta(),
+    new Set(Object.keys(a.groups)),
+    includeArchived,
+    Infinity,
+  );
+  const dms = rankDms(
+    loadDmActivity(),
+    loadContacts(),
+    a.allowFrom,
+    loadLidMap(),
+    Infinity,
+  );
+  emitJson({
+    groups: { items: groups, total: groups.length },
+    dms: { items: dms, total: dms.length },
+  });
+}
+
+// Already configured: the revoke screen. Uncapped on purpose - `manage`
+// only ever removes, so a list truncated here would leave later entries
+// permanently unrevokable (a caller showing 4 at a time has to walk the
+// whole list it gets back, not re-ask for a fresh first page).
+function configured(): void {
+  const a = load();
+  const groups = listConfiguredGroups(a.groups, loadGroupsMeta());
+  const dms = listConfiguredDms(a.allowFrom, loadContacts(), loadLidMap());
+  emitJson({
+    groups: { items: groups, total: groups.length },
+    dms: { items: dms, total: dms.length },
+  });
+}
+
 // Shared by `remove` (which also drops the allowlist entry) and `forget`
 // (which purges the cache alone, for someone never allowlisted in the
 // first place). Never touches lid-map.json - see forgetContact's own
@@ -552,9 +626,31 @@ switch (command) {
     if (!a.allowFrom.includes(jid)) die(`${jid} is not on the allowlist.`);
     a.allowFrom = a.allowFrom.filter((j) => j !== jid);
     save(a);
-    const forgot = forgetCachedIdentity(jid);
+    // One contact can sit in allowFrom twice, under both its @lid and its
+    // phone form, and BOTH resolve to the same contacts.json /
+    // dm-activity.json key. Revoking one form while the other still grants
+    // access must not wipe that shared cache: the surviving grant would go
+    // on working while the contact silently degraded to a bare masked
+    // number everywhere, and this command would report them "forgotten"
+    // while they could still message Claude.
+    const lidMap = loadLidMap();
+    const key = contactKeyFor(lidMap, jid);
+    const stillAllowed = a.allowFrom.some(
+      (j) => contactKeyFor(lidMap, j) === key,
+    );
+    // Guarded on something actually being cached, the same way the
+    // "Forgot" half is: a contact allowlisted by JID who has never DMed
+    // has no cached name, and claiming one was KEPT is as wrong as
+    // claiming one was forgotten.
+    const cached = key in loadContacts() || key in loadDmActivity();
+    const forgot = stillAllowed ? false : forgetCachedIdentity(jid);
     process.stdout.write(
-      `Removed ${jid}.${forgot ? " Forgot their cached name too." : ""}\n`,
+      `Removed ${jid}.` +
+        (forgot ? " Forgot their cached name too." : "") +
+        (stillAllowed && cached
+          ? " Kept their cached name - another allowlist entry still resolves to the same contact."
+          : "") +
+        "\n",
     );
     break;
   }
@@ -589,6 +685,12 @@ switch (command) {
     break;
   case "wizard":
     await wizard(rest);
+    break;
+  case "candidates":
+    candidates(rest);
+    break;
+  case "configured":
+    configured();
     break;
   case "set":
     set(requireArg(rest[0], "key"), requireArg(rest[1], "value"));

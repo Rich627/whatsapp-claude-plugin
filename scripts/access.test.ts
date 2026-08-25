@@ -181,6 +181,54 @@ describe("allowlist", () => {
     expect(res.code).toBe(0);
     expect(res.out).not.toContain("Forgot");
   });
+
+  // One contact can be allowlisted twice, under its @lid form AND its phone
+  // form, and both resolve to the same contacts.json / dm-activity.json key.
+  // Revoking one form must not wipe the cache the surviving grant still
+  // relies on (PR #24 review, #3).
+  test("revoking one form of a doubly-allowlisted contact keeps the shared cache", () => {
+    const dir = freshStateDir();
+    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
+    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Akash" } });
+    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 1000 });
+    run(dir, "allow", "184710990000999@lid");
+    run(dir, "allow", "61403911675@s.whatsapp.net");
+
+    const { out } = run(dir, "remove", "184710990000999@lid");
+    expect(out).toContain("Kept their cached name");
+    expect(out).not.toContain("Forgot their cached name");
+    // The surviving grant still works, so the name behind it must survive too.
+    expect(readContacts(dir)["61403911675@s.whatsapp.net"]).toEqual({
+      name: "Akash",
+    });
+    expect(access(dir).allowFrom).toEqual(["61403911675@s.whatsapp.net"]);
+  });
+
+  test("nothing cached: the surviving grant is kept quietly, no invented name claim", () => {
+    // Allowlisted by JID, never DMed - so there is no cached name to keep,
+    // and saying one was kept is as wrong as saying one was forgotten.
+    const dir = freshStateDir();
+    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
+    run(dir, "allow", "184710990000999@lid");
+    run(dir, "allow", "61403911675@s.whatsapp.net");
+
+    const { out } = run(dir, "remove", "184710990000999@lid");
+    expect(out).toContain("Removed 184710990000999@lid.");
+    expect(out).not.toContain("cached name");
+  });
+
+  test("revoking the LAST form of that contact does forget them", () => {
+    const dir = freshStateDir();
+    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
+    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Akash" } });
+    run(dir, "allow", "184710990000999@lid");
+    run(dir, "allow", "61403911675@s.whatsapp.net");
+    run(dir, "remove", "184710990000999@lid");
+
+    const { out } = run(dir, "remove", "61403911675@s.whatsapp.net");
+    expect(out).toContain("Forgot their cached name");
+    expect(readContacts(dir)["61403911675@s.whatsapp.net"]).toBeUndefined();
+  });
 });
 
 describe("forget", () => {
@@ -596,5 +644,173 @@ describe("robustness", () => {
     const res = run(dir, "status");
     expect(res.code).toBe(0);
     expect(res.out).toContain("dmPolicy:   pairing");
+  });
+});
+
+// The read-only JSON pair the in-session review/manage screens execute
+// (skills/access/SKILL.md) instead of restating the ranking and labelling
+// rules in prose. What matters here is the CONTRACT the skill depends on -
+// the label/description rules themselves are ranking.test.ts's job.
+describe("candidates (JSON for the in-session review screen)", () => {
+  test("empty state: valid JSON with empty lists, not a failure", () => {
+    const dir = freshStateDir();
+    const { out, code } = run(dir, "candidates");
+    expect(code).toBe(0);
+    expect(JSON.parse(out)).toEqual({
+      groups: { items: [], total: 0 },
+      dms: { items: [], total: 0 },
+    });
+  });
+
+  // Uncapped on purpose: a caller that showed the first four and then
+  // re-asked for a fresh page would offer the same four forever, so a
+  // candidate the user declines once could never be reached again.
+  test("returns the WHOLE pool, most recently active first, not just a first page", () => {
+    const dir = freshStateDir();
+    const meta: Record<string, never> | Record<string, any> = {};
+    for (let i = 1; i <= 6; i++) {
+      meta[`${i}@g.us`] = {
+        name: `Group ${i}`,
+        memberCount: 3,
+        archived: false,
+        lastActivityAt: i,
+        updatedAt: 0,
+      };
+    }
+    writeGroupsMeta(dir, meta);
+    writeDmActivity(dir, {
+      "1@s.whatsapp.net": 1,
+      "2@s.whatsapp.net": 2,
+      "3@s.whatsapp.net": 3,
+      "4@s.whatsapp.net": 4,
+      "5@s.whatsapp.net": 5,
+    });
+    const parsed = JSON.parse(run(dir, "candidates").out);
+    expect(parsed.groups.items).toHaveLength(6);
+    expect(parsed.groups.total).toBe(6);
+    expect(parsed.dms.items).toHaveLength(5);
+    expect(parsed.dms.total).toBe(5);
+    // Ranked, so a caller showing four at a time still shows the four that
+    // matter first.
+    expect(parsed.groups.items[0].jid).toBe("6@g.us");
+    expect(parsed.dms.items[0].jid).toBe("5@s.whatsapp.net");
+  });
+
+  test("every option carries the jid, label and description the screen needs", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "120363424405607157@g.us": {
+        name: "Team",
+        memberCount: 4,
+        archived: false,
+        updatedAt: 0,
+      },
+    });
+    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
+    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Akash" } });
+    const parsed = JSON.parse(run(dir, "candidates").out);
+    expect(parsed.groups.items[0]).toEqual({
+      jid: "120363424405607157@g.us",
+      label: "Team  (4 member(s))",
+      description: "120363424405607157@g.us",
+    });
+    expect(parsed.dms.items[0]).toEqual({
+      jid: "61403911675@s.whatsapp.net",
+      label: "Akash",
+      // Masked, never the raw number - a full one in an option payload is
+      // a real phone number written into the session transcript.
+      description: "•••••1675",
+    });
+  });
+
+  test("archived groups are excluded unless --include-archived is passed", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "a@g.us": {
+        name: "Old",
+        memberCount: 2,
+        archived: true,
+        updatedAt: 0,
+      },
+    });
+    expect(JSON.parse(run(dir, "candidates").out).groups.total).toBe(0);
+    expect(
+      JSON.parse(run(dir, "candidates", "--include-archived").out).groups.total,
+    ).toBe(1);
+  });
+
+  test("already-configured groups and already-allowed contacts are not offered again", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "a@g.us": { name: "Team", memberCount: 2, archived: false, updatedAt: 0 },
+    });
+    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
+    run(dir, "group", "add", "a@g.us");
+    run(dir, "allow", "61403911675@s.whatsapp.net");
+    const parsed = JSON.parse(run(dir, "candidates").out);
+    expect(parsed.groups.total).toBe(0);
+    expect(parsed.dms.total).toBe(0);
+  });
+
+  test("reads only - access.json is untouched", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "x@s.whatsapp.net");
+    const before = readFileSync(join(dir, "access.json"), "utf8");
+    run(dir, "candidates");
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
+  });
+});
+
+describe("configured (JSON for the in-session manage/revoke screen)", () => {
+  test("empty state: valid JSON with empty lists, not a failure", () => {
+    const dir = freshStateDir();
+    const { out, code } = run(dir, "configured");
+    expect(code).toBe(0);
+    expect(JSON.parse(out)).toEqual({
+      groups: { items: [], total: 0 },
+      dms: { items: [], total: 0 },
+    });
+  });
+
+  // The revoke screen must never truncate: `manage` only ever removes, so
+  // an entry that never appears can never be revoked (PR #24 review, #2).
+  test("lists EVERY allowlisted contact, well past the 4 an option list shows", () => {
+    const dir = freshStateDir();
+    for (let i = 1; i <= 7; i++) run(dir, "allow", `${i}@s.whatsapp.net`);
+    const parsed = JSON.parse(run(dir, "configured").out);
+    expect(parsed.dms.total).toBe(7);
+    expect(parsed.dms.items).toHaveLength(7);
+  });
+
+  test("both forms of a contact allowlisted twice stay separately revokable", () => {
+    const dir = freshStateDir();
+    writeLidMap(dir, {
+      "184710990000999@lid": "61403911675@s.whatsapp.net",
+    });
+    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Akash" } });
+    run(dir, "allow", "184710990000999@lid");
+    run(dir, "allow", "61403911675@s.whatsapp.net");
+    const items = JSON.parse(run(dir, "configured").out).dms.items;
+    expect(items).toHaveLength(2);
+    // Distinct labels: AskUserQuestion returns a selection by its label, so
+    // two identical ones cannot be mapped back to one JID.
+    expect(new Set(items.map((c: { label: string }) => c.label)).size).toBe(2);
+  });
+
+  test("a configured group with no cached meta still appears, so it stays revokable", () => {
+    const dir = freshStateDir();
+    run(dir, "group", "add", "ghost@g.us");
+    const items = JSON.parse(run(dir, "configured").out).groups.items;
+    expect(items).toEqual([
+      { jid: "ghost@g.us", label: "ghost@g.us", description: "ghost@g.us" },
+    ]);
+  });
+
+  test("reads only - access.json is untouched", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "x@s.whatsapp.net");
+    const before = readFileSync(join(dir, "access.json"), "utf8");
+    run(dir, "configured");
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
   });
 });
