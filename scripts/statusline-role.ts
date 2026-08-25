@@ -225,12 +225,12 @@ export function ancestorChain(
 // Nearest ancestor first, so the innermost session wins if a Claude Code
 // session ever runs inside another one.
 export function roleFromOwnerStamp(
-  files: { content: string }[],
+  files: string[],
   ancestors: number[],
 ): string | null {
   const owners = new Map<number, string>();
   for (const f of files) {
-    const [role, owner] = f.content.split("\n");
+    const [role, owner] = f.split("\n");
     const ownerPid = Number((owner ?? "").trim());
     // No line 2 at all: a server predating the stamp, or a client that never
     // identified itself. Unusable here - the tree search still covers it.
@@ -265,15 +265,15 @@ export function formatSegment(role: string): string {
 
 // Every role file in the state dir. Missing dir, unreadable file, no files
 // at all: an empty list, same as every other miss in here.
-function readRoleFiles(): { content: string }[] {
+function readRoleFiles(): string[] {
   try {
     return readdirSync(STATE_DIR)
       .filter((f) => f.startsWith(".role-"))
       .map((f) => {
         try {
-          return { content: readFileSync(join(STATE_DIR, f), "utf8") };
+          return readFileSync(join(STATE_DIR, f), "utf8");
         } catch {
-          return { content: "" };
+          return "";
         }
       });
   } catch {

@@ -397,10 +397,7 @@ describe("roleFromOwnerStamp", () => {
   // The whole point: two terminals, two servers, and the only thing telling
   // them apart is which session each server says it belongs to. The process
   // tree cannot decide this once a shared ancestor is in range.
-  const files = [
-    { content: "primary\n100\n" },
-    { content: "secondary\n200\n" },
-  ];
+  const files = ["primary\n100\n", "secondary\n200\n"];
 
   test("takes the file stamped with one of our own ancestors", () => {
     expect(roleFromOwnerStamp(files, [400, 300, 200])).toBe("secondary");
@@ -418,19 +415,15 @@ describe("roleFromOwnerStamp", () => {
   // A dead pid is nobody's ancestor, so a leftover file from a crashed
   // session drops out with no liveness check of its own.
   test("stale files from dead sessions cannot match", () => {
-    expect(
-      roleFromOwnerStamp([{ content: "primary\n999999\n" }], [1, 2]),
-    ).toBeNull();
+    expect(roleFromOwnerStamp(["primary\n999999\n"], [1, 2])).toBeNull();
   });
 
   // Pre-stamp servers write the bare role with no line 2. Unusable here on
   // purpose - main() falls back to the tree search for exactly this case.
   test("ignores an unstamped file rather than guessing it is ours", () => {
-    expect(roleFromOwnerStamp([{ content: "primary" }], [100])).toBeNull();
-    expect(
-      roleFromOwnerStamp([{ content: "primary\nnot-a-pid\n" }], [100]),
-    ).toBeNull();
-    expect(roleFromOwnerStamp([{ content: "" }], [100])).toBeNull();
+    expect(roleFromOwnerStamp(["primary"], [100])).toBeNull();
+    expect(roleFromOwnerStamp(["primary\nnot-a-pid\n"], [100])).toBeNull();
+    expect(roleFromOwnerStamp([""], [100])).toBeNull();
   });
 });
 
