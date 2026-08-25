@@ -13,6 +13,8 @@
  *    it as line 2 of its role file, so we climb our own ppid chain and take
  *    the file whose owner is one of our ancestors. Ownership is read, not
  *    guessed, so a sibling terminal's server can never be mistaken for ours.
+ *    Files whose server pid (from the filename) is no longer running are
+ *    dropped first, so a killed server's file cannot keep printing a role.
  * 2. The process tree, for a server that predates the stamp or a client that
  *    never identified itself: climb the ppid chain to the Claude Code CLI
  *    (this script does NOT run as its direct child — see
@@ -263,12 +265,21 @@ export function formatSegment(role: string): string {
   return color ? `${color}WA:${role}${RESET}` : "";
 }
 
-// Every role file in the state dir. Missing dir, unreadable file, no files
-// at all: an empty list, same as every other miss in here.
-function readRoleFiles(): string[] {
+// Every role file in the state dir whose server is still running. Missing
+// dir, unreadable file, no files at all: an empty list, same as every other
+// miss in here.
+//
+// The liveness filter is what stops a stamped file outliving its server:
+// only a graceful exit removes one, so a killed server leaves a file whose
+// owning session is still alive and still our ancestor, and the stamp would
+// keep printing a role for a server that is gone. server.ts's startup sweep
+// cannot cover it - nothing starts. A non-numeric name is not in the set
+// either and drops out the same way.
+function readRoleFiles(livePids: Set<number>): string[] {
   try {
     return readdirSync(STATE_DIR)
       .filter((f) => f.startsWith(".role-"))
+      .filter((f) => livePids.has(Number(f.slice(".role-".length))))
       .map((f) => {
         try {
           return readFileSync(join(STATE_DIR, f), "utf8");
@@ -289,7 +300,10 @@ function main(): void {
     // server that has not been restarted since this shipped, or a client that
     // does not identify itself - it can confuse a sibling terminal's server
     // for ours, which is exactly what the stamp exists to prevent.
-    const stamped = roleFromOwnerStamp(readRoleFiles(), ancestors);
+    const stamped = roleFromOwnerStamp(
+      readRoleFiles(new Set(rows.map((r) => r.pid))),
+      ancestors,
+    );
     if (stamped) {
       const segment = formatSegment(stamped);
       if (segment) process.stdout.write(segment);

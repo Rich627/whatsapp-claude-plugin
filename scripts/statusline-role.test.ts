@@ -107,11 +107,16 @@ describe("end-to-end (real processes)", () => {
   // The stamped path, end to end through the real script: no wrapper and no
   // server process exist here at all, so this can only pass by reading the
   // owner pid out of the file. The decoy is a second terminal's server, which
-  // the process tree alone would have no way to rule out.
+  // the process tree alone would have no way to rule out. Both filenames use
+  // live pids (this test and its parent) so the liveness filter cannot be
+  // what decides it - the stamp has to.
   test("reads the stamped owner instead of hunting the process tree", () => {
     const dir = freshStateDir();
-    writeFileSync(join(dir, ".role-4242"), `secondary\n${process.pid}\n`);
-    writeFileSync(join(dir, ".role-4243"), "primary\n999999\n");
+    writeFileSync(
+      join(dir, `.role-${process.pid}`),
+      `secondary\n${process.pid}\n`,
+    );
+    writeFileSync(join(dir, `.role-${process.ppid}`), "primary\n999999\n");
     const out = runStatusline(
       dir,
       process.pid,
@@ -122,12 +127,27 @@ describe("end-to-end (real processes)", () => {
     expect(out).not.toContain("primary");
   });
 
+  // A server that was killed without a graceful exit leaves its role file
+  // behind, and the owning session named on line 2 is still alive and still
+  // an ancestor - so the stamp alone would happily print a role for a server
+  // that no longer exists. The filename's pid is dead, which is the only
+  // thing that gives it away.
+  test("ignores a stamped file whose server is gone", () => {
+    const dir = freshStateDir();
+    writeFileSync(join(dir, ".role-999999"), `secondary\n${process.pid}\n`);
+    expect(
+      runStatusline(dir, process.pid, "no-such-wrapper", "no-such-server"),
+    ).toBe("");
+  });
+
   // Same fixture minus the stamp: nothing matches, and with no wrapper or
   // server process to fall back to the script stays silent rather than
   // picking the only file it can see.
+  // Live server pid on purpose, so the silence is the owner mismatch talking
+  // and not the liveness filter above.
   test("stays silent when the only files belong to someone else", () => {
     const dir = freshStateDir();
-    writeFileSync(join(dir, ".role-4243"), "primary\n999999\n");
+    writeFileSync(join(dir, `.role-${process.pid}`), "primary\n999999\n");
     expect(
       runStatusline(dir, process.pid, "no-such-wrapper", "no-such-server"),
     ).toBe("");

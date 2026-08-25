@@ -68,10 +68,26 @@ describe("update-notice.ts", () => {
   // and shipped a notice headed with the current version over notes from the
   // first release in the file. The test above asserts only the header, which
   // is exactly why that went unnoticed.
+  //
+  // The head note is read out of the source rather than pasted in, so this
+  // keeps testing the slice direction instead of needing an edit every time
+  // a release adds an entry — which is what it used to need, and what would
+  // tempt the next person to "fix" it by pasting the new text in.
   test("first-ever run shows the NEWEST changelog entry, not the oldest", () => {
+    const source = readFileSync(join(import.meta.dir, "update-notice.ts"), {
+      encoding: "utf8",
+    });
+    // First string literal of at least 30 plain characters after the first
+    // `notes: [` — i.e. the head entry's first note. Literals carrying a
+    // ${...} interpolation are skipped: the source text and the rendered
+    // output differ there, so they cannot be compared against the notice.
+    const headNote = source
+      .slice(source.indexOf("notes: ["))
+      .match(/["`]([^"`$]{30,})/)?.[1];
+    expect(headNote).toBeTruthy();
     const dir = mkdtempSync(join(tmpdir(), "wa-notice-newest-"));
     const ctx = JSON.parse(run(dir)).systemMessage as string;
-    expect(ctx).toContain("--revoke");
+    expect(ctx).toContain(headNote!.slice(0, 40));
     expect(ctx).not.toContain("Proactive notifications");
   });
 
