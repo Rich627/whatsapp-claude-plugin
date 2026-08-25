@@ -102,7 +102,7 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 Run this one through `access.ts` (see "Running `access.ts`") rather than
 editing the files by hand:
 
-```
+```sh
 bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" remove <jid>
 ```
 
@@ -235,7 +235,7 @@ none of which decides anything on its own.
 Both screens below get every list, every label and every write from the
 script, never from this file:
 
-```
+```sh
 bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" <subcommand>
 ```
 
