@@ -20,11 +20,11 @@ All state lives in `~/.whatsapp-channel/access.json`. The `/whatsapp-channel:acc
 
 `dmPolicy` controls how DMs from senders not on the allowlist are handled.
 
-| Policy              | Behavior                                                                                                 |
-| ------------------- | -------------------------------------------------------------------------------------------------------- |
+| Policy              | Behavior                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------- |
 | `pairing` (default) | Reply with a pairing code, drop the message. Approve with `/whatsapp-channel:access pair <code>`. |
-| `allowlist`         | Drop silently. No reply. Prevents strangers from knowing the linked device is active.                    |
-| `disabled`          | Drop everything, including allowlisted users and groups.                                                 |
+| `allowlist`         | Drop silently. No reply. Prevents strangers from knowing the linked device is active.             |
+| `disabled`          | Drop everything, including allowlisted users and groups.                                          |
 
 ```
 /whatsapp-channel:access policy allowlist
@@ -164,8 +164,8 @@ The first Claude Code session that starts after the plugin's version has changed
 
 ## Skill reference
 
-| Command                                                              | Effect                                                                                                                            |
-| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Command                                                       | Effect                                                                                                                            |
+| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | `/whatsapp-channel:access`                                    | Print current state: policy, allowlist, pending pairings, enabled groups.                                                         |
 | `/whatsapp-channel:access pair a4f91c`                        | Approve pairing code `a4f91c`. Adds the sender to `allowFrom` and sends a confirmation on WhatsApp.                               |
 | `/whatsapp-channel:access deny a4f91c`                        | Discard a pending code. The sender is not notified.                                                                               |

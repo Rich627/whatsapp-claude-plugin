@@ -57,12 +57,7 @@ tool_timeout_sec = 120     # default 60; wait_for_messages parks for up to 40s
   "mcpServers": {
     "whatsapp": {
       "command": "bun",
-      "args": [
-        "run",
-        "--cwd",
-        "/absolute/path/to/whatsapp-channel",
-        "start"
-      ],
+      "args": ["run", "--cwd", "/absolute/path/to/whatsapp-channel", "start"],
       "timeout": 600000
     }
   }
@@ -77,12 +72,7 @@ tool_timeout_sec = 120     # default 60; wait_for_messages parks for up to 40s
     "whatsapp": {
       "type": "stdio",
       "command": "bun",
-      "args": [
-        "run",
-        "--cwd",
-        "/absolute/path/to/whatsapp-channel",
-        "start"
-      ]
+      "args": ["run", "--cwd", "/absolute/path/to/whatsapp-channel", "start"]
     }
   }
 }
@@ -150,12 +140,12 @@ The reference script uses `mlx-community/whisper-large-v3-turbo` — accurate, f
 
 | Issue                               | Solution                                                                                                                                                                                                                                                                                                                                                                                            |
 | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pairing code not showing            | Run `/whatsapp-channel:configure <phone>` first, then relaunch                                                                                                                                                                                                                                                                                                                               |
+| Pairing code not showing            | Run `/whatsapp-channel:configure <phone>` first, then relaunch                                                                                                                                                                                                                                                                                                                                      |
 | 440 disconnect error                | Only one connection per auth state allowed. Kill stale processes: `pkill -f "whatsapp.*server"`                                                                                                                                                                                                                                                                                                     |
-| Session not waking on new messages  | Most common cause: launched without `--dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin`. Tools work but inbound pushes are dropped (`Channel notifications skipped` in the MCP debug log) — relaunch with the flag.                                                                                                                                     |
+| Session not waking on new messages  | Most common cause: launched without `--dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin`. Tools work but inbound pushes are dropped (`Channel notifications skipped` in the MCP debug log) — relaunch with the flag.                                                                                                                                            |
 | Messages not arriving               | Known Claude Code client bug ([#37933](https://github.com/anthropics/claude-code/issues/37933)). Server-side is correct, awaiting client fix.                                                                                                                                                                                                                                                       |
 | Replies still send, nothing arrives | Send a **DM** to the connected number as well as a group message — a DM that lands while groups stay silent means the group sender-key path, not the connection. `~/.whatsapp-channel/diag.log` records an `inbound upsert` line for every batch WhatsApp delivers, so it distinguishes "never arrived" from "arrived and was dropped". Set `WHATSAPP_DIAG_DEBUG=1` for Baileys' full debug stream. |
-| Auth expired                        | Run `/whatsapp-channel:configure reset-auth` and re-pair                                                                                                                                                                                                                                                                                                                                     |
+| Auth expired                        | Run `/whatsapp-channel:configure reset-auth` and re-pair                                                                                                                                                                                                                                                                                                                                            |
 
 ## Documentation
 

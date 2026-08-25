@@ -16,9 +16,9 @@ describe("findServerPid", () => {
       }, // wrapper
       { pid: 300, ppid: 200, command: "bun.exe server.ts" }, // real server
     ];
-    expect(
-      findServerPid(chain, 100, "whatsapp-channel", "server.ts"),
-    ).toBe(300);
+    expect(findServerPid(chain, 100, "whatsapp-channel", "server.ts")).toBe(
+      300,
+    );
   });
 
   test("returns null when no wrapper matches", () => {
@@ -53,9 +53,7 @@ describe("findServerPid", () => {
       { pid: 200, ppid: 100, command: "whatsapp-channel wrapper" },
       { pid: 300, ppid: 200, command: "bun.exe server.ts" }, // the real one
     ];
-    expect(
-      findServerPid(rows, 100, "whatsapp-channel", "server.ts"),
-    ).toBe(300);
+    expect(findServerPid(rows, 100, "whatsapp-channel", "server.ts")).toBe(300);
   });
 });
 
