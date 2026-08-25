@@ -63,6 +63,33 @@ describe("update-notice.ts", () => {
     );
   });
 
+  // Regression: CHANGELOG is newest-first, so the no-marker fallback has to
+  // take the HEAD of the array. slice(-1) took the tail — the OLDEST entry —
+  // and shipped a notice headed with the current version over notes from the
+  // first release in the file. The test above asserts only the header, which
+  // is exactly why that went unnoticed.
+  test("first-ever run shows the NEWEST changelog entry, not the oldest", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wa-notice-newest-"));
+    const ctx = JSON.parse(run(dir)).hookSpecificOutput
+      .additionalContext as string;
+    expect(ctx).toContain("--revoke");
+    expect(ctx).not.toContain("Proactive notifications");
+  });
+
+  // Regression: a downgrade leaves changedVersion true while the version
+  // filter matches nothing, which emitted "updated to v<older>" over an empty
+  // bullet list — a false claim the model is explicitly told to relay. The
+  // marker still has to advance, or every later session repeats the mistake.
+  test("a downgrade says nothing but still records the version", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wa-notice-downgrade-"));
+    writeFileSync(join(dir, ".last-seen-version"), "99.0.0");
+    const out = run(dir);
+    expect(out).not.toContain("What's new");
+    expect(readFileSync(join(dir, ".last-seen-version"), "utf8")).toBe(
+      PLUGIN_VERSION,
+    );
+  });
+
   test("skipped entirely in static mode (env var) — no output, no write", () => {
     const dir = mkdtempSync(join(tmpdir(), "wa-notice-static-env-"));
     writeFileSync(join(dir, ".last-seen-version"), "0.1.0");

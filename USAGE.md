@@ -234,10 +234,17 @@ glance which terminal holds the real connection:
 }
 ```
 
-It finds the server by walking down from the Claude Code CLI process:
-first the plugin's own wrapper process, then `server.ts` among that
-wrapper's children. Same-machine, read-only, never throws - a miss just
-means no segment, not a broken statusline.
+It finds the server in three steps. A statusLine setting is a compound
+command, so the script runs under a shell that the CLI spawned separately
+from the plugin - a sibling of what it is looking for, not a descendant.
+So it first climbs the parent chain (a few hops) to the CLI that owns this
+terminal, then looks for the plugin's own wrapper process among that CLI's
+descendants, then `server.ts` among that wrapper's children. Several
+processes can carry the plugin dir name in their command line, including
+the statusline shell itself, so every wrapper candidate is tried and the
+one with a `server.ts` under it wins. Same-machine, read-only, never throws
+
+- a miss just means no segment, not a broken statusline.
 
 ## Known limitations
 

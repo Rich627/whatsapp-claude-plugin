@@ -111,10 +111,7 @@ if (!isStaticMode()) {
         readFileSync(
           join(
             PLUGIN_DIR,
-            "..",
-            "..",
-            "..",
-            "..",
+            "../../../..",
             "marketplaces",
             marketplaceName,
             ".claude-plugin",
@@ -146,16 +143,26 @@ if (!isStaticMode()) {
     // A state directory that has never recorded a version (a first-ever run,
     // or an existing user updating past the point this file started being
     // written) only sees the latest entry, not the whole history.
+    // slice(0, 1), NOT slice(-1): CHANGELOG is newest-first, so the tail is
+    // the OLDEST entry. That mismatch shipped a first-run notice headed
+    // "updated to v0.20.0" with v0.18.0's bullets under it.
     const newEntries = lastSeen
       ? CHANGELOG.filter((e) => newer(e.version, lastSeen))
-      : CHANGELOG.slice(-1);
+      : CHANGELOG.slice(0, 1);
     const notes = newEntries.flatMap((e) => e.notes);
-    sections.push(
-      `WhatsApp plugin updated to v${PLUGIN_VERSION}` +
-        (lastSeen ? ` (from v${lastSeen})` : "") +
-        `.\n\nWhat's new:\n` +
-        notes.map((n) => `- ${n}`).join("\n"),
-    );
+    // No entries means nothing truthful to say. A downgrade lands here -
+    // lastSeen is NEWER than what is running, so the filter matches nothing -
+    // and the header would claim an update that did not happen, over an empty
+    // list, with the model told to relay it. The marker write below stays
+    // unconditional so the downgrade is still recorded.
+    if (notes.length > 0) {
+      sections.push(
+        `WhatsApp plugin updated to v${PLUGIN_VERSION}` +
+          (lastSeen ? ` (from v${lastSeen})` : "") +
+          `.\n\nWhat's new:\n` +
+          notes.map((n) => `- ${n}`).join("\n"),
+      );
+    }
   }
 
   // Deliberately NOT gated on the marker. The "what's new" notice above gets

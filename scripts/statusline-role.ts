@@ -109,20 +109,56 @@ function findDescendant(
   return null;
 }
 
+// EVERY match, shallowest first, because the wrapper pattern is the plugin
+// dir name and more than one child of the CLI legitimately carries it in its
+// command line: the statusline's own shell does (the documented wiring is
+// `... && bun <plugin-dir>/scripts/statusline-role.ts`), this very script
+// does, and so does any `bun <plugin-dir>/scripts/access.ts` the session
+// happens to run. Win32_Process rows are not pid-ordered, so a first-match
+// search picks an arbitrary one of them and the segment blanks out whenever
+// that pick has no server.ts under it - the original bug, downgraded from
+// permanent to intermittent, which is worse to diagnose.
+function findDescendants(
+  rows: ProcRow[],
+  rootPid: number,
+  match: string,
+  maxDepth: number,
+): number[] {
+  const hits: number[] = [];
+  let frontier = new Set([rootPid]);
+  for (let depth = 0; depth < maxDepth; depth++) {
+    const children = rows.filter((r) => frontier.has(r.ppid));
+    for (const c of children) if (c.command.includes(match)) hits.push(c.pid);
+    frontier = new Set(children.map((r) => r.pid));
+    if (frontier.size === 0) break;
+  }
+  return hits;
+}
+
 export function findServerPid(
   rows: ProcRow[],
   cliPid: number,
   wrapperMatch: string,
   serverMatch: string,
 ): number | null {
-  const wrapperPid = findDescendant(
+  // A candidate is only the real wrapper if server.ts sits under it. The
+  // decoys above have no such child, so they cost one scan of their own
+  // (empty) subtree each and nothing else.
+  for (const wrapperPid of findDescendants(
     rows,
     cliPid,
     wrapperMatch,
     WRAPPER_MAX_DEPTH,
-  );
-  if (wrapperPid === null) return null;
-  return findDescendant(rows, wrapperPid, serverMatch, SERVER_MAX_DEPTH);
+  )) {
+    const serverPid = findDescendant(
+      rows,
+      wrapperPid,
+      serverMatch,
+      SERVER_MAX_DEPTH,
+    );
+    if (serverPid !== null) return serverPid;
+  }
+  return null;
 }
 
 // The bug this exists for (issue #3): a statusLine setting is a compound
@@ -161,13 +197,12 @@ export function findServerPidForTerminal(
   maxHops: number = ANCESTOR_MAX_HOPS,
 ): number | null {
   const byPid = new Map(rows.map((r) => [r.pid, r]));
-  const visited = new Set<number>();
   let pid: number | undefined = startPid;
   for (let hop = 0; hop <= maxHops; hop++) {
     // pid 0 and a self-parenting row both appear in real Win32_Process
-    // output; either would spin this loop forever without the guards.
-    if (pid === undefined || pid <= 0 || visited.has(pid)) return null;
-    visited.add(pid);
+    // output. Neither can spin this loop - the hop bound ends it either way -
+    // so this only skips the pointless scans they would otherwise cause.
+    if (pid === undefined || pid <= 0) return null;
     const found = findServerPid(rows, pid, wrapperMatch, serverMatch);
     if (found !== null) return found;
     pid = byPid.get(pid)?.ppid;

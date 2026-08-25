@@ -204,6 +204,48 @@ describe("findServerPidForTerminal", () => {
     ).toBe(300);
   });
 
+  // Regression: the documented statusLine command is
+  // `... && bun <plugin-dir>/scripts/statusline-role.ts`, and <plugin-dir>
+  // ends in the plugin name — so the shell's OWN command line contains the
+  // wrapper pattern, at the same BFS depth as the real wrapper. A
+  // first-match-wins search picks whichever row the OS listed first, and
+  // Win32_Process rows are not pid-ordered, so the segment blanked out
+  // unpredictably. Both orderings must resolve to the real server.
+  //
+  // The fixture above dodges this by giving its shell a command with no
+  // plugin path in it, which is why 295 passing tests never caught it.
+  const realWiring = (shellFirst: boolean): ProcRow[] => {
+    const plugin = "plugins/cache/wa/whatsapp-claude-channel/0.20.0";
+    const cli: ProcRow = { pid: 100, ppid: 1, command: "claude.exe" };
+    const shell: ProcRow = {
+      pid: 400,
+      ppid: 100,
+      command: `sh -c "statusline.sh && bun ${plugin}/scripts/statusline-role.ts"`,
+    };
+    const wrapper: ProcRow = {
+      pid: 200,
+      ppid: 100,
+      command: `bun run --cwd ${plugin} start`,
+    };
+    const server: ProcRow = { pid: 300, ppid: 200, command: "bun server.ts" };
+    return shellFirst
+      ? [cli, shell, wrapper, server]
+      : [cli, wrapper, server, shell];
+  };
+
+  test("ignores a decoy carrying the plugin name, whichever order it is listed in", () => {
+    for (const shellFirst of [true, false]) {
+      expect(
+        findServerPidForTerminal(
+          realWiring(shellFirst),
+          400,
+          "whatsapp-claude-channel",
+          "server.ts",
+        ),
+      ).toBe(300);
+    }
+  });
+
   test("still works when started at the CLI itself, no climb needed", () => {
     expect(
       findServerPidForTerminal(
