@@ -2,9 +2,9 @@
 
 WhatsApp has no bot API — this channel connects as a **linked device** (like WhatsApp Web). Any contact who can message the linked phone number can reach the server. The access model described here decides who gets through.
 
-By default, a DM from an unknown sender triggers **pairing**: the server replies with a 6-character code and drops the message. You run `/whatsapp-claude-channel:access pair <code>` from your Claude Code session to approve them. Once approved, their messages pass through.
+By default, a DM from an unknown sender triggers **pairing**: the server replies with a 6-character code and drops the message. You run `/whatsapp-channel:access pair <code>` from your Claude Code session to approve them. Once approved, their messages pass through.
 
-All state lives in `~/.whatsapp-channel/access.json`. The `/whatsapp-claude-channel:access` skill commands edit this file; the server re-reads it on every inbound message, so changes take effect without a restart. Set `WHATSAPP_ACCESS_MODE=static` to pin config to what was on disk at boot (pairing is unavailable in static mode since it requires runtime writes).
+All state lives in `~/.whatsapp-channel/access.json`. The `/whatsapp-channel:access` skill commands edit this file; the server re-reads it on every inbound message, so changes take effect without a restart. Set `WHATSAPP_ACCESS_MODE=static` to pin config to what was on disk at boot (pairing is unavailable in static mode since it requires runtime writes).
 
 ## At a glance
 
@@ -20,14 +20,14 @@ All state lives in `~/.whatsapp-channel/access.json`. The `/whatsapp-claude-chan
 
 `dmPolicy` controls how DMs from senders not on the allowlist are handled.
 
-| Policy              | Behavior                                                                                                 |
-| ------------------- | -------------------------------------------------------------------------------------------------------- |
-| `pairing` (default) | Reply with a pairing code, drop the message. Approve with `/whatsapp-claude-channel:access pair <code>`. |
-| `allowlist`         | Drop silently. No reply. Prevents strangers from knowing the linked device is active.                    |
-| `disabled`          | Drop everything, including allowlisted users and groups.                                                 |
+| Policy              | Behavior                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------- |
+| `pairing` (default) | Reply with a pairing code, drop the message. Approve with `/whatsapp-channel:access pair <code>`. |
+| `allowlist`         | Drop silently. No reply. Prevents strangers from knowing the linked device is active.             |
+| `disabled`          | Drop everything, including allowlisted users and groups.                                          |
 
 ```
-/whatsapp-claude-channel:access policy allowlist
+/whatsapp-channel:access policy allowlist
 ```
 
 ## User IDs (JIDs)
@@ -37,8 +37,8 @@ WhatsApp identifies users by **JIDs** — phone number + `@s.whatsapp.net`, e.g.
 Pairing captures the JID automatically. To add one manually, use the phone number with country code, no leading `+`, followed by `@s.whatsapp.net`.
 
 ```
-/whatsapp-claude-channel:access allow 886912345678@s.whatsapp.net
-/whatsapp-claude-channel:access remove 886912345678@s.whatsapp.net
+/whatsapp-channel:access allow 886912345678@s.whatsapp.net
+/whatsapp-channel:access remove 886912345678@s.whatsapp.net
 ```
 
 ## Groups
@@ -46,7 +46,7 @@ Pairing captures the JID automatically. To add one manually, use the phone numbe
 Groups are off by default. Opt each one in individually.
 
 ```
-/whatsapp-claude-channel:access group add 120363424405607157@g.us
+/whatsapp-channel:access group add 120363424405607157@g.us
 ```
 
 Group JIDs end in `@g.us`. To find one, add the linked device to the group — the server logs the group JID when it receives a message from an unenabled group.
@@ -56,12 +56,12 @@ With the default `requireMention: false`, the server responds to every message. 
 Running `group add` again on an already-configured group **merges**, it doesn't start over: any flag you don't pass this time keeps whatever was already set. Adding `--roster` to a group that already has `--mention` on doesn't reset `--mention` back off — only the flags you actually pass change anything. To explicitly turn `--mention` or `--roster` back off (rather than just never setting them), pass `--no-mention` / `--no-roster` — passing both a flag and its negation at once is refused, not silently resolved one way.
 
 ```
-/whatsapp-claude-channel:access group add 120363424405607157@g.us
-/whatsapp-claude-channel:access group add 120363424405607157@g.us --mention
-/whatsapp-claude-channel:access group add 120363424405607157@g.us --allow 886912345678@s.whatsapp.net
-/whatsapp-claude-channel:access group add 120363424405607157@g.us --roster
-/whatsapp-claude-channel:access group add 120363424405607157@g.us --no-roster
-/whatsapp-claude-channel:access group rm 120363424405607157@g.us
+/whatsapp-channel:access group add 120363424405607157@g.us
+/whatsapp-channel:access group add 120363424405607157@g.us --mention
+/whatsapp-channel:access group add 120363424405607157@g.us --allow 886912345678@s.whatsapp.net
+/whatsapp-channel:access group add 120363424405607157@g.us --roster
+/whatsapp-channel:access group add 120363424405607157@g.us --no-roster
+/whatsapp-channel:access group rm 120363424405607157@g.us
 ```
 
 ### Per-group personality & memory
@@ -73,7 +73,7 @@ Each enabled group gets a config directory at `~/.whatsapp-channel/groups/<group
 | `config.md` | Personality, goals, and instructions for Claude in this group. User edits this.    |
 | `memory.md` | Conversation summaries appended by Claude automatically. Persists across sessions. |
 
-Created automatically when a group is added. Edit `config.md` to customize Claude's behavior per group. View or clear with `/whatsapp-claude-channel:access group config <jid>` and `/whatsapp-claude-channel:access group memory <jid>`.
+Created automatically when a group is added. Edit `config.md` to customize Claude's behavior per group. View or clear with `/whatsapp-channel:access group config <jid>` and `/whatsapp-channel:access group memory <jid>`.
 
 ### LID identifiers
 
@@ -114,11 +114,11 @@ It's a terminal command, deliberately not a Claude Code skill: running it yourse
 
 > No group or contact data was sent to any AI model during this setup — this ran entirely in your terminal.
 
-The `/whatsapp-claude-channel:access` skill will point you at it if you ask for guided setup there, but will never run it on your behalf.
+The `/whatsapp-channel:access` skill will point you at it if you ask for guided setup there, but will never run it on your behalf.
 
 ### Removing someone already granted access
 
-`/whatsapp-claude-channel:access remove <jid>` (or the equivalent CLI command) also forgets their cached name from `contacts.json`, not just their allowlist entry — it does **not** touch `lid-map.json` (needed for correct message/mention matching if they're still an active participant in a group you can see) and it does **not** remove them from any shared group or block them on WhatsApp, neither of which this plugin does. If they're still in a group with roster access, they'll show up there as a masked number from then on instead of by name — the honest consequence of choosing to forget someone this plugin was never going to remove from a group.
+`/whatsapp-channel:access remove <jid>` (or the equivalent CLI command) also forgets their cached name from `contacts.json`, not just their allowlist entry — it does **not** touch `lid-map.json` (needed for correct message/mention matching if they're still an active participant in a group you can see) and it does **not** remove them from any shared group or block them on WhatsApp, neither of which this plugin does. If they're still in a group with roster access, they'll show up there as a masked number from then on instead of by name — the honest consequence of choosing to forget someone this plugin was never going to remove from a group.
 
 ### Forgetting a stranger who was never allowlisted
 
@@ -132,18 +132,18 @@ In groups with `requireMention: true`, any of the following triggers the server:
 - A match against any regex in `mentionPatterns`
 
 ```
-/whatsapp-claude-channel:access set mentionPatterns '["claude", "assistant"]'
+/whatsapp-channel:access set mentionPatterns '["claude", "assistant"]'
 ```
 
 ## Delivery
 
-Configure outbound behavior with `/whatsapp-claude-channel:access set <key> <value>`.
+Configure outbound behavior with `/whatsapp-channel:access set <key> <value>`.
 
 **`ackReaction`** reacts to inbound messages on receipt. WhatsApp supports **any emoji** — there's no fixed whitelist like Telegram.
 
 ```
-/whatsapp-claude-channel:access set ackReaction 👀
-/whatsapp-claude-channel:access set ackReaction ""
+/whatsapp-channel:access set ackReaction 👀
+/whatsapp-channel:access set ackReaction ""
 ```
 
 **`replyToMode`** controls threading on chunked replies. When a long response is split, `first` (default) threads only the first chunk under the inbound message; `all` threads every chunk; `off` sends all chunks standalone.
@@ -164,17 +164,17 @@ The first Claude Code session that starts after the plugin's version has changed
 
 ## Skill reference
 
-| Command                                                              | Effect                                                                                                                            |
-| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `/whatsapp-claude-channel:access`                                    | Print current state: policy, allowlist, pending pairings, enabled groups.                                                         |
-| `/whatsapp-claude-channel:access pair a4f91c`                        | Approve pairing code `a4f91c`. Adds the sender to `allowFrom` and sends a confirmation on WhatsApp.                               |
-| `/whatsapp-claude-channel:access deny a4f91c`                        | Discard a pending code. The sender is not notified.                                                                               |
-| `/whatsapp-claude-channel:access allow 886912345678@s.whatsapp.net`  | Add a JID directly.                                                                                                               |
-| `/whatsapp-claude-channel:access remove 886912345678@s.whatsapp.net` | Remove from the allowlist.                                                                                                        |
-| `/whatsapp-claude-channel:access policy allowlist`                   | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`.                                                                       |
-| `/whatsapp-claude-channel:access group add 120363424405607157@g.us`  | Enable a group (merges into an existing entry). Flags: `--mention`/`--no-mention`, `--allow jid1,jid2`, `--roster`/`--no-roster`. |
-| `/whatsapp-claude-channel:access group rm 120363424405607157@g.us`   | Disable a group.                                                                                                                  |
-| `/whatsapp-claude-channel:access set ackReaction 👀`                 | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`.                                 |
+| Command                                                       | Effect                                                                                                                            |
+| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `/whatsapp-channel:access`                                    | Print current state: policy, allowlist, pending pairings, enabled groups.                                                         |
+| `/whatsapp-channel:access pair a4f91c`                        | Approve pairing code `a4f91c`. Adds the sender to `allowFrom` and sends a confirmation on WhatsApp.                               |
+| `/whatsapp-channel:access deny a4f91c`                        | Discard a pending code. The sender is not notified.                                                                               |
+| `/whatsapp-channel:access allow 886912345678@s.whatsapp.net`  | Add a JID directly.                                                                                                               |
+| `/whatsapp-channel:access remove 886912345678@s.whatsapp.net` | Remove from the allowlist.                                                                                                        |
+| `/whatsapp-channel:access policy allowlist`                   | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`.                                                                       |
+| `/whatsapp-channel:access group add 120363424405607157@g.us`  | Enable a group (merges into an existing entry). Flags: `--mention`/`--no-mention`, `--allow jid1,jid2`, `--roster`/`--no-roster`. |
+| `/whatsapp-channel:access group rm 120363424405607157@g.us`   | Disable a group.                                                                                                                  |
+| `/whatsapp-channel:access set ackReaction 👀`                 | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`.                                 |
 
 ## Config file
 

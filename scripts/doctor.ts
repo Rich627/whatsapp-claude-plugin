@@ -141,7 +141,7 @@ function checkStateDir(): boolean {
       `${STATE_DIR} does not exist — the server has never run on this machine`,
       {
         kind: "manual",
-        text: "Restart Claude Code with the plugin enabled (/mcp should list 'whatsapp'), then run /whatsapp-claude-channel:setup",
+        text: "Restart Claude Code with the plugin enabled (/mcp should list 'whatsapp'), then run /whatsapp-channel:setup",
       },
     );
     return false;
@@ -174,7 +174,7 @@ function checkAuth(): void {
       "no Baileys credentials — WhatsApp has never been linked",
       {
         kind: "manual",
-        text: "Run /whatsapp-claude-channel:setup and scan the QR code",
+        text: "Run /whatsapp-channel:setup and scan the QR code",
       },
     );
     return;
@@ -183,7 +183,7 @@ function checkAuth(): void {
   if (creds === null) {
     report("ERROR", "auth", "creds.json is corrupt (unparseable JSON)", {
       kind: "manual",
-      text: `Re-link from scratch: rm -rf ${AUTH_DIR} then restart Claude Code and run /whatsapp-claude-channel:setup. WARNING: this discards the linked session — only do it if the channel is otherwise dead.`,
+      text: `Re-link from scratch: rm -rf ${AUTH_DIR} then restart Claude Code and run /whatsapp-channel:setup. WARNING: this discards the linked session — only do it if the channel is otherwise dead.`,
     });
     return;
   }
@@ -195,7 +195,7 @@ function checkAuth(): void {
       "credentials exist but have no paired identity (me.id) — pairing may not have completed",
       {
         kind: "manual",
-        text: "Run /whatsapp-claude-channel:setup to finish linking",
+        text: "Run /whatsapp-channel:setup to finish linking",
       },
     );
     return;
@@ -301,7 +301,7 @@ function checkAccess(): AccessShape | null {
       "access.json is corrupt — on next start the server moves it aside and starts fresh (allowlist and policies will need re-adding)",
       {
         kind: "manual",
-        text: "Restore from a backup if you have one; otherwise reconfigure with /whatsapp-claude-channel:access after the next restart",
+        text: "Restore from a backup if you have one; otherwise reconfigure with /whatsapp-channel:access after the next restart",
       },
     );
     return null;
@@ -332,7 +332,7 @@ function checkAccess(): AccessShape | null {
       `access.json malformed: ${problems.join("; ")}`,
       {
         kind: "manual",
-        text: "Fix the listed fields by hand, or delete access.json and reconfigure via /whatsapp-claude-channel:access",
+        text: "Fix the listed fields by hand, or delete access.json and reconfigure via /whatsapp-channel:access",
       },
     );
     return null;
@@ -482,7 +482,7 @@ function checkWatchdog(): void {
     report(
       "INFO",
       "watchdog",
-      "watchdog not installed (optional) — run /whatsapp-claude-channel:setup to install auto-recovery",
+      "watchdog not installed (optional) — run /whatsapp-channel:setup to install auto-recovery",
     );
     return;
   }

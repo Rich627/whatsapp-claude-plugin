@@ -17,8 +17,8 @@ The plugin connects to WhatsApp as a **linked device** (the same protocol as Wha
 
 ```sh
 claude plugin marketplace add Rich627/whatsapp-claude-plugin
-claude plugin install whatsapp-claude-channel@whatsapp-claude-plugin
-claude --dangerously-load-development-channels plugin:whatsapp-claude-channel@whatsapp-claude-plugin
+claude plugin install whatsapp-channel@whatsapp-claude-plugin
+claude --dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin
 ```
 
 The `--dangerously-load-development-channels` flag matters: it registers the plugin as a **channel**, so an inbound WhatsApp message wakes your session immediately. Without it the tools still load, but nothing wakes the session when messages arrive — they sit unanswered until you (or a [watchdog](./scripts/watchdog.sh)) prompt Claude to check. `--channels` does not accept this plugin yet (it is not on the research-preview allowlist), so the development flag is currently the only way.
@@ -26,7 +26,7 @@ The `--dangerously-load-development-channels` flag matters: it registers the plu
 Inside the session, set your number and pair:
 
 ```text
-/whatsapp-claude-channel:configure <phone>   # country code + number, no +
+/whatsapp-channel:configure <phone>   # country code + number, no +
 ```
 
 A pairing code is printed on first launch. On your phone: WhatsApp → Settings → Linked Devices → Link a Device → **Link with phone number instead** → enter the code. No WhatsApp Business API, Meta developer account, or API key is involved — it links to your regular account.
@@ -36,7 +36,7 @@ A pairing code is printed on first launch. On your phone: WhatsApp → Settings 
 The server is a plain stdio MCP server, so any MCP client can run it. Two things are Claude Code specific and worth knowing before you start:
 
 - **Inbound messages are not pushed.** Waking a session on an incoming message uses `notifications/claude/channel`, a Claude Code extension. MCP has no standard equivalent that reaches the model, and other clients drop unknown notifications silently. Elsewhere the plugin is poll-based: call `wait_for_messages` (waits up to 40s for the next message) or `catch_up` / `unreplied`. Every tool result also carries a count of unreplied messages, so a client finds out there is traffic on its next call whatever that call was.
-- **Setup is done from a terminal, not a slash command.** `/whatsapp-claude-channel:access` and friends are Claude Code skills. Use `bun scripts/access.ts` instead (see [Access control from a terminal](#access-control-from-a-terminal)).
+- **Setup is done from a terminal, not a slash command.** `/whatsapp-channel:access` and friends are Claude Code skills. Use `bun scripts/access.ts` instead (see [Access control from a terminal](#access-control-from-a-terminal)).
 
 Register the server with an absolute path — `${CLAUDE_PLUGIN_ROOT}` is substituted by Claude Code only:
 
@@ -45,7 +45,7 @@ Register the server with an absolute path — `${CLAUDE_PLUGIN_ROOT}` is substit
 ```toml
 [mcp_servers.whatsapp]
 command = "bun"
-args = ["run", "--cwd", "/absolute/path/to/whatsapp-claude-channel", "start"]
+args = ["run", "--cwd", "/absolute/path/to/whatsapp-channel", "start"]
 startup_timeout_sec = 30   # default 10 is tight for a first Baileys connect
 tool_timeout_sec = 120     # default 60; wait_for_messages parks for up to 40s
 ```
@@ -57,12 +57,7 @@ tool_timeout_sec = 120     # default 60; wait_for_messages parks for up to 40s
   "mcpServers": {
     "whatsapp": {
       "command": "bun",
-      "args": [
-        "run",
-        "--cwd",
-        "/absolute/path/to/whatsapp-claude-channel",
-        "start"
-      ],
+      "args": ["run", "--cwd", "/absolute/path/to/whatsapp-channel", "start"],
       "timeout": 600000
     }
   }
@@ -77,12 +72,7 @@ tool_timeout_sec = 120     # default 60; wait_for_messages parks for up to 40s
     "whatsapp": {
       "type": "stdio",
       "command": "bun",
-      "args": [
-        "run",
-        "--cwd",
-        "/absolute/path/to/whatsapp-claude-channel",
-        "start"
-      ]
+      "args": ["run", "--cwd", "/absolute/path/to/whatsapp-channel", "start"]
     }
   }
 }
@@ -112,13 +102,13 @@ Approving always needs the specific code, even when only one pairing is waiting:
 - **@-mentions.** `reply` can tag people so they actually get notified — ids are accepted as phone, LID, or full JID, and mentions attach only to the chunk that names them.
 - **Full media support.** Photos, voice notes, video, documents, and stickers, in both directions.
 - **Voice transcription.** Incoming voice notes are transcribed locally via mlx-whisper (see [setup](#voice-transcription-optional)); without the script they arrive as plain attachments.
-- **Access control.** Pairing codes, allowlists, and per-group policies gate every inbound message — strangers never reach your session. Managed via `/whatsapp-claude-channel:access` in Claude Code, or `bun scripts/access.ts` anywhere.
+- **Access control.** Pairing codes, allowlists, and per-group policies gate every inbound message — strangers never reach your session. Managed via `/whatsapp-channel:access` in Claude Code, or `bun scripts/access.ts` anywhere.
 - **Per-group personalities.** Each group gets its own `config.md` with a custom personality and conversation memory.
 - **Permission relay.** Approve or deny Claude's tool requests from WhatsApp with an emoji reaction (👍 / 👎).
 - **Cron tasks.** A `## Cron Jobs` section in a group's `config.md` schedules recurring server-side tasks.
 - **Context recovery.** After a restart, the `catch_up` tool replays recent two-way conversation per chat, unreplied counts, and open tasks from `tasks.md`, so a fresh session resumes mid-flight work.
 - **Dual accounts.** Run personal and business numbers side by side with separate state and behaviors.
-- **Self-diagnosis.** `/whatsapp-claude-channel:doctor` checks the server process, device link, singleton lock, and config, then walks you through the fixes — no more guessing why replies stopped.
+- **Self-diagnosis.** `/whatsapp-channel:doctor` checks the server process, device link, singleton lock, and config, then walks you through the fixes — no more guessing why replies stopped.
 
 ## How it works
 
@@ -150,12 +140,12 @@ The reference script uses `mlx-community/whisper-large-v3-turbo` — accurate, f
 
 | Issue                               | Solution                                                                                                                                                                                                                                                                                                                                                                                            |
 | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pairing code not showing            | Run `/whatsapp-claude-channel:configure <phone>` first, then relaunch                                                                                                                                                                                                                                                                                                                               |
+| Pairing code not showing            | Run `/whatsapp-channel:configure <phone>` first, then relaunch                                                                                                                                                                                                                                                                                                                                      |
 | 440 disconnect error                | Only one connection per auth state allowed. Kill stale processes: `pkill -f "whatsapp.*server"`                                                                                                                                                                                                                                                                                                     |
-| Session not waking on new messages  | Most common cause: launched without `--dangerously-load-development-channels plugin:whatsapp-claude-channel@whatsapp-claude-plugin`. Tools work but inbound pushes are dropped (`Channel notifications skipped` in the MCP debug log) — relaunch with the flag.                                                                                                                                     |
+| Session not waking on new messages  | Most common cause: launched without `--dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin`. Tools work but inbound pushes are dropped (`Channel notifications skipped` in the MCP debug log) — relaunch with the flag.                                                                                                                                            |
 | Messages not arriving               | Known Claude Code client bug ([#37933](https://github.com/anthropics/claude-code/issues/37933)). Server-side is correct, awaiting client fix.                                                                                                                                                                                                                                                       |
 | Replies still send, nothing arrives | Send a **DM** to the connected number as well as a group message — a DM that lands while groups stay silent means the group sender-key path, not the connection. `~/.whatsapp-channel/diag.log` records an `inbound upsert` line for every batch WhatsApp delivers, so it distinguishes "never arrived" from "arrived and was dropped". Set `WHATSAPP_DIAG_DEBUG=1` for Baileys' full debug stream. |
-| Auth expired                        | Run `/whatsapp-claude-channel:configure reset-auth` and re-pair                                                                                                                                                                                                                                                                                                                                     |
+| Auth expired                        | Run `/whatsapp-channel:configure reset-auth` and re-pair                                                                                                                                                                                                                                                                                                                                            |
 
 ## Documentation
 

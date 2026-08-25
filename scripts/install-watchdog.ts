@@ -130,7 +130,7 @@ function install(): void {
     report(
       "ERROR",
       "watchdog-file",
-      `state dir ${STATE_DIR} does not exist — run /whatsapp-claude-channel:setup first (the server creates it on first start)`,
+      `state dir ${STATE_DIR} does not exist — run /whatsapp-channel:setup first (the server creates it on first start)`,
     );
     return;
   }
