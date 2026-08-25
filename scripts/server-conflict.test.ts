@@ -62,3 +62,36 @@ describe("conflict mode", () => {
     }
   }, 60_000);
 });
+
+// Issue #4: shutdown() only removes the role file on a graceful exit, so a
+// killed or crashed server leaves one behind forever. The sweep runs before
+// the singleton lock is taken, which is what lets this test see it: the
+// server planted against a live lock refuses and exits, and must STILL have
+// tidied up on its way through.
+describe("stale role file sweep", () => {
+  test("removes role files of dead pids and keeps live ones", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wa-rolesweep-"));
+    const dead = join(dir, ".role-999999");
+    const live = join(dir, `.role-${process.pid}`);
+    const notOurs = join(dir, ".role-not-a-pid");
+    writeFileSync(dead, "primary\n999999\n");
+    writeFileSync(live, "secondary\n1\n");
+    writeFileSync(notOurs, "primary");
+
+    const child = spawn("bun", [SERVER], {
+      env: { ...process.env, WHATSAPP_STATE_DIR: dir },
+      stdio: ["pipe", "ignore", "pipe"],
+      windowsHide: true,
+    });
+    try {
+      for (let i = 0; i < 60 && existsSync(dead); i++) await sleep(500);
+      expect(existsSync(dead)).toBe(false);
+      // A live pid's file belongs to a running server - never ours to remove.
+      expect(existsSync(live)).toBe(true);
+      // Not .role-<number>, so not this sweep's business.
+      expect(existsSync(notOurs)).toBe(true);
+    } finally {
+      child.kill();
+    }
+  }, 60_000);
+});

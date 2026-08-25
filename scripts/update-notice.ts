@@ -63,6 +63,7 @@ if (!isStaticMode()) {
         "You will now be told when a newer version of this plugin is available, instead of only hearing about one after you had already installed it. Notices like this one now print straight to your terminal rather than being passed to the assistant and hoping it mentions them.",
         "`/whatsapp-channel:access` with no arguments now ends by telling you how to add groups and contacts, how to take access back, and how to do either with no AI model involved.",
         "Fixed: the WA:<role> statusline segment never appeared. It was looking for the server in the wrong branch of the process tree, and failing silently when it did not find it. Each server now records which session it belongs to, so with several sessions open every terminal shows its own role rather than possibly a neighbour's.",
+        "Fixed: leftover `.role-<pid>` files from crashed or killed sessions are now cleared at startup instead of piling up in `~/.whatsapp-channel/` forever.",
       ],
     },
     {
