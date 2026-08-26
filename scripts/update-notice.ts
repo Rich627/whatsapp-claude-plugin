@@ -63,6 +63,7 @@ if (!isStaticMode()) {
         "Fixed: the WA:<role> statusline segment was blank for the first few seconds of a session, and because Claude Code only redraws the statusline when you type, it often stayed blank until your first message. A terminal that asked for the WhatsApp channel now shows a dim WA:… straight away, and the server writes its role file earlier, so the real primary/secondary label arrives sooner.",
         "The terminal wizard no longer drops the contacts screen without saying why: it tells you when there is no DM activity on record yet (and that WHATSAPP_CACHE_CONTACTS=1 is what makes the server keep one) or when the record simply has nothing new. Each screen also says when there is more than it can show - `Only showing 5 of 23 (most recent)` - and how many archived groups it left out.",
         "The terminal wizard's 5-group/10-contact screens are no longer a wall: after each one you can type to search everything cached, add one at a time, and pick `Done` when you are finished. Still entirely in your terminal, with no AI model involved.",
+        'Replies you type on your phone are no longer invisible to Claude. For chats already on your allowlist, the message is logged the moment you send it, so the unreplied list clears and `catch_up` shows both sides of the conversation instead of only Claude\'s half. Your own words stay readable for an hour and then collapse to a "replied (text expired)" line, and `catch_up` now replays the last 5 messages per chat rather than 15.',
       ],
     },
     {

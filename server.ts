@@ -55,6 +55,7 @@ import {
   normalizeMentionJids,
   mentionsForChunk,
 } from "./lib/mentions";
+import { RECENT_LIMIT, recentWindow, renderLogEntry } from "./lib/message-view";
 import {
   contactName,
   mergeContact,
@@ -1661,7 +1662,7 @@ function checkApprovals(): void {
 
   for (const senderId of files) {
     const file = join(APPROVED_DIR, senderId);
-    void sock.sendMessage(senderId, { text: "Paired! Say hi to Claude." }).then(
+    void sendTracked(senderId, { text: "Paired! Say hi to Claude." }).then(
       () => rmSync(file, { force: true }),
       (err) => {
         logDiag(`${LOG_PREFIX}: failed to send approval confirm: ${err}\n`);
@@ -1905,9 +1906,40 @@ function trackSent(key: WAMessageKey): void {
   if (key.id) sentMessages.set(key.id, Date.now());
 }
 
+// Every send this server makes has to be tracked, not just the reply tool's:
+// isOwnerHandReply treats "fromMe and not in sentMessages" as the owner
+// typing on their phone, and Baileys' event buffer delivers a batch under
+// its FIRST entry's type, so an own `append` sharing a window with an inbound
+// `notify` arrives as notify - untracked, it would be logged as a hand reply
+// under the owner's name and clear that chat's unreplied count.
+async function sendTracked(
+  jid: string,
+  content: Parameters<WASocket["sendMessage"]>[1],
+): Promise<WAMessage | undefined> {
+  const sent = await sock!.sendMessage(jid, content);
+  if (sent?.key) trackSent(sent.key);
+  return sent;
+}
+
 function isEcho(key: WAMessageKey): boolean {
   if (key.fromMe) return true;
   return key.id ? sentMessages.has(key.id) : false;
+}
+
+// isEcho's `fromMe` clause treats every message from this account as our own
+// echo — including the ones the owner types on their phone. `sentMessages` is
+// the only real test of "this server sent it" (see trackSent), so a fromMe
+// message that is NOT in it is the owner replying by hand.
+function isOwnerHandReply(key: WAMessageKey): boolean {
+  if (!key.fromMe) return false;
+  return !(key.id && sentMessages.has(key.id));
+}
+
+// Fork default (owner, 2026-08-26): the owner's own display name, never the
+// phone number. safeName strips the characters that would break a rendered
+// log line (the profile name is self-set data crossing into model-visible text).
+function ownerDisplayName(): string {
+  return safeName(sock?.user?.name)?.trim() || "You (by hand)";
 }
 
 setInterval(() => {
@@ -1960,6 +1992,9 @@ interface MessageLogEntry {
   replied: boolean;
   /** Absent on legacy lines — treat missing as 'in'. */
   direction?: "in" | "out";
+  /** 'owner' = the owner typed this on their phone, not the agent.
+   *  Absent = today's meaning (agent-sent if direction 'out', inbound otherwise). */
+  by?: "owner";
   image_path?: string;
   attachment_kind?: string;
   group_name?: string;
@@ -2016,10 +2051,12 @@ async function waitForUnreplied(maxMs: number): Promise<MessageLogEntry[]> {
 }
 
 function formatMessages(entries: MessageLogEntry[]): string {
+  const owner = ownerDisplayName();
   return entries
     .map((m) => {
-      const parts = [`[${m.ts}] ${m.user} in ${m.group_name ?? m.chat_id}:`];
-      if (m.text) parts.push(m.text);
+      const view = renderLogEntry(m, owner);
+      const parts = [`[${m.ts}] ${view.who} in ${m.group_name ?? m.chat_id}:`];
+      if (view.text) parts.push(view.text);
       if (m.image_path) parts.push(`(image: ${m.image_path})`);
       if (m.attachment_kind) parts.push(`(${m.attachment_kind} attachment)`);
       parts.push(`  chat_id=${m.chat_id} message_id=${m.id}`);
@@ -2045,10 +2082,12 @@ function getUnreplied(): MessageLogEntry[] {
   }
 }
 
-/** Last ~N messages per chat, both directions, chronological — for catch_up.
- *  The 24h window is enforced by pruneMessageLog, not here. */
+/** Last ~5 messages per chat, both directions, chronological — for catch_up.
+ *  The 5-message window is the privacy limit on the owner's own hand-typed
+ *  replies (see lib/message-view.ts); the 24h window is enforced by
+ *  pruneMessageLog, not here. */
 function getRecentByChat(
-  limit = 15,
+  limit = RECENT_LIMIT,
 ): Map<string, { entries: MessageLogEntry[]; unreplied: number }> {
   const byChat = new Map<
     string,
@@ -2071,8 +2110,7 @@ function getRecentByChat(
       } catch {}
     }
     for (const bucket of byChat.values()) {
-      bucket.entries.sort((a, b) => a.ts.localeCompare(b.ts));
-      bucket.entries = bucket.entries.slice(-limit);
+      bucket.entries = recentWindow(bucket.entries, limit);
     }
   } catch {}
   return byChat;
@@ -2411,7 +2449,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           {
             name: "catch_up",
             description:
-              'Recover conversation context after a restart. For every chat active in the last 24h, returns the recent messages in BOTH directions (sender name for incoming, "You" for replies this agent sent), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
+              'Recover conversation context after a restart. For every chat active in the last 24h, returns the recent messages in BOTH directions (sender name for incoming, "You" for a reply this agent sent, and the owner\'s own name for a message they typed on their phone — those show only their most recent hour, older ones read "replied (text expired)"), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
             inputSchema: {
               type: "object",
               properties: {},
@@ -2651,7 +2689,7 @@ const handleToolCall = async (req: {
           args.chat_id as string,
           args.message_id as string,
         );
-        await sock.sendMessage(args.chat_id as string, {
+        await sendTracked(args.chat_id as string, {
           react: { text: args.emoji as string, key },
         });
         return { content: [{ type: "text", text: "reacted" }] };
@@ -2703,7 +2741,7 @@ const handleToolCall = async (req: {
           args.message_id as string,
           true,
         );
-        await sock.sendMessage(args.chat_id as string, {
+        await sendTracked(args.chat_id as string, {
           text: args.text as string,
           edit: editKey,
         });
@@ -2786,6 +2824,7 @@ const handleToolCall = async (req: {
       case "catch_up": {
         const byChat = getRecentByChat();
         const sections: string[] = [];
+        const owner = ownerDisplayName();
         for (const [chatId, { entries, unreplied }] of byChat) {
           const name =
             entries.find((e) => e.group_name)?.group_name ??
@@ -2793,11 +2832,11 @@ const handleToolCall = async (req: {
             chatId;
           const header = `=== ${name} (chat_id=${chatId})${unreplied ? ` — ${unreplied} unreplied` : ""} ===`;
           const lines = entries.map((e) => {
-            const who = e.direction === "out" ? "You" : e.user;
+            const view = renderLogEntry(e, owner);
             const extras =
               (e.image_path ? ` (image: ${e.image_path})` : "") +
               (e.attachment_kind ? ` (${e.attachment_kind} attachment)` : "");
-            return `[${e.ts}] ${who}: ${e.text}${extras}`;
+            return `[${e.ts}] ${view.who}: ${view.text}${extras}`;
           });
           sections.push([header, ...lines].join("\n"));
         }
@@ -3234,10 +3273,69 @@ function safeName(s: string | undefined | null): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, "_");
 }
 
+// The owner replied on their phone. Log it for the chats the agent is already
+// allowed to see, so unreplied clears and catch_up shows both halves. This is
+// deliberately NOT gate(): gate is the INBOUND path and mints/refreshes pairing
+// codes as a side effect (server.ts:1584-1602) — a message the owner sent must
+// never burn a pairing slot or trigger a "pairing required" reply. Only gate's
+// pure reads are reused.
+async function logOwnerHandReply(msg: WAMessage): Promise<void> {
+  const chatId = msg.key.remoteJid!;
+  if (
+    chatId === "status@broadcast" ||
+    chatId.endsWith("@broadcast") ||
+    chatId.endsWith("@newsletter")
+  )
+    return;
+
+  const isGroup = chatId.endsWith("@g.us");
+  const access = loadAccess();
+  if (isGroup) {
+    if (!access.groups[chatId]) return;
+  } else {
+    if (access.dmPolicy === "disabled") return;
+    const peerJid = jidNormalizedUser(chatId);
+    // Cached lid map only (isAllowedJid → resolveToPhone), never
+    // ensureLidResolved: that one WRITES lid-map.json on success and logs the
+    // jid on failure, which for a chat that is then dropped would be a new
+    // on-disk record of a contact the owner never allowlisted. The cost is
+    // that a hand reply to a @lid contact nobody has mapped yet is dropped
+    // until their next inbound message maps them - strictly less stored.
+    if (!isAllowedJid(peerJid, access.allowFrom)) return;
+  }
+
+  // Only now is the text read at all. No diag line, no log line, nothing on
+  // the drop paths above.
+  const text = extractText(msg.message);
+  if (!text) return; // media-only / reaction / protocol message — see NOTE 3
+
+  const tsSec =
+    typeof msg.messageTimestamp === "number"
+      ? msg.messageTimestamp
+      : Number(msg.messageTimestamp ?? 0);
+  const groupName = isGroup ? await resolveGroupName(chatId) : undefined;
+
+  markReplied(chatId);
+  persistMessage({
+    id: msg.key.id ?? `hand-${Date.now()}`,
+    chat_id: chatId,
+    user: ownerDisplayName(),
+    user_id: ownJid || "self",
+    text,
+    ts: new Date(tsSec > 0 ? tsSec * 1000 : Date.now()).toISOString(),
+    replied: true,
+    direction: "out",
+    by: "owner",
+    ...(groupName && groupName !== chatId ? { group_name: groupName } : {}),
+  });
+}
+
 async function handleMessage(msg: WAMessage): Promise<void> {
   if (!msg.message) return;
-  if (isEcho(msg.key)) return;
   if (!msg.key.remoteJid) return;
+  // MUST come before isEcho: its fromMe clause would swallow this again.
+  if (isOwnerHandReply(msg.key)) return logOwnerHandReply(msg);
+  if (isEcho(msg.key)) return;
 
   const remoteJid = msg.key.remoteJid;
   // Status updates / channel broadcasts aren't DMs or groups — treating them
@@ -3284,7 +3382,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
   if (result.action === "pair") {
     if (!sock) return;
     const lead = result.isResend ? "Still pending" : "Pairing required";
-    await sock.sendMessage(remoteJid, {
+    await sendTracked(remoteJid, {
       text: `${lead} — run in Claude Code:\n\n/whatsapp-channel:access pair ${result.code}`,
     });
     return;
@@ -3295,7 +3393,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
   // ─── In-chat commands ───────────────────────────────────────────────
   if (text.trim().toLowerCase() === "/new") {
     if (sock) {
-      await sock.sendMessage(remoteJid, {
+      await sendTracked(remoteJid, {
         text: "🔄 Context cleared. Starting fresh.",
       });
     }

@@ -131,6 +131,23 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 | `list_groups`         | List every group the account is in, with JID, allowlist state, and roster-grant state. Also refreshes the local group name cache the access wizard reads.                                                             |
 | `group_roster`        | List a group's members by saved name, or a masked number — never raw. Requires [roster access](./ACCESS.md#group-roster--all-mentions).                                                                               |
 
+### Your own replies
+
+When you answer a chat from your phone instead of asking Claude to, the server logs that message
+too — but only for chats already on the allowlist (a DM from someone in `allowFrom`, or a group
+you have enabled). Anything you send to any other chat is discarded before its text is read: the text is never
+read, logged or stored, and the drop itself is not recorded either. (The connection's own
+diagnostic log already notes every message id and chat it receives, as it did before this
+feature; that is the only trace.)
+
+`catch_up` replays the last **5** messages per chat, both directions. Your own hand-typed text is
+readable for **1 hour**; after that the line collapses to `<your name> replied (text expired)` —
+the fact that you answered is still shown, the words are not. That is a display rule: the raw
+line stays in `~/.whatsapp-channel/messages.jsonl` until the log's existing 24-hour prune
+removes it, the same as every other message there. Messages Claude sent and messages you
+received keep the existing 24-hour window in full. There is **no backfill**: the plugin only sees messages
+while it is running, so anything you typed while it was stopped is gone for good.
+
 ## Photos & Media
 
 Inbound **photos** are downloaded eagerly to `~/.whatsapp-channel/inbox/` and the local path is included in the notification so the assistant can read it.
