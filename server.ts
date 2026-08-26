@@ -55,6 +55,7 @@ import {
   normalizeMentionJids,
   mentionsForChunk,
 } from "./lib/mentions";
+import { logContainsId } from "./lib/message-log-probe";
 import { RECENT_LIMIT, recentWindow, renderLogEntry } from "./lib/message-view";
 import {
   contactName,
@@ -2012,6 +2013,17 @@ function persistMessage(entry: MessageLogEntry): void {
   }
 }
 
+// The probe itself lives in lib/message-log-probe.ts, with its spoofing and
+// collision cases pinned by tests; this is only the fs wrapper.
+function isAlreadyLogged(id: string): boolean {
+  try {
+    if (!existsSync(MESSAGE_LOG)) return false;
+    return logContainsId(readFileSync(MESSAGE_LOG, "utf8"), id);
+  } catch {
+    return false;
+  }
+}
+
 function markReplied(chat_id: string): void {
   // Rewrite the log, marking all unreplied messages for this chat as replied
   try {
@@ -3312,6 +3324,24 @@ async function logOwnerHandReply(msg: WAMessage): Promise<void> {
   // the drop paths above.
   const text = extractText(msg.message);
   if (!text) return; // media-only / reaction / protocol message — see NOTE 3
+
+  // Idempotence guard, and a PARTIAL defence against replay. `sentMessages` is
+  // in-memory and pruned at 5 minutes, so after a restart or a long drop it no
+  // longer knows our own sends - and Baileys types a whole buffered batch by
+  // its FIRST entry (see trackSent), so a replayed own send can arrive as
+  // `notify` and reach here looking exactly like the owner typing. markReplied
+  // below would then flip EVERY unreplied inbound in this chat to replied and
+  // it would silently leave `unreplied`. Our sends persist under their real
+  // message id, so an id already in the log means replay.
+  //
+  // ponytail: this covers only sends whose id we PERSIST, which is chunk 1 of
+  // a reply (:2681 writes sentIds[0] alone). Still misclassifiable after a
+  // restart: chunks 2..N of a long reply, the `/new` ack (:3430) and the two
+  // pairing notices (:1669, :3419) - none of those reach messages.jsonl. The
+  // `/new` one is reachable on demand: any allowlisted contact can type it.
+  // The real fix is making trackSent durable (one choke point, all 12 sends);
+  // left for the owner because it adds a state file. See HANDOFF.md.
+  if (msg.key.id && isAlreadyLogged(msg.key.id)) return;
 
   const tsSec =
     typeof msg.messageTimestamp === "number"
