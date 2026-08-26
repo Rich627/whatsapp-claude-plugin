@@ -136,9 +136,13 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 When you answer a chat from your phone instead of asking Claude to, the server logs that message
 too — but only for chats already on the allowlist (a DM from someone in `allowFrom`, or a group
 you have enabled). Anything you send to any other chat is discarded before its text is read: the text is never
-read, logged or stored, and the drop itself is not recorded either. (The connection's own
-diagnostic log already notes every message id and chat it receives, as it did before this
-feature; that is the only trace.)
+read, logged or stored, and the drop itself is not recorded either — the drop path writes no
+diagnostic line and no log line. (One line per inbound batch still reaches the diagnostic log
+before any of this, as it did before this feature, but every number in it is masked to its last
+four digits — no full phone number, no message id, no text. A group keeps its identifying form,
+since that is what makes an outage diagnosable, with the creator's number masked out of the
+legacy `<number>-<timestamp>` style. Baileys' own library logging, at `info` and above or `debug`
+under `WHATSAPP_DIAG_DEBUG=1`, is the library's own and is not masked by us.)
 
 `catch_up` replays the last **5** messages per chat, both directions. Your own hand-typed text is
 readable for **1 hour**; after that the line collapses to `<your name> replied (text expired)` —

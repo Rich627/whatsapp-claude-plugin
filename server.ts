@@ -62,7 +62,7 @@ import {
   migrateContactKey,
   type ContactsMap,
 } from "./scripts/contacts";
-import { looksLikeNumber, maskNumber } from "./scripts/mask";
+import { looksLikeNumber, maskJid, maskNumber } from "./scripts/mask";
 import { wizardCmd } from "./scripts/wizard-cmd";
 import {
   createServer,
@@ -1245,7 +1245,11 @@ async function ensureLidResolved(jid: string): Promise<void> {
     if (pn) recordLidMapping(normalized, pn);
   } catch (err) {
     logDiag(
-      `${LOG_PREFIX}: active LID resolution failed for ${normalized}: ${err}\n`,
+      // Masked: this runs from handleMessage BEFORE the gate, so an unmasked
+      // jid here is a refused stranger's identifier on disk - the leak the
+      // hand-reply path avoids this function entirely to prevent (see the
+      // cached-lid-map-only comment in logOwnerHandReply).
+      `${LOG_PREFIX}: active LID resolution failed for ${maskJid(normalized)}: ${err}\n`,
     );
   }
 }
@@ -1796,7 +1800,7 @@ setInterval(() => {
     job.lastFired = minuteKey;
 
     logDiag(
-      `${LOG_PREFIX}: cron firing for ${job.groupJid}: ${job.prompt.slice(0, 50)}...\n`,
+      `${LOG_PREFIX}: cron firing for ${maskJid(job.groupJid)}: ${job.prompt.slice(0, 50)}...\n`,
     );
     mcp
       .notification({
@@ -2307,7 +2311,7 @@ mcp.setNotificationHandler(
     const owner = access.allowFrom[0];
     if (sock && owner) {
       const sent = await sock.sendMessage(owner, { text }).catch((e) => {
-        logDiag(`permission_request send to ${owner} failed: ${e}\n`);
+        logDiag(`permission_request send to ${maskJid(owner)} failed: ${e}\n`);
         return undefined;
       });
       if (sent?.key?.id) {
@@ -3373,8 +3377,8 @@ async function handleMessage(msg: WAMessage): Promise<void> {
 
   if (result.action === "drop") {
     logDiag(
-      `${LOG_PREFIX}: dropped inbound from ${senderJid}` +
-        `${isLidUser(senderJid) ? ` (resolved: ${resolveToPhone(senderJid)})` : ""} chat=${remoteJid}\n`,
+      `${LOG_PREFIX}: dropped inbound from ${maskJid(senderJid)}` +
+        `${isLidUser(senderJid) ? ` (resolved: ${maskNumber(resolveToPhone(senderJid))})` : ""} chat=${maskJid(remoteJid)}\n`,
     );
     return;
   }
@@ -3448,22 +3452,18 @@ async function handleMessage(msg: WAMessage): Promise<void> {
       const emoji = permMatch[1]!.toLowerCase().startsWith("y")
         ? "\u2705"
         : "\u274C";
-      void sock
-        .sendMessage(remoteJid, {
-          react: { text: emoji, key: msg.key },
-        })
-        .catch(() => {});
+      void sendTracked(remoteJid, {
+        react: { text: emoji, key: msg.key },
+      }).catch(() => {});
     }
     return;
   }
 
   // Ack reaction
   if (access.ackReaction && sock && messageId) {
-    void sock
-      .sendMessage(remoteJid, {
-        react: { text: access.ackReaction, key: msg.key },
-      })
-      .catch(() => {});
+    void sendTracked(remoteJid, {
+      react: { text: access.ackReaction, key: msg.key },
+    }).catch(() => {});
   }
 
   // Typing indicator
@@ -3881,7 +3881,7 @@ async function connectWhatsApp(): Promise<void> {
       pairingCodeRequested = false;
       ownJid = jidNormalizedUser(sock!.user?.id ?? "");
       const resolvedOwn = ownJid ? resolveToPhone(ownJid) : "";
-      logDiag(`${LOG_PREFIX}: connected as ${ownJid}\n`);
+      logDiag(`${LOG_PREFIX}: connected as ${maskJid(ownJid)}\n`);
 
       // Auto-add owner to allowlist on first connection
       if (ownJid && !STATIC) {
@@ -3894,7 +3894,7 @@ async function connectWhatsApp(): Promise<void> {
           }
           saveAccess(access);
           logDiag(
-            `${LOG_PREFIX}: auto-added owner ${resolvedOwn} to allowlist\n`,
+            `${LOG_PREFIX}: auto-added owner ${maskJid(resolvedOwn)} to allowlist\n`,
           );
         }
       }
@@ -3995,15 +3995,24 @@ async function connectWhatsApp(): Promise<void> {
   sock.ev.on(
     "messages.upsert",
     async (ev: { messages: WAMessage[]; type: string }) => {
-      // The one line that answers "did it even get here?". JIDs only, never
-      // message text: this file is a debugging aid, not a second transcript.
+      // The one line that answers "did it even get here?". Masked JIDs only,
+      // never message text: this file is a debugging aid, not a second
+      // transcript. It runs BEFORE the allowlist gate, so an unmasked number
+      // here would be a dropped stranger's real number on disk - the one
+      // trace the hand-reply feature promises not to leave (USAGE.md).
       // Logged before the notify filter so a batch dropped for arriving as
       // "append" (offline backlog) is distinguishable from one that never came.
       logDiag(
         `${LOG_PREFIX}: inbound upsert type=${ev.type} n=${ev.messages.length} ` +
           `decrypted=[${ev.messages.map((m) => (m.message ? "y" : "NULL")).join(",")}] ` +
           `from=[${ev.messages
-            .map((m) => String(m.key?.participant ?? m.key?.remoteJid))
+            .map((m) => {
+              // A missing jid stays legible rather than masking to bullets:
+              // "did it even get here?" is exactly the case where the absence
+              // is the finding, and •••••  would hide it as a short number.
+              const j = m.key?.participant ?? m.key?.remoteJid;
+              return j ? maskJid(String(j)) : "undefined";
+            })
             .join(",")}]\n`,
       );
       if (ev.type !== "notify") return;

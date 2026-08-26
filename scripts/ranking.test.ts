@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { groupAnchor } from "./mask";
 import {
   contactKeyFor,
   filterCandidates,
-  groupAnchor,
   listConfiguredDms,
   listConfiguredGroups,
   normalizeJid,

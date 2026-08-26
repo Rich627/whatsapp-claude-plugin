@@ -4,7 +4,7 @@
 // import (same class of problem server.ts has, see its own comments on
 // why mentions.ts/contacts.ts/mask.ts were extracted the same way).
 import { type ContactsMap } from "./contacts";
-import { looksLikeNumber, maskNumber } from "./mask";
+import { groupAnchor, looksLikeNumber, maskNumber } from "./mask";
 
 export type GroupMeta = {
   name: string;
@@ -67,21 +67,6 @@ function clip(name: string): string {
 // never drift between "what's new" and "what's already on".
 function groupLabel(g: GroupMeta): string {
   return `${clip(g.name)}  (${g.memberCount} member(s))${g.archived ? "  [archived]" : ""}`;
-}
-
-// A modern group JID is a random `120363…@g.us` and carries nothing
-// personal, which is why a group's anchor shows it in full. A LEGACY one is
-// `<creator-phone>-<created-at>@g.us`, so the same field would put a real
-// phone number on screen and into the transcript - exactly what mask.ts
-// exists to stop. The hyphen is what tells the two apart: mask only the
-// segment before it, leaving the timestamp (and the whole modern form)
-// intact, so the anchor still identifies one group unambiguously.
-export function groupAnchor(jid: string): string {
-  const at = jid.indexOf("@");
-  const user = at < 0 ? jid : jid.slice(0, at);
-  const dash = user.indexOf("-");
-  if (dash < 0) return jid;
-  return maskNumber(user.slice(0, dash)) + user.slice(dash) + jid.slice(at);
 }
 
 // AskUserQuestion - the checkbox UI behind the in-session `review`/`manage`

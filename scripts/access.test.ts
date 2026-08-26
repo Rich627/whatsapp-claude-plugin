@@ -704,7 +704,7 @@ describe("wizard", () => {
   });
 
   test.skipIf(!!process.env.CI)(
-    "says the contacts screen is missing because caching is off, not silently",
+    "no DM activity on record: says so and names the cache flag, not silently",
     () => {
       const dir = freshStateDir();
       writeGroupsMeta(dir, {

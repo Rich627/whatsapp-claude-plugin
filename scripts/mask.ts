@@ -6,12 +6,44 @@
 // Fixed-length mask (5 bullets, not one per hidden digit): a variable-length
 // mask still leaks the number's digit count, which narrows down country code
 // and format. A fixed length reveals only the last 4 digits, nothing else.
+// The device suffix is stripped as well as the domain: a JID off the wire can
+// be `<number>:<device>@…`, and since this keeps the LAST four digits, an
+// unstripped `:12` would silently shift the window and render the same person
+// two different ways depending on which call site normalized the JID first.
 export function maskNumber(input: string): string {
   const digits = String(input ?? "")
     .split("@")[0]
+    .split(":")[0]
     .replace(/\D/g, "");
   if (digits.length <= 4) return "•".repeat(5);
   return "•".repeat(5) + digits.slice(-4);
+}
+
+// A MODERN group JID is a random `120363…@g.us` and carries nothing personal,
+// which is why a group's anchor shows it in full. A LEGACY one is
+// `<creator-phone>-<created-at>@g.us`, so the same field would put a real
+// phone number on screen and into the transcript - exactly what this file
+// exists to stop. The hyphen is what tells the two apart: mask only the
+// segment before it, leaving the timestamp (and the whole modern form)
+// intact, so the anchor still identifies one group unambiguously.
+export function groupAnchor(jid: string): string {
+  const at = jid.indexOf("@");
+  const user = at < 0 ? jid : jid.slice(0, at);
+  const dash = user.indexOf("-");
+  if (dash < 0) return jid;
+  return maskNumber(user.slice(0, dash)) + user.slice(dash) + jid.slice(at);
+}
+
+// Same rule for anything written to the diagnostic log, which is a file on
+// disk that outlives the session and is read long after the fact. A group JID
+// is the handle that makes an outage diagnosable at all (the inbound-upsert
+// line exists because a group going silent was undiagnosable for 20h), so it
+// keeps its identifying form - but through groupAnchor, since a legacy group
+// carries its creator's number. @s.whatsapp.net and @lid both carry real
+// digits and are masked outright.
+export function maskJid(jid: string): string {
+  const s = String(jid ?? "");
+  return s.endsWith("@g.us") ? groupAnchor(s) : maskNumber(s);
 }
 
 // A "name" that's actually just a phone number in disguise defeats any

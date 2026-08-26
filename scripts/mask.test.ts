@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { looksLikeNumber, maskNumber } from "./mask";
+import { looksLikeNumber, maskJid, maskNumber } from "./mask";
 
 describe("maskNumber", () => {
   test("bare phone number shows only the last 4 digits", () => {
@@ -72,5 +72,41 @@ describe("looksLikeNumber", () => {
   test("a short embedded digit run (under 6 digits) is not flagged", () => {
     expect(looksLikeNumber("Room 42, 3rd floor")).toBe(false);
     expect(looksLikeNumber("Agent 007")).toBe(false);
+  });
+});
+
+describe("maskJid", () => {
+  test("a user JID is masked", () => {
+    expect(maskJid("61403911675@s.whatsapp.net")).toBe("•••••1675");
+  });
+
+  test("a LID is masked too - it carries real digits", () => {
+    expect(maskJid("184710990000999@lid")).toBe("•••••0999");
+  });
+
+  test("a modern group JID passes through whole: it is the debug handle", () => {
+    expect(maskJid("120363427665348138@g.us")).toBe("120363427665348138@g.us");
+  });
+
+  test("a LEGACY group JID has its creator's number masked, timestamp kept", () => {
+    // The case the first version of maskJid got wrong: a bare @g.us
+    // passthrough writes <creator-phone>-<created-at> to the diag log intact.
+    expect(maskJid("61403911675-1443627404@g.us")).toBe(
+      "•••••1675-1443627404@g.us",
+    );
+  });
+
+  test("a device suffix does not shift the masked window", () => {
+    // Off the wire a jid can be <number>:<device>@…; unstripped, the ":12"
+    // is absorbed into the digit run and the same person renders two ways
+    // depending on which call site normalized first.
+    expect(maskJid("61403911675:12@s.whatsapp.net")).toBe(
+      maskJid("61403911675@s.whatsapp.net"),
+    );
+  });
+
+  test("undefined/empty does not throw or leak", () => {
+    expect(maskJid("")).toBe("•••••");
+    expect(maskJid(undefined as unknown as string)).toBe("•••••");
   });
 });
