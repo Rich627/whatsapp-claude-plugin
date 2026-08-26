@@ -61,6 +61,15 @@ Missing file = `{dmPolicy:"pairing", allowFrom:[], groups:{}, pending:{}}`.
 
 Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 
+A plain-language request to add access — "add a contact", "add this group",
+"let them message me", "set up access", "approve the people I already talk
+to" — is not an unrecognized argument. It is `review`: run that. The same
+request in reverse ("take their access away", "revoke", "remove them") is
+`manage`. Offer the terminal wizard second, in the same order the status
+screen below lists the three routes, and never as the answer that sends the
+user away: `review` does this in-session, and the wizard is for someone who
+wants the decision made with no AI model involved.
+
 ### No args — status
 
 1. Read `~/.whatsapp-channel/access.json` (handle missing file).
@@ -240,6 +249,12 @@ the user asks for "the wizard" or "guided setup" here, tell them to open a
 terminal and run `bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" wizard`
 themselves (a marketplace install's real path — not the repo-relative
 `scripts/access.ts`, which resolves to nothing outside a repo checkout).
+In the same breath, say that `review` below is the same checkbox screen
+without leaving the session, and point at that section for why it is an
+acceptable substitute rather than restating it here. If they asked to add a
+contact or a group and named the wizard only because it is the route they
+knew, `review` is the one to run: this refusal is about who may run the
+wizard, never a reason to leave adding access undone.
 Continue helping with everything else in this skill as normal.
 
 The same applies to `wizard --revoke`, its revoke screen: same terminal-only
@@ -469,10 +484,12 @@ recently active DM contacts, so review stays to one screen each instead
 of scaling with how many groups/contacts exist. Its `--revoke` mode is the
 same screen over everything already configured, uncapped. It's terminal-only by
 design (see the `wizard` entry above) so the decision can be made with a
-verifiable guarantee that no AI model was involved in making it. Point
-the user at it for setting up several groups or contacts at once; use
-this skill's own `group add` for one group with a custom personality, or
-`allow <jid>` for one contact.
+verifiable guarantee that no AI model was involved in making it. Point the
+user at it when that guarantee is the point — not for volume: `review`
+offers the whole ranked, uncapped list four at a time and keeps paging, so
+several groups or contacts at once is in-session work too. Use this skill's
+own `group add` for one group with a custom personality, or `allow <jid>`
+for one contact.
 
 This skill's own `review`/`manage` (above) are the in-session checkbox
 equivalent, Claude Code only. They run the same script for their lists and

@@ -3803,8 +3803,8 @@ async function connectWhatsApp(): Promise<void> {
         `  → edit personality at ~/.whatsapp-channel/groups/<groupJid>/config.md`,
         ``,
         `Already have contacts and groups you talk to on WhatsApp? Run`,
-        `\`${WIZARD_CMD}\` for a checkbox screen to bulk-approve`,
-        `them instead of pairing each one individually.`,
+        `\`/whatsapp-channel:access review\` for a checkbox screen to bulk-approve them,`,
+        `or \`${WIZARD_CMD}\` for the same with no AI model involved.`,
         ``,
         `Ready to receive messages.`,
       ].join("\n");

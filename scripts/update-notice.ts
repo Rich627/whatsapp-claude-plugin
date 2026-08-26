@@ -57,6 +57,12 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.22.0",
+      notes: [
+        "Asking Claude to add a contact or a group now opens the in-session checkbox screen instead of sending you off to a terminal: it runs `/whatsapp-channel:access review` over everything you already talk to, four at a time. The terminal wizard is still there, offered second, for when you want the decision made with no AI model involved.",
+      ],
+    },
+    {
       version: "0.21.2",
       notes: [
         "Fixed: the WA:<role> statusline segment could still show a role for a server that had been killed, if the operating system had since handed that process id to something else. It now checks that the process really is a running server before believing the file.",
