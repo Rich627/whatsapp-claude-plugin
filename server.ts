@@ -3376,9 +3376,14 @@ async function handleMessage(msg: WAMessage): Promise<void> {
   const result = gate(remoteJid, senderJid, text, mentionedJids);
 
   if (result.action === "drop") {
+    // resolveToPhone returns its INPUT when the lid is unmapped, so echoing it
+    // through the mask printed "(resolved: X)" with the same X twice - reading
+    // as a success when resolution had in fact failed. Say which it was.
+    const mapped = isLidUser(senderJid) ? lidMap[senderJid] : undefined;
     logDiag(
       `${LOG_PREFIX}: dropped inbound from ${maskJid(senderJid)}` +
-        `${isLidUser(senderJid) ? ` (resolved: ${maskNumber(resolveToPhone(senderJid))})` : ""} chat=${maskJid(remoteJid)}\n`,
+        `${isLidUser(senderJid) ? (mapped ? ` (resolved: ${maskNumber(mapped)})` : " (lid unresolved)") : ""}` +
+        ` chat=${maskJid(remoteJid)}\n`,
     );
     return;
   }
@@ -4007,11 +4012,19 @@ async function connectWhatsApp(): Promise<void> {
           `decrypted=[${ev.messages.map((m) => (m.message ? "y" : "NULL")).join(",")}] ` +
           `from=[${ev.messages
             .map((m) => {
-              // A missing jid stays legible rather than masking to bullets:
-              // "did it even get here?" is exactly the case where the absence
-              // is the finding, and •••••  would hide it as a short number.
-              const j = m.key?.participant ?? m.key?.remoteJid;
-              return j ? maskJid(String(j)) : "undefined";
+              // Chat first, then the sender within it. Taking `participant ??
+              // remoteJid` would drop the group entirely for group traffic
+              // (participant always wins there) - which is the one thing this
+              // line was added to make visible. A missing jid stays legible
+              // rather than masking to bullets: "did it even get here?" is
+              // exactly the case where the absence IS the finding, and •••••
+              // would hide it as a short number.
+              const chat = m.key?.remoteJid;
+              const who = m.key?.participant;
+              if (!chat) return who ? maskJid(String(who)) : "undefined";
+              return (
+                maskJid(String(chat)) + (who ? `/${maskJid(String(who))}` : "")
+              );
             })
             .join(",")}]\n`,
       );

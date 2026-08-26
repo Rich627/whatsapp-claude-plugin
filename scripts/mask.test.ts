@@ -109,4 +109,16 @@ describe("maskJid", () => {
     expect(maskJid("")).toBe("•••••");
     expect(maskJid(undefined as unknown as string)).toBe("•••••");
   });
+  test("a broadcast/newsletter JID keeps its form - it names a channel", () => {
+    expect(maskJid("status@broadcast")).toBe("status@broadcast");
+    expect(maskJid("120363111111111111@newsletter")).toBe(
+      "120363111111111111@newsletter",
+    );
+  });
+
+  test("a LEGACY broadcast list still has its creator's number masked", () => {
+    expect(maskJid("61403911675-1443627404@broadcast")).toBe(
+      "•••••1675-1443627404@broadcast",
+    );
+  });
 });

@@ -750,6 +750,11 @@ describe("groupAnchor", () => {
     );
   });
 
+  test("a domain-less legacy id does not get its last character duplicated", () => {
+    // jid.slice(at) with at === -1 is slice(-1): the LAST char, re-appended.
+    expect(groupAnchor("61403911675-1443627404")).toBe("•••••1675-1443627404");
+  });
+
   test("a legacy group JID has its creator's number masked, timestamp kept", () => {
     expect(groupAnchor("61403911675-1443627404@g.us")).toBe(
       "•••••1675-1443627404@g.us",

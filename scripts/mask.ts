@@ -31,19 +31,30 @@ export function groupAnchor(jid: string): string {
   const user = at < 0 ? jid : jid.slice(0, at);
   const dash = user.indexOf("-");
   if (dash < 0) return jid;
-  return maskNumber(user.slice(0, dash)) + user.slice(dash) + jid.slice(at);
+  // `jid.slice(at)` with at === -1 is slice(-1) - the LAST character, silently
+  // duplicated onto the end. Only re-attach a domain that exists.
+  return (
+    maskNumber(user.slice(0, dash)) +
+    user.slice(dash) +
+    (at < 0 ? "" : jid.slice(at))
+  );
 }
 
 // Same rule for anything written to the diagnostic log, which is a file on
-// disk that outlives the session and is read long after the fact. A group JID
-// is the handle that makes an outage diagnosable at all (the inbound-upsert
-// line exists because a group going silent was undiagnosable for 20h), so it
-// keeps its identifying form - but through groupAnchor, since a legacy group
-// carries its creator's number. @s.whatsapp.net and @lid both carry real
-// digits and are masked outright.
+// disk that outlives the session and is read long after the fact.
+//
+// A group, broadcast list or newsletter JID names a CHANNEL, not a person:
+// the id is not a phone number, and it is the handle that makes an outage
+// diagnosable at all (a group going silent was undiagnosable for 20h - see
+// server.ts's own note). Those keep their identifying form, but through
+// groupAnchor, because the LEGACY `<creator-number>-<created-at>` form is
+// used by both @g.us and @broadcast and does carry a real number.
+// @s.whatsapp.net and @lid are a person by definition and are masked outright.
 export function maskJid(jid: string): string {
   const s = String(jid ?? "");
-  return s.endsWith("@g.us") ? groupAnchor(s) : maskNumber(s);
+  return /@(g\.us|broadcast|newsletter)$/.test(s)
+    ? groupAnchor(s)
+    : maskNumber(s);
 }
 
 // A "name" that's actually just a phone number in disguise defeats any
