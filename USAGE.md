@@ -76,7 +76,7 @@ After pairing, the policy auto-locks back to `allowlist`.
 
 Each group gets its own personality config at `~/.whatsapp-channel/groups/<groupJid>/config.md`. Edit that file to customize how Claude behaves in each group. Conversation memory is auto-saved to `memory.md` in the same directory.
 
-See [ACCESS.md](./ACCESS.md) for group options (`--mention`, `--allow`, `--roster`). Setting up several groups or contacts at once? Run `bun scripts/access.ts wizard` in your own terminal for a checkbox pass over your most recently active ones, or `wizard --revoke` to tick off access you want taken away — see [Guided bulk setup](./ACCESS.md#guided-bulk-setup-wizard).
+See [ACCESS.md](./ACCESS.md) for group options (`--mention`, `--allow`, `--roster`). Setting up several groups or contacts at once? Ask for `/whatsapp-channel:access review` — the in-session checkbox screen over everything you already talk to. If you would rather the decision were made with no AI model involved, run `bun scripts/access.ts wizard` in your own terminal instead (or `wizard --revoke` to tick off access you want taken away) — see [Guided bulk setup](./ACCESS.md#guided-bulk-setup-wizard).
 
 ## Daily use
 
@@ -221,9 +221,11 @@ pkill -f "whatsapp.*server"
 ## Statusline (optional)
 
 `scripts/statusline-role.ts` prints `WA:primary`, `WA:secondary` or
-`WA:reconnecting` (colored, empty string otherwise) for whichever terminal
-it's run in. Append it to a Claude Code `statusLine` command to see at a
-glance which terminal holds the real connection:
+`WA:reconnecting` (colored) for whichever terminal it's run in, a dim
+`WA:…` while a terminal that asked for the channel is still bringing a
+server up, and an empty string when there is no server here at all. Append
+it to a Claude Code `statusLine` command to see at a glance which terminal
+holds the real connection:
 
 ```json
 {

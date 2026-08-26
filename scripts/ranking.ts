@@ -115,11 +115,14 @@ function disambiguate(candidates: Candidate[]): Candidate[] {
 // applyChatActivity there). Undefined/never-seen activity sorts last,
 // tie-broken alphabetically so the order is still deterministic rather
 // than depending on object key iteration order.
+//
+// `limit` defaults to uncapped - the wizard ranks the whole pool so it can
+// say how many did not fit, then slices for the screen.
 export function rankGroups(
   meta: Record<string, GroupMeta>,
   alreadyConfigured: ReadonlySet<string>,
   includeArchived: boolean,
-  limit: number,
+  limit: number = Infinity,
 ): Candidate[] {
   const ranked = Object.entries(meta)
     .filter(([jid]) => !alreadyConfigured.has(jid))
@@ -198,12 +201,15 @@ function dmLabel(contacts: ContactsMap, key: string): string {
 
 // See dmLabel above for why a `.notify`-only label is marked unverified
 // rather than shown like a saved name.
+//
+// `limit` defaults to uncapped - the wizard ranks the whole pool so it can
+// say how many did not fit, then slices for the screen.
 export function rankDms(
   activity: Record<string, number>,
   contacts: ContactsMap,
   allowFrom: readonly string[],
   lidMap: Record<string, string>,
-  limit: number,
+  limit: number = Infinity,
 ): Candidate[] {
   const alreadyAllowed = new Set(
     allowFrom.map((jid) => contactKeyFor(lidMap, jid)),
@@ -218,6 +224,28 @@ export function rankDms(
       description: maskNumber(jid),
     }));
   return disambiguate(ranked);
+}
+
+// The search prompt's source (access.ts's wizard). Case-insensitive substring
+// over the two strings already on screen: the label, and the description -
+// a group's description IS its JID, the identity anchor, and a contact's is
+// the masked number, so typing either finds the row. Plain `includes`, never
+// a RegExp built from the term: the term and the labels are both
+// attacker-influenced text, and a term like `.*` or `(a+)+` has to stay a
+// literal search rather than become a pattern. Returns the SAME candidate
+// objects in the SAME (ranked) order - this never builds a candidate, so
+// nothing here can invent or alter a JID.
+export function filterCandidates(
+  pool: readonly Candidate[],
+  term: string | undefined,
+): Candidate[] {
+  const needle = (term ?? "").trim().toLowerCase();
+  if (!needle) return [...pool];
+  return pool.filter(
+    (c) =>
+      c.label.toLowerCase().includes(needle) ||
+      c.description.toLowerCase().includes(needle),
+  );
 }
 
 // Every DM contact already in allowFrom, not just the top N new ones - the

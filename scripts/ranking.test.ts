@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   contactKeyFor,
+  filterCandidates,
   groupAnchor,
   listConfiguredDms,
   listConfiguredGroups,
@@ -149,6 +150,27 @@ describe("rankGroups", () => {
     expect(rankGroups(meta, new Set(), false, 2)).toHaveLength(2);
   });
 
+  test("omitting the limit returns the whole pool - the total the wizard discloses", () => {
+    const meta: Record<string, GroupMeta> = {};
+    for (let i = 1; i <= 7; i++) {
+      meta[`${i}@g.us`] = group({ name: `Group ${i}` });
+    }
+    expect(rankGroups(meta, new Set(), false)).toHaveLength(7);
+    expect(rankGroups(meta, new Set(), false, 2)).toHaveLength(2);
+  });
+
+  test("labels are disambiguated across the WHOLE pool when uncapped", () => {
+    // A cap of 1 would only ever see one of these two, so its label would
+    // never need the disambiguation suffix - uncapped, both are visible to
+    // disambiguate() and both must come back distinct.
+    const meta = {
+      "111999@g.us": group({ name: "Team", memberCount: 4 }),
+      "222888@g.us": group({ name: "Team", memberCount: 4 }),
+    };
+    const result = rankGroups(meta, new Set(), false);
+    expect(new Set(result.map((c) => c.label)).size).toBe(2);
+  });
+
   test("label includes member count and an [archived] tag when relevant", () => {
     const meta = {
       "a@g.us": group({ name: "Alpha", memberCount: 6 }),
@@ -254,6 +276,114 @@ describe("rankDms", () => {
       "c@s.whatsapp.net": 3,
     };
     expect(rankDms(activity, {}, [], {}, 2)).toHaveLength(2);
+  });
+
+  test("omitting the limit returns the whole pool - the total the wizard discloses", () => {
+    const activity: Record<string, number> = {};
+    for (let i = 1; i <= 12; i++) {
+      activity[`${i}@s.whatsapp.net`] = i;
+    }
+    expect(rankDms(activity, {}, [], {})).toHaveLength(12);
+    expect(rankDms(activity, {}, [], {}, 2)).toHaveLength(2);
+  });
+
+  test("labels are disambiguated across the WHOLE pool when uncapped", () => {
+    // A cap of 1 would only ever see one of these two Alex's - uncapped,
+    // both are visible to disambiguate() and both must come back distinct.
+    const activity = {
+      "61403911675@s.whatsapp.net": 200,
+      "61432609386@s.whatsapp.net": 100,
+    };
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Alex" },
+      "61432609386@s.whatsapp.net": { name: "Alex" },
+    };
+    const result = rankDms(activity, contacts, [], {});
+    expect(new Set(result.map((c) => c.label)).size).toBe(2);
+  });
+});
+
+// The search prompt's source (access.ts's wizard). Pure, no mocks - see
+// filterCandidates' own header comment for why it matches on label OR
+// description, and never builds a RegExp from the term.
+describe("filterCandidates", () => {
+  const pool = rankGroups(
+    {
+      "120363424405607157@g.us": group({ name: "Family", memberCount: 4 }),
+      "b@g.us": group({ name: "Work", memberCount: 2, lastActivityAt: 1 }),
+    },
+    new Set(),
+    false,
+  );
+
+  test("undefined term returns the whole pool, in ranked order", () => {
+    const result = filterCandidates(pool, undefined);
+    expect(result.map((c) => c.jid)).toEqual(pool.map((c) => c.jid));
+  });
+
+  test('"" and "   " do the same as undefined', () => {
+    expect(filterCandidates(pool, "").map((c) => c.jid)).toEqual(
+      pool.map((c) => c.jid),
+    );
+    expect(filterCandidates(pool, "   ").map((c) => c.jid)).toEqual(
+      pool.map((c) => c.jid),
+    );
+  });
+
+  test("case-insensitive label substring", () => {
+    const result = filterCandidates(pool, "fam");
+    expect(result.map((c) => c.label)).toEqual(["Family  (4 member(s))"]);
+  });
+
+  test("matches on description - a group JID fragment finds the group", () => {
+    const result = filterCandidates(pool, "120363");
+    expect(result.map((c) => c.jid)).toEqual(["120363424405607157@g.us"]);
+  });
+
+  test("matches on description - a masked-number fragment finds the DM", () => {
+    const dmPool = rankDms({ "61403911675@s.whatsapp.net": 100 }, {}, [], {});
+    const result = filterCandidates(dmPool, "1675");
+    expect(result.map((c) => c.jid)).toEqual(["61403911675@s.whatsapp.net"]);
+  });
+
+  test("no match returns an empty array", () => {
+    expect(filterCandidates(pool, "nonexistent")).toEqual([]);
+  });
+
+  test("returns candidates, never builds them (identity, not equality)", () => {
+    const result = filterCandidates(pool, undefined);
+    expect(result[0]).toBe(pool[0]);
+  });
+
+  test("a regex-special term is matched literally, never as a pattern", () => {
+    const abPool = rankGroups(
+      {
+        "a@g.us": group({ name: "Alpha" }),
+        "b@g.us": group({ name: "Bravo" }),
+      },
+      new Set(),
+      false,
+    );
+    expect(filterCandidates(abPool, ".*")).toEqual([]);
+  });
+
+  test("order is the pool's ranked order, not match-quality order", () => {
+    const both = rankGroups(
+      {
+        "z@g.us": group({ name: "Zzz Family", lastActivityAt: 1 }),
+        "a@g.us": group({ name: "Aaa Family", lastActivityAt: 2 }),
+      },
+      new Set(),
+      false,
+    );
+    const result = filterCandidates(both, "family");
+    expect(result.map((c) => c.jid)).toEqual(["a@g.us", "z@g.us"]);
+  });
+
+  test("does not mutate the pool", () => {
+    const before = pool.length;
+    filterCandidates(pool, "fam");
+    expect(pool.length).toBe(before);
   });
 });
 

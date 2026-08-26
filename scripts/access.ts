@@ -28,14 +28,16 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { checkbox } from "@inquirer/prompts";
+import { checkbox, search } from "@inquirer/prompts";
 import { forgetContact, type ContactsMap } from "./contacts";
 import {
   contactKeyFor,
+  filterCandidates,
   listConfiguredDms,
   listConfiguredGroups,
   rankDms,
   rankGroups,
+  type Candidate,
   type GroupMeta,
 } from "./ranking";
 
@@ -370,12 +372,67 @@ function highlight(text: string): string {
 const GROUP_CANDIDATE_LIMIT = 5;
 const DM_CANDIDATE_LIMIT = 10;
 
+// `search` resolves to ONE value and has no built-in "done", so the loop is
+// what makes more than one pick possible and Done is a choice like any other.
+// Sentinel value rather than "": a JID always contains "@" and never a NUL
+// byte, so this cannot collide with a real pick even if a cache file holds a
+// junk key.
+const SEARCH_DONE = " done";
+
+function capLine(shown: number, total: number): string {
+  return `Only showing ${shown} of ${total} (most recent) - use the search below to reach the rest.`;
+}
+
+const CACHE_OFF_NOTE =
+  'No contacts to review - no DM activity is on record. The server only records it with WHATSAPP_CACHE_CONTACTS=1 (off by default, and never in static mode); with that set, let it run so the record builds (see "Names and privacy" in ACCESS.md).';
+
+const NO_DM_CANDIDATES_NOTE =
+  "No contacts to review - nothing new in the cached DM activity: everyone who has messaged recently is already on the allowlist, or nobody has messaged yet.";
+
+// One pick per round, repeated until Done, over the FULL eligible pool for a
+// screen - the checkbox above it only ever shows the first 5/10. Returns the
+// jids picked, in pick order, never a duplicate and never one already in
+// `taken` (the checkbox's own selections), so the caller can concatenate
+// without a dedupe pass.
+async function searchPicks(
+  pool: readonly Candidate[],
+  taken: readonly string[],
+  message: string,
+): Promise<string[]> {
+  const picks: string[] = [];
+  for (;;) {
+    const chosen = new Set([...taken, ...picks]);
+    const remaining = pool.filter((c) => !chosen.has(c.jid));
+    if (remaining.length === 0) return picks;
+    const jid = await search<string>({
+      message,
+      source: (term) => {
+        const done = {
+          name: "Done - nothing more from here",
+          value: SEARCH_DONE,
+        };
+        const hits = filterCandidates(remaining, term).map((c) => ({
+          name: c.label,
+          value: c.jid,
+          description: c.description,
+        }));
+        // Done first while nothing is typed, so a bare Enter leaves the loop;
+        // last once a term is typed, so Enter takes the best match instead of
+        // silently ending the round on the user.
+        return term?.trim() ? [...hits, done] : [done, ...hits];
+      },
+    });
+    if (jid === SEARCH_DONE) return picks;
+    picks.push(jid);
+  }
+}
+
 // Guided setup for the account's most recently active groups and contacts
 // that haven't been decided on yet - top 5 / top 10 by recency, the same
 // way WhatsApp's own app orders its chat list, so the review stays to one
 // screen instead of every group/contact ever seen. Anything beyond that is
-// meant to be added one at a time later (`group add`/`allow`, or just
-// asking Claude - it already has the name from context), not reviewed here.
+// reachable one at a time through the search round after each screen, over
+// the full eligible pool - or later via `group add`/`allow`.
 //
 // Terminal, not chat: this is what makes "no data went to an AI" literally
 // true (no model runs during the decision), and it works for any client
@@ -387,22 +444,24 @@ async function wizard(args: string[]): Promise<void> {
   const includeArchived = args.includes("--include-archived");
   const a = load();
   const lidMap = loadLidMap();
+  const meta = loadGroupsMeta();
+  const configuredGroups = new Set(Object.keys(a.groups));
 
-  const groupCandidates = rankGroups(
-    loadGroupsMeta(),
-    new Set(Object.keys(a.groups)),
-    includeArchived,
-    GROUP_CANDIDATE_LIMIT,
-  );
-  const dmCandidates = rankDms(
-    loadDmActivity(),
-    loadContacts(),
-    a.allowFrom,
-    lidMap,
-    DM_CANDIDATE_LIMIT,
-  );
+  // Ranked uncapped, sliced here: the pool length is what the cap line
+  // discloses and what the search round searches; the slice is the screen.
+  const groupPool = rankGroups(meta, configuredGroups, includeArchived);
+  const shownGroups = groupPool.slice(0, GROUP_CANDIDATE_LIMIT);
+  const dmPool = rankDms(loadDmActivity(), loadContacts(), a.allowFrom, lidMap);
+  const shownDms = dmPool.slice(0, DM_CANDIDATE_LIMIT);
+  // Eligible-but-archived, counted the same way rankGroups filters: a group
+  // already configured was never a candidate, archived or not.
+  const hiddenArchived = includeArchived
+    ? 0
+    : Object.entries(meta).filter(
+        ([jid, g]) => g.archived && !configuredGroups.has(jid),
+      ).length;
 
-  if (groupCandidates.length === 0 && dmCandidates.length === 0) {
+  if (groupPool.length === 0 && dmPool.length === 0) {
     die(
       "Nothing to review - either no group/contact activity is cached yet " +
         "(pair the account and let it connect at least once first), or " +
@@ -414,26 +473,73 @@ async function wizard(args: string[]): Promise<void> {
   let rosterGroups: string[] = [];
   let allowDms: string[] = [];
   try {
-    if (groupCandidates.length > 0) {
+    if (hiddenArchived > 0) {
+      process.stdout.write(
+        `${hiddenArchived} archived group(s) are hidden - re-run with --include-archived to include them.\n`,
+      );
+    }
+    if (groupPool.length > 0) {
+      const moreGroups = groupPool.length > shownGroups.length;
+      if (moreGroups) {
+        process.stdout.write(
+          capLine(shownGroups.length, groupPool.length) + "\n",
+        );
+      }
       actGroups = await checkbox({
         message: "Which groups can Claude reply in?",
-        choices: groupCandidates.map((c) => ({ name: c.label, value: c.jid })),
+        choices: shownGroups.map((c) => ({ name: c.label, value: c.jid })),
       });
+      if (moreGroups) {
+        actGroups = actGroups.concat(
+          await searchPicks(
+            groupPool,
+            actGroups,
+            "Search for another group Claude can reply in (or pick Done):",
+          ),
+        );
+      }
+      // AFTER the search round, over the union of both kinds of pick, and
+      // sourced from groupPool (not the slice) so a searched group is offered
+      // roster access too.
       if (actGroups.length > 0) {
         rosterGroups = await checkbox({
           message:
             'Of those, which can Claude also see member names in (for "all" mentions)?',
-          choices: groupCandidates
+          choices: groupPool
             .filter((c) => actGroups.includes(c.jid))
             .map((c) => ({ name: c.label, value: c.jid })),
         });
       }
     }
-    if (dmCandidates.length > 0) {
+    if (dmPool.length > 0) {
+      const moreDms = dmPool.length > shownDms.length;
+      if (moreDms) {
+        process.stdout.write(capLine(shownDms.length, dmPool.length) + "\n");
+      }
       allowDms = await checkbox({
         message: "Which contacts can message Claude?",
-        choices: dmCandidates.map((c) => ({ name: c.label, value: c.jid })),
+        choices: shownDms.map((c) => ({ name: c.label, value: c.jid })),
       });
+      if (moreDms) {
+        allowDms = allowDms.concat(
+          await searchPicks(
+            dmPool,
+            allowDms,
+            "Search for another contact who can message Claude (or pick Done):",
+          ),
+        );
+      }
+    } else {
+      // Two different observations, one line for whichever applies. The file
+      // is only ever written under WHATSAPP_CACHE_CONTACTS=1 and never in
+      // static mode (server.ts:131-141), so "absent" means no record exists -
+      // this script cannot see the server's env, so it names the precondition
+      // rather than asserting which of the three causes it was.
+      process.stdout.write(
+        (existsSync(DM_ACTIVITY_FILE)
+          ? NO_DM_CANDIDATES_NOTE
+          : CACHE_OFF_NOTE) + "\n",
+      );
     }
   } catch (err) {
     // @inquirer/prompts throws this specific error on Ctrl-C/Ctrl-D -

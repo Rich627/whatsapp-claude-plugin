@@ -614,6 +614,132 @@ describe("wizard", () => {
       expect(res.out).not.toContain("\x1b[1;38;5;208m");
     },
   );
+
+  // The disclosure lines below are written before the checkbox renders, so
+  // Ctrl-C alone is enough to observe them - no toggle/submit keystroke
+  // needed, so these are NOT skipIf(CI).
+  test("the cap line discloses the total when there are more than fit", () => {
+    const dir = freshStateDir();
+    const meta: Record<string, any> = {};
+    for (let i = 1; i <= 7; i++) {
+      meta[`${i}@g.us`] = {
+        name: `Group ${i}`,
+        memberCount: 2,
+        archived: false,
+        updatedAt: 0,
+      };
+    }
+    writeGroupsMeta(dir, meta);
+    const res = runWithInput(dir, "\x03", "wizard");
+    expect(res.out).toContain("showing 5 of 7");
+    expect(res.out).toContain("Cancelled - nothing was changed.");
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
+  });
+
+  test("no cap line when the whole pool fits on screen", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": { name: "A", memberCount: 2, archived: false, updatedAt: 0 },
+      "2@g.us": { name: "B", memberCount: 2, archived: false, updatedAt: 0 },
+    });
+    const res = runWithInput(dir, "\x03", "wizard");
+    expect(res.out).not.toContain("Only showing");
+  });
+
+  test("archived groups hidden are disclosed with the --include-archived hint", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": {
+        name: "Active",
+        memberCount: 2,
+        archived: false,
+        updatedAt: 0,
+      },
+      "2@g.us": {
+        name: "Old",
+        memberCount: 2,
+        archived: true,
+        updatedAt: 0,
+      },
+      "3@g.us": {
+        name: "Older",
+        memberCount: 2,
+        archived: true,
+        updatedAt: 0,
+      },
+    });
+    const res = runWithInput(dir, "\x03", "wizard");
+    expect(res.out).toContain("2 archived group(s) are hidden");
+    expect(res.out).toContain("--include-archived");
+    const withFlag = runWithInput(dir, "\x03", "wizard", "--include-archived");
+    expect(withFlag.out).not.toContain("are hidden");
+  });
+
+  test("an archived group that is already configured does not count toward hiddenArchived", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": {
+        name: "Active",
+        memberCount: 2,
+        archived: false,
+        updatedAt: 0,
+      },
+      "2@g.us": {
+        name: "Old",
+        memberCount: 2,
+        archived: true,
+        updatedAt: 0,
+      },
+      "3@g.us": {
+        name: "AlreadyConfigured",
+        memberCount: 2,
+        archived: true,
+        updatedAt: 0,
+      },
+    });
+    run(dir, "group", "add", "3@g.us");
+    const res = runWithInput(dir, "\x03", "wizard");
+    expect(res.out).toContain("1 archived group(s) are hidden");
+    expect(res.out).not.toContain("2 archived group(s) are hidden");
+  });
+
+  test.skipIf(!!process.env.CI)(
+    "says the contacts screen is missing because caching is off, not silently",
+    () => {
+      const dir = freshStateDir();
+      writeGroupsMeta(dir, {
+        "1@g.us": {
+          name: "Family",
+          memberCount: 4,
+          archived: false,
+          updatedAt: 0,
+        },
+      });
+      const res = runWithInput(dir, "\n", "wizard");
+      expect(res.out).toContain("no DM activity is on record");
+      expect(res.out).toContain("WHATSAPP_CACHE_CONTACTS=1");
+      expect(existsSync(join(dir, "access.json"))).toBe(false);
+    },
+  );
+
+  test.skipIf(!!process.env.CI)(
+    "cache on but nothing new: says that instead of the caching-off line",
+    () => {
+      const dir = freshStateDir();
+      writeGroupsMeta(dir, {
+        "1@g.us": {
+          name: "Family",
+          memberCount: 4,
+          archived: false,
+          updatedAt: 0,
+        },
+      });
+      writeDmActivity(dir, {});
+      const res = runWithInput(dir, "\n", "wizard");
+      expect(res.out).toContain("nothing new in the cached DM activity");
+      expect(res.out).not.toContain("caching is off");
+    },
+  );
 });
 
 describe("set", () => {
