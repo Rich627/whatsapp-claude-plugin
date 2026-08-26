@@ -368,6 +368,14 @@ function releaseSingletonLock(): void {
   } catch {}
 }
 
+// The role file exists this early on purpose. acquireSingletonLock() below is
+// a synchronous process probe (a PowerShell CIM spawn on Windows, 2-6 s), and
+// the real role cannot be known until it returns - but the statusline is
+// rendered long before that and Claude Code will not redraw it while the
+// session is idle. "starting" is not a role, it is "a server is coming up
+// here"; the first settled role overwrites it a moment later.
+writeRoleFile("starting");
+
 // Null when we hold the connection. Set when another server has it: we stay
 // up in conflict mode, serve one tool that says so, and never touch Baileys —
 // the invariant is one connection, not one process. Exiting instead would be
@@ -404,7 +412,7 @@ diagFileEnabled = isPrimary;
 // having to remember to opt out individually.
 let pastInitialRole = false;
 function writeRoleFile(
-  role: "primary" | "secondary" | "reconnecting",
+  role: "primary" | "secondary" | "reconnecting" | "starting",
   everConnected = false,
 ): void {
   try {
@@ -417,6 +425,14 @@ function writeRoleFile(
     // reader just checks whether the owner is one of its own ancestors.
     writeFileSync(ROLE_FILE, CLIENT_ID ? `${role}\n${CLIENT_ID}\n` : role);
   } catch {}
+  // Provisional, not a settled role: it must not consume the "first role is
+  // never announced" allowance, or the real primary/secondary that follows
+  // would fire a role-change notification on a session that never changed
+  // role. This early return is also what keeps the provisional
+  // writeRoleFile("starting") call above — which runs before `pastInitialRole`
+  // is evaluated — from ever reading it: the flag's declaration position
+  // doesn't matter, this guard is what's load-bearing.
+  if (role === "starting") return;
   if (pastInitialRole) notifyRoleChange(role, everConnected);
   pastInitialRole = true;
 }

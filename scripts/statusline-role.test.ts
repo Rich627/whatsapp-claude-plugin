@@ -8,6 +8,7 @@ import {
   findServerPid,
   findServerPidForTerminal,
   formatSegment,
+  pendingRoleFromAncestors,
   roleFromOwnerStamp,
   type ProcRow,
 } from "./statusline-role";
@@ -71,11 +72,51 @@ describe("formatSegment", () => {
     expect(formatSegment("reconnecting")).toBe(
       "\x1b[33mWA:reconnecting\x1b[0m",
     );
+    // Not a role: the server is coming up, or this terminal asked for the
+    // channel and nothing has answered yet. Dim, one ellipsis glyph.
+    expect(formatSegment("starting")).toBe("\x1b[2mWA:…\x1b[0m");
   });
 
   test("an unknown or empty role renders nothing", () => {
     expect(formatSegment("")).toBe("");
     expect(formatSegment("garbage")).toBe("");
+  });
+});
+
+describe("pendingRoleFromAncestors", () => {
+  // claude.exe(100), launched with the channel ├── statusline shell(400)
+  // claude.exe(900) is a SECOND terminal, also with the channel, not ours.
+  const rows: ProcRow[] = [
+    {
+      pid: 100,
+      ppid: 1,
+      command:
+        "claude.exe --channels=plugin:whatsapp-channel@whatsapp-claude-plugin",
+    },
+    {
+      pid: 400,
+      ppid: 100,
+      command:
+        'sh -c "statusline.sh && bun plugins/cache/wa/whatsapp-channel/0.22.0/scripts/statusline-role.ts"',
+    },
+    {
+      pid: 900,
+      ppid: 1,
+      command:
+        "claude.exe --channels=plugin:whatsapp-channel@whatsapp-claude-plugin",
+    },
+  ];
+
+  test("an ancestor CLI launched with the channel means pending", () => {
+    expect(pendingRoleFromAncestors(rows, [400, 100])).toBe("starting");
+  });
+
+  // Two ways to be wrong, both of which the bare plugin name would get wrong:
+  // our own shell carries the plugin DIR name (whatsapp-channel) but never
+  // asked for anything, and a sibling terminal's CLI did ask - for itself.
+  test("the plugin dir name alone, or someone else's CLI, is not pending", () => {
+    expect(pendingRoleFromAncestors(rows, [400])).toBeNull();
+    expect(pendingRoleFromAncestors(rows, [400, 999])).toBeNull();
   });
 });
 
@@ -100,6 +141,14 @@ describe("end-to-end (real processes)", () => {
         WA_STATUSLINE_PARENT_PID: String(parentPid),
         WA_STATUSLINE_WRAPPER_MATCH: wrapperMarker,
         WA_STATUSLINE_MATCH: serverMarker,
+        // This harness's own ancestor chain runs inside a real Claude Code
+        // CLI launched with the whatsapp channel, so without pinning this to
+        // a sentinel that never matches, the four "prints nothing" e2e cases
+        // below would start printing the pending marker on a developer's
+        // machine (never in CI, which has no such ancestor) - a flaky red.
+        // Must be non-empty: "".includes("") is true and would match every
+        // row.
+        WA_STATUSLINE_CHANNEL_MATCH: "WA_NO_CHANNEL_MATCH",
       },
     });
   }
@@ -131,6 +180,36 @@ describe("end-to-end (real processes)", () => {
     }
     child.kill();
     throw new Error(`fake server ${marker} never showed up in ps`);
+  }
+
+  // Same purpose as spawnFakeServer (a live process carrying `marker` in its
+  // command line), but confirmed ready via its OWN stdout signal instead of
+  // polling external `ps` - the same technique the two-hop wrapper test below
+  // already relies on. Process creation supplies the full command line up
+  // front on this platform (no exec-replacement gap to race), so a stdout
+  // signal is enough proof the process exists and PowerShell's CIM query
+  // will already see it.
+  function spawnReady(marker: string): Promise<ReturnType<typeof spawn>> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(
+        "bun",
+        [
+          "-e",
+          `/*${marker}*/ console.log("READY"); setTimeout(() => {}, 30000)`,
+        ],
+        { stdio: ["ignore", "pipe", "ignore"] },
+      );
+      const timer = setTimeout(() => {
+        child.kill();
+        reject(new Error(`process ${marker} never signaled ready`));
+      }, 10_000);
+      child.stdout!.on("data", (chunk: Buffer) => {
+        if (chunk.toString().includes("READY")) {
+          clearTimeout(timer);
+          resolve(child);
+        }
+      });
+    });
   }
 
   // The stamped path, end to end through the real script: no wrapper exists,
@@ -280,6 +359,135 @@ describe("end-to-end (real processes)", () => {
     );
     expect(out).toBe("");
   });
+
+  // Order is fixed: stamped -> tree -> marker, and a role that can actually
+  // be READ always wins. Build an ancestor that really did ask for the
+  // channel (so pendingRoleFromAncestors would fire if the main() short
+  // circuit ever reached it) alongside a live stamped role file, and prove
+  // the stamp still wins - this is the ordering the "manual check" in the
+  // acceptance criteria only ever exercised by hand.
+  test("a live stamped role always beats the pending marker", async () => {
+    const channelMarker = `WA_CHANNEL_${process.pid}`;
+    const askedForChannel = await spawnReady(channelMarker);
+    const marker = `WA_FAKE_${process.pid}_stamp_beats_marker`;
+    const server = await spawnReady(marker);
+    try {
+      const dir = freshStateDir();
+      writeFileSync(
+        join(dir, `.role-${server.pid}`),
+        `secondary\n${askedForChannel.pid}\n`,
+      );
+      const out = execFileSync("bun", [SCRIPT], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          WHATSAPP_STATE_DIR: dir,
+          WA_STATUSLINE_PARENT_PID: String(askedForChannel.pid),
+          WA_STATUSLINE_WRAPPER_MATCH: "no-such-wrapper",
+          WA_STATUSLINE_MATCH: marker,
+          WA_STATUSLINE_CHANNEL_MATCH: channelMarker,
+        },
+      });
+      expect(out).toBe(formatSegment("secondary"));
+    } finally {
+      askedForChannel.kill();
+      server.kill();
+    }
+  }, 30_000);
+
+  // Other direction, same ordering rule: the TREE fallback finds a role
+  // file for this terminal but its line 1 is garbage. A file existing at
+  // all means "we just can't read it", not "nothing exists here" - falling
+  // through to the marker there would be a guess the spec forbids.
+  test("a garbage tree-fallback role file does not fall through to the marker", async () => {
+    const channelMarker = `WA_CHANNEL_${process.pid}_b`;
+    const askedForChannel = await spawnReady(channelMarker);
+    const wrapperMarker = `WA_WRAPPER_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const serverMarker = `WA_SERVER_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const wrapper = spawn(
+      "bun",
+      [
+        "-e",
+        `/*${wrapperMarker}*/
+        const c = require("node:child_process").spawn("bun", ["-e", "/*${serverMarker}*/ setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+        console.log("CHILD_PID=" + c.pid);
+        setTimeout(() => {}, 30000);`,
+      ],
+      { stdio: ["ignore", "pipe", "ignore"] },
+    );
+    let serverPid = -1;
+    try {
+      serverPid = await new Promise<number>((resolve, reject) => {
+        let buf = "";
+        const timer = setTimeout(
+          () => reject(new Error("wrapper never reported its child pid")),
+          10000,
+        );
+        wrapper.stdout!.on("data", (chunk: Buffer) => {
+          buf += chunk.toString();
+          const m = buf.match(/CHILD_PID=(\d+)/);
+          if (m) {
+            clearTimeout(timer);
+            resolve(Number(m[1]));
+          }
+        });
+      });
+
+      const stateDir = freshStateDir();
+      writeFileSync(join(stateDir, `.role-${serverPid}`), "not-a-real-role");
+
+      const out = execFileSync("bun", [SCRIPT], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          WHATSAPP_STATE_DIR: stateDir,
+          WA_STATUSLINE_PARENT_PID: String(askedForChannel.pid),
+          WA_STATUSLINE_WRAPPER_MATCH: wrapperMarker,
+          WA_STATUSLINE_MATCH: serverMarker,
+          WA_STATUSLINE_CHANNEL_MATCH: channelMarker,
+        },
+      });
+      expect(out).toBe("");
+    } finally {
+      askedForChannel.kill();
+      wrapper.kill();
+      if (serverPid > 0) {
+        try {
+          process.kill(serverPid);
+        } catch {}
+      }
+    }
+  }, 30_000);
+
+  // The headline behaviour, proved end to end through main(): nothing
+  // readable exists (empty state dir, no wrapper, no server), but one of our
+  // own ancestors really is a CLI carrying the channel spec, so the pending
+  // marker fires instead of silence. WA_STATUSLINE_CHANNEL_MATCH is set to
+  // the real "plugin:whatsapp-channel" for this one call only - every other
+  // case in this file pins it to a sentinel on purpose (see runStatusline's
+  // comment), so this is the one place the real string is deliberately live.
+  test("prints the pending marker when an ancestor asked for the channel", async () => {
+    const askedForChannel = await spawnReady(
+      "plugin:whatsapp-channel@whatsapp-claude-plugin",
+    );
+    try {
+      const dir = freshStateDir();
+      const out = execFileSync("bun", [SCRIPT], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          WHATSAPP_STATE_DIR: dir,
+          WA_STATUSLINE_PARENT_PID: String(askedForChannel.pid),
+          WA_STATUSLINE_WRAPPER_MATCH: "no-such-wrapper",
+          WA_STATUSLINE_MATCH: "no-such-server",
+          WA_STATUSLINE_CHANNEL_MATCH: "plugin:whatsapp-channel",
+        },
+      });
+      expect(out).toBe(formatSegment("starting"));
+    } finally {
+      askedForChannel.kill();
+    }
+  }, 30_000);
 });
 
 // Issue #3. Every fixture above hands findServerPid the CLI pid directly,

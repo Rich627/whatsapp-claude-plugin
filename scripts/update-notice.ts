@@ -60,6 +60,7 @@ if (!isStaticMode()) {
       version: "0.22.0",
       notes: [
         "Asking Claude to add a contact or a group now opens the in-session checkbox screen instead of sending you off to a terminal: it runs `/whatsapp-channel:access review` over everything you already talk to, four at a time. The terminal wizard is still there, offered second, for when you want the decision made with no AI model involved.",
+        "Fixed: the WA:<role> statusline segment was blank for the first few seconds of a session, and because Claude Code only redraws the statusline when you type, it often stayed blank until your first message. A terminal that asked for the WhatsApp channel now shows a dim WA:… straight away, and the server writes its role file earlier, so the real primary/secondary label arrives sooner.",
       ],
     },
     {
