@@ -28,7 +28,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { checkbox, search } from "@inquirer/prompts";
+import { checkbox, confirm, search } from "@inquirer/prompts";
 import { forgetContact, type ContactsMap } from "./contacts";
 import { groupAnchor, maskNumber } from "./mask";
 import {
@@ -37,6 +37,7 @@ import {
   filterCandidates,
   listConfiguredDms,
   listConfiguredGroups,
+  mergePools,
   publicCandidates,
   rankDms,
   rankGroups,
@@ -45,6 +46,7 @@ import {
   type GroupMeta,
   type PublicCandidate,
 } from "./ranking";
+import { wizardCmd } from "./wizard-cmd";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -153,10 +155,15 @@ const USAGE = `Usage: bun scripts/access.ts <command>
   policy <${POLICIES.join("|")}>   set the DM policy
   group add <groupJid> | --ref <ref> [--mention|--no-mention] [--allow a,b] [--roster|--no-roster]
   group rm <groupJid>             stop responding in a group (files kept)
-  wizard [--include-archived]     guided group setup: can-act / can-see-roster,
-                                   per group, from names cached by list_groups
-  wizard --revoke                 the same screen in reverse: tick what to
-                                   take access AWAY from
+  wizard [--include-archived]     guided access screen, one per kind: what
+                                   Claude can reach today is PRE-TICKED -
+                                   untick to take access away, tick to grant,
+                                   search reaches anything past the cap. Shows
+                                   the +/- list and asks before it writes.
+  wizard --revoke                 an alias for the same screen (revoking is
+                                   unticking there)
+  wizard --undo                   put back the access.json from before the
+                                   last wizard run (same as "undo")
   state [--include-archived]      JSON: candidates + configured, both pools
   candidates [--include-archived] [--search <text>]
                                   JSON: groups/contacts not configured yet
@@ -401,6 +408,17 @@ function group(args: string[]): void {
 const PRIVACY_DISCLOSURE =
   "No group or contact data was sent to any AI model during this setup — this ran entirely in your terminal.";
 
+// The exact command, absolute-pathed the same way every other user-facing
+// wizard mention is (see scripts/wizard-cmd.ts) - a marketplace install is not
+// run from a repo checkout, so "bun scripts/access.ts" resolves to nothing
+// there. Printed only after a write, and it is the same one-step undo the
+// in-session review/manage flow points at (skills/access/SKILL.md, `undo`).
+const UNDO_HINT = `Changed your mind? Run \`${wizardCmd(join(import.meta.dir, ".."))} --undo --dry-run\` to see what would come back, then the same command without --dry-run.`;
+
+const NOTHING_TO_REVIEW =
+  "Nothing to review - no group or contact activity is cached yet and nothing is " +
+  "configured. Pair the account and let it connect at least once first.";
+
 // Bold amber, not red/green: a disclosure, not an error or a success state.
 // Plain text when the terminal can't render color, or NO_COLOR is set.
 function highlight(text: string): string {
@@ -428,21 +446,26 @@ const CACHE_OFF_NOTE =
 const NO_DM_CANDIDATES_NOTE =
   "No contacts to review - nothing new in the cached DM activity: everyone who has messaged recently is already on the allowlist, or nobody has messaged yet.";
 
-// One pick per round, repeated until Done, over the FULL eligible pool for a
-// screen - the checkbox above it only ever shows the first 5/10. Returns the
-// jids picked, in pick order, never a duplicate and never one already in
-// `taken` (the checkbox's own selections), so the caller can concatenate
-// without a dedupe pass.
-async function searchPicks(
+// One pick per round, repeated until Done, over the FULL pool for a screen -
+// the checkbox above it only ever shows the configured entries plus the first
+// 5/10 candidates. Two-way since #14's terminal half: a hit that is currently
+// ticked turns OFF, one that is not turns ON, so a configured entry the first
+// screen could not fit is still revokable in the same run.
+//
+// Mutates `selected` in place and acts on each jid at most once per round, so
+// the loop always terminates. `source` reads `selected` live (it re-runs on
+// every keystroke), which is what makes the [on]/[off] marker current. The
+// marker is built HERE and never stored on the candidate: labels stay exactly
+// what ranking.ts produced, everywhere else.
+async function searchToggle(
   pool: readonly Candidate[],
-  taken: readonly string[],
+  selected: Set<string>,
   message: string,
-): Promise<string[]> {
-  const picks: string[] = [];
+): Promise<void> {
+  const acted = new Set<string>();
   for (;;) {
-    const chosen = new Set([...taken, ...picks]);
-    const remaining = pool.filter((c) => !chosen.has(c.jid));
-    if (remaining.length === 0) return picks;
+    const remaining = pool.filter((c) => !acted.has(c.jid));
+    if (remaining.length === 0) return;
     const jid = await search<string>({
       message,
       source: (term) => {
@@ -451,27 +474,56 @@ async function searchPicks(
           value: SEARCH_DONE,
         };
         const hits = filterCandidates(remaining, term).map((c) => ({
-          name: c.label,
+          name: `${selected.has(c.jid) ? "[on]  " : "[off] "}${c.label}`,
           value: c.jid,
           description: c.description,
         }));
-        // Done first while nothing is typed, so a bare Enter leaves the loop;
-        // last once a term is typed, so Enter takes the best match instead of
-        // silently ending the round on the user.
         return term?.trim() ? [...hits, done] : [done, ...hits];
       },
     });
-    if (jid === SEARCH_DONE) return picks;
-    picks.push(jid);
+    if (jid === SEARCH_DONE) return;
+    acted.add(jid);
+    if (selected.has(jid)) selected.delete(jid);
+    else selected.add(jid);
   }
 }
 
-// Guided setup for the account's most recently active groups and contacts
-// that haven't been decided on yet - top 5 / top 10 by recency, the same
-// way WhatsApp's own app orders its chat list, so the review stays to one
-// screen instead of every group/contact ever seen. Anything beyond that is
-// reachable one at a time through the search round after each screen, over
-// the full eligible pool - or later via `group add`/`allow`.
+// One kind's screen: the cap disclosure, the pre-ticked checkbox, and the
+// search round when (and only when) the candidate pool did not fit. Returns
+// the jids ticked at the end, NOT deltas - the caller knows which of them were
+// already configured.
+async function reviewScreen(
+  candidates: readonly Candidate[],
+  configured: readonly Candidate[],
+  cap: number,
+  message: string,
+  searchMessage: string,
+): Promise<Set<string>> {
+  const capped = candidates.length > cap;
+  if (capped) process.stdout.write(capLine(cap, candidates.length) + "\n");
+  const selected = new Set(
+    await checkbox({
+      message,
+      choices: mergePools(candidates, configured, cap),
+    }),
+  );
+  // Only when something is off-screen: everything configured is always shown,
+  // so with the candidate pool inside the cap there is nothing search reaches
+  // that the checkbox did not.
+  if (capped) {
+    await searchToggle([...configured, ...candidates], selected, searchMessage);
+  }
+  return selected;
+}
+
+// Guided setup for the account's groups and contacts: one screen per kind.
+// What Claude can already reach comes pre-ticked - so the screen shows
+// current state, and unticking IS the revoke - then the most recently active
+// groups/contacts not yet configured, top 5 / top 10 by recency, the same
+// way WhatsApp's own app orders its chat list, so review stays to one screen
+// instead of every group/contact ever seen. Anything beyond that is
+// reachable one at a time through a two-way search round after each screen,
+// over the full eligible pool - or later via `group add`/`allow`.
 //
 // Terminal, not chat: this is what makes "no data went to an AI" literally
 // true (no model runs during the decision), and it works for any client
@@ -484,228 +536,215 @@ async function wizard(args: string[]): Promise<void> {
   const a = load();
   const lidMap = loadLidMap();
   const meta = loadGroupsMeta();
-  const configuredGroups = new Set(Object.keys(a.groups));
+  const contacts = loadContacts();
+  const configuredGroupJids = new Set(Object.keys(a.groups));
 
-  // Ranked uncapped, sliced here: the pool length is what the cap line
-  // discloses and what the search round searches; the slice is the screen.
-  const groupPool = rankGroups(meta, configuredGroups, includeArchived);
-  const shownGroups = groupPool.slice(0, GROUP_CANDIDATE_LIMIT);
-  const dmPool = rankDms(loadDmActivity(), loadContacts(), a.allowFrom, lidMap);
-  const shownDms = dmPool.slice(0, DM_CANDIDATE_LIMIT);
+  // Ranked uncapped, capped inside reviewScreen: the pool length is what the
+  // cap line discloses and what the search round searches.
+  const groupCandidates = rankGroups(
+    meta,
+    configuredGroupJids,
+    includeArchived,
+  );
+  const configuredGroups = listConfiguredGroups(a.groups, meta);
+  const dmCandidates = rankDms(loadDmActivity(), contacts, a.allowFrom, lidMap);
+  const configuredDms = listConfiguredDms(a.allowFrom, contacts, lidMap);
+  const configuredDmJids = new Set(configuredDms.map((c) => c.jid));
+
   // Eligible-but-archived, counted the same way rankGroups filters: a group
   // already configured was never a candidate, archived or not.
   const hiddenArchived = includeArchived
     ? 0
     : Object.entries(meta).filter(
-        ([jid, g]) => g.archived && !configuredGroups.has(jid),
+        ([jid, g]) => g.archived && !configuredGroupJids.has(jid),
       ).length;
 
-  if (groupPool.length === 0 && dmPool.length === 0) {
-    die(
-      "Nothing to review - either no group/contact activity is cached yet " +
-        "(pair the account and let it connect at least once first), or " +
-        "everything currently known is already configured.",
-    );
+  if (
+    groupCandidates.length === 0 &&
+    configuredGroups.length === 0 &&
+    dmCandidates.length === 0 &&
+    configuredDms.length === 0
+  ) {
+    die(NOTHING_TO_REVIEW);
   }
 
-  let actGroups: string[] = [];
+  const disclose = () =>
+    process.stdout.write(`\n${highlight(PRIVACY_DISCLOSURE)}\n`);
+
+  let groupSel = new Set<string>();
+  let dmSel = new Set<string>();
   let rosterGroups: string[] = [];
-  let allowDms: string[] = [];
+
   try {
     if (hiddenArchived > 0) {
       process.stdout.write(
         `${hiddenArchived} archived group(s) are hidden - re-run with --include-archived to include them.\n`,
       );
     }
-    if (groupPool.length > 0) {
-      const moreGroups = groupPool.length > shownGroups.length;
-      if (moreGroups) {
-        process.stdout.write(
-          capLine(shownGroups.length, groupPool.length) + "\n",
-        );
-      }
-      actGroups = await checkbox({
-        message: "Which groups can Claude reply in?",
-        choices: shownGroups.map((c) => ({ name: c.label, value: c.jid })),
-      });
-      if (moreGroups) {
-        actGroups = actGroups.concat(
-          await searchPicks(
-            groupPool,
-            actGroups,
-            "Search for another group Claude can reply in (or pick Done):",
-          ),
-        );
-      }
-      // AFTER the search round, over the union of both kinds of pick, and
-      // sourced from groupPool (not the slice) so a searched group is offered
-      // roster access too.
-      if (actGroups.length > 0) {
+
+    if (groupCandidates.length > 0 || configuredGroups.length > 0) {
+      groupSel = await reviewScreen(
+        groupCandidates,
+        configuredGroups,
+        GROUP_CANDIDATE_LIMIT,
+        "Which groups can Claude reply in? (already ticked = it can today - untick to take that away)",
+        "Search for a group to add or remove (or pick Done):",
+      );
+      // Roster is asked only about groups being granted in THIS run - see
+      // diffAccess's own comment in ranking.ts. A group that was already
+      // configured keeps whatever roster flag it has.
+      const newGroups = [...groupSel].filter(
+        (jid) => !configuredGroupJids.has(jid),
+      );
+      if (newGroups.length > 0) {
         rosterGroups = await checkbox({
           message:
             'Of those, which can Claude also see member names in (for "all" mentions)?',
-          choices: groupPool
-            .filter((c) => actGroups.includes(c.jid))
+          choices: groupCandidates
+            .filter((c) => newGroups.includes(c.jid))
             .map((c) => ({ name: c.label, value: c.jid })),
         });
       }
     }
-    if (dmPool.length > 0) {
-      const moreDms = dmPool.length > shownDms.length;
-      if (moreDms) {
-        process.stdout.write(capLine(shownDms.length, dmPool.length) + "\n");
-      }
-      allowDms = await checkbox({
-        message: "Which contacts can message Claude?",
-        choices: shownDms.map((c) => ({ name: c.label, value: c.jid })),
-      });
-      if (moreDms) {
-        allowDms = allowDms.concat(
-          await searchPicks(
-            dmPool,
-            allowDms,
-            "Search for another contact who can message Claude (or pick Done):",
-          ),
-        );
-      }
+
+    if (dmCandidates.length > 0 || configuredDms.length > 0) {
+      dmSel = await reviewScreen(
+        dmCandidates,
+        configuredDms,
+        DM_CANDIDATE_LIMIT,
+        "Which contacts can message Claude? (already ticked = they can today - untick to take that away)",
+        "Search for a contact to add or remove (or pick Done):",
+      );
     } else {
-      // Two different observations, one line for whichever applies. The file
-      // is written by default, never in static mode and never under
-      // WHATSAPP_CACHE_CONTACTS=0 (see CACHE_CONTACTS in server.ts), so
-      // "absent" means no record exists - this script cannot see the
-      // server's env, so it names the precondition rather than asserting
-      // which of the three causes it was.
+      // unchanged: two different observations, one line for whichever applies
       process.stdout.write(
         (existsSync(DM_ACTIVITY_FILE)
           ? NO_DM_CANDIDATES_NOTE
           : CACHE_OFF_NOTE) + "\n",
       );
     }
-  } catch (err) {
-    // @inquirer/prompts throws this specific error on Ctrl-C/Ctrl-D -
-    // nothing has been written yet at this point (save() only happens
-    // below, after every question is answered), so there's nothing to
-    // roll back, just a clean message instead of a raw stack trace.
-    if (err instanceof Error && err.name === "ExitPromptError") {
-      process.stdout.write("\nCancelled - nothing was changed.\n");
+
+    // The decision, applied to whatever access.json says at the moment of the
+    // call - used twice: once against a snapshot to render the delta, once
+    // against a fresh read to write. Never rewrites an entry it is keeping.
+    const applyTo = (base: Access): Access => {
+      const groups = { ...base.groups };
+      for (const jid of configuredGroupJids) {
+        if (!groupSel.has(jid)) delete groups[jid];
+      }
+      for (const jid of groupSel) {
+        if (groups[jid]) continue; // kept, not re-granted: flags survive
+        groups[jid] = {
+          requireMention: true,
+          allowFrom: [],
+          roster: rosterGroups.includes(jid),
+        };
+      }
+      // Drop ONLY an entry this screen showed and the user unticked. An
+      // allowFrom entry the SERVER added while the prompts were open (a
+      // pairing approval) was never on screen, so it is kept.
+      const allowFrom = base.allowFrom.filter(
+        (j) => !configuredDmJids.has(j) || dmSel.has(j),
+      );
+      for (const jid of dmSel) {
+        if (!allowFrom.includes(jid)) allowFrom.push(jid);
+      }
+      return { ...base, groups, allowFrom };
+    };
+
+    const before = load();
+    const d = diffAccess(before, applyTo(before));
+    const nothing =
+      d.added.groups.length === 0 &&
+      d.added.dms.length === 0 &&
+      d.removed.groups.length === 0 &&
+      d.removed.dms.length === 0;
+    if (nothing) {
+      process.stdout.write(
+        "\nNothing changed - your ticks match what was already set up.\n",
+      );
+      disclose();
       return;
     }
-    throw err;
-  }
 
-  for (const jid of actGroups) {
-    provisionGroupFiles(jid);
-  }
-  // Re-load rather than reuse `a`: the checkbox prompts above block on the
-  // user for an unbounded time, and the server can write access.json in
-  // that window (a pairing approval appended to allowFrom, a pending code
-  // created or pruned). Writing back the pre-prompt snapshot would silently
-  // revert that write - unlike the one-shot commands, where the load-to-save
-  // gap is a few ms, this gap is however long the user takes to answer.
-  if (actGroups.length > 0 || allowDms.length > 0) {
+    // Labels from the lists that were on screen; masked fallback otherwise -
+    // same rule undo() uses, and the reason a raw number never reaches this
+    // output.
+    const labels = new Map(
+      [
+        ...configuredGroups,
+        ...groupCandidates,
+        ...configuredDms,
+        ...dmCandidates,
+      ].map((c) => [c.jid, c]),
+    );
+    const shown = (jid: string): string => {
+      const c = labels.get(jid);
+      if (c) return `${c.label}  [${c.description}]`;
+      return jid.endsWith("@g.us") ? groupAnchor(jid) : maskNumber(jid);
+    };
+    const lines = [
+      ...d.added.groups.map((j) => `+ ${shown(j)}`),
+      ...d.added.dms.map((j) => `+ ${shown(j)}`),
+      ...d.removed.groups.map((j) => `- ${shown(j)}`),
+      ...d.removed.dms.map((j) => `- ${shown(j)}`),
+      "(+ = access this grants, - = access this takes away)",
+    ];
+    process.stdout.write(`\n${lines.join("\n")}\n`);
+
+    if (!(await confirm({ message: "Apply these changes?", default: true }))) {
+      process.stdout.write("\nCancelled - nothing was changed.\n");
+      disclose();
+      return;
+    }
+
+    // Re-load AFTER the confirm, for the reason the old code re-loaded after
+    // the checkboxes: every prompt blocks on the user for an unbounded time
+    // and the server can write access.json in that window (a pairing approval
+    // appended to allowFrom, a pending code created or pruned). Writing back a
+    // pre-prompt snapshot would silently revert that.
     const fresh = load();
-    for (const jid of actGroups) {
-      fresh.groups[jid] = {
-        requireMention: true,
-        allowFrom: [],
-        roster: rosterGroups.includes(jid),
-      };
-    }
-    for (const jid of allowDms) {
-      if (!fresh.allowFrom.includes(jid)) fresh.allowFrom.push(jid);
-    }
-    save(fresh);
-  }
+    const next = applyTo(fresh);
+    for (const jid of d.added.groups) provisionGroupFiles(jid);
+    // Read before save() overwrites it: whether this run actually took a
+    // .bak, so a first-ever run doesn't point UNDO_HINT at a command that
+    // only answers "no previous access file - nothing to undo".
+    const tookBackup = existsSync(ACCESS_FILE);
+    // backup: true on the one and only write of the run, so a single `undo`
+    // reverses the whole run.
+    save(next, { backup: true });
 
-  process.stdout.write(
-    `\n${actGroups.length} group(s), ${allowDms.length} contact(s) configured.\n`,
-  );
-  process.stdout.write(`\n${highlight(PRIVACY_DISCLOSURE)}\n`);
-}
-
-// The revoke half of the terminal wizard (issue #1). Until this existed the
-// only supported way to take access back was `remove`/`group rm` one JID at
-// a time, or editing access.json by hand - while the wizard's own update
-// notice pointed users at it as though it were the access screen.
-//
-// Reuses listConfiguredGroups/listConfiguredDms, the same two functions the
-// in-session `manage` screen reads through `configured`, so the terminal and
-// the in-session path cannot disagree about what is configured, how a row is
-// labelled, or what a revoke cleans up.
-//
-// Same terminal-only, no-model guarantee as the grant screen above, and the
-// same rule in both: an empty selection removes NOTHING. A revoke screen
-// that read "no ticks" as "remove all" would be a catastrophe on a mis-Enter.
-async function wizardRevoke(): Promise<void> {
-  const a = load();
-  const groups = listConfiguredGroups(a.groups, loadGroupsMeta());
-  const dms = listConfiguredDms(a.allowFrom, loadContacts(), loadLidMap());
-
-  if (groups.length === 0 && dms.length === 0) {
-    die("Nothing is configured yet - there is no access to take away.");
-  }
-
-  let dropGroups: string[] = [];
-  let dropDms: string[] = [];
-  try {
-    if (groups.length > 0) {
-      dropGroups = await checkbox({
-        message:
-          "Which groups should Claude STOP replying in? (leave all unticked to keep everything)",
-        choices: groups.map((c) => ({ name: c.label, value: c.jid })),
-      });
+    process.stdout.write(
+      `\nApplied: ${d.added.groups.length} group(s) and ${d.added.dms.length} contact(s) granted, ` +
+        `${d.removed.groups.length} group(s) and ${d.removed.dms.length} contact(s) revoked.\n`,
+    );
+    if (d.removed.groups.length > 0) {
+      process.stdout.write(
+        "Revoked groups keep their config.md and memory.md, in case you add them back.\n",
+      );
     }
-    if (dms.length > 0) {
-      dropDms = await checkbox({
-        message:
-          "Which contacts should lose DM access? (leave all unticked to keep everything)",
-        choices: dms.map((c) => ({ name: c.label, value: c.jid })),
-      });
+    // Cache cleanup runs AFTER the write and against the POST-write allowFrom -
+    // revokeCachedIdentity's "another entry still resolves to this contact"
+    // check depends on it (see its comment).
+    for (const jid of d.removed.dms) {
+      const label = labels.get(jid)?.label ?? maskNumber(jid);
+      process.stdout.write(
+        `- ${label}: DM access removed.${CACHE_NOTE[revokeCachedIdentity(next.allowFrom, jid)]}\n`,
+      );
     }
+    if (tookBackup) process.stdout.write(`${UNDO_HINT}\n`);
   } catch (err) {
+    // @inquirer/prompts throws this on Ctrl-C/Ctrl-D. Every prompt in this
+    // function runs before save(), so there is still nothing to roll back -
+    // just a clean message instead of a raw stack trace. No disclosure line
+    // here: nothing was decided, same as today.
     if (err instanceof Error && err.name === "ExitPromptError") {
       process.stdout.write("\nCancelled - nothing was changed.\n");
       return;
     }
     throw err;
   }
-
-  if (dropGroups.length === 0 && dropDms.length === 0) {
-    process.stdout.write("\nNothing selected - nothing was changed.\n");
-    process.stdout.write(`\n${highlight(PRIVACY_DISCLOSURE)}\n`);
-    return;
-  }
-
-  // Re-load for the same reason the grant screen does: the checkbox prompts
-  // block on the user for an unbounded time and the server can write
-  // access.json in that window.
-  const fresh = load();
-  for (const jid of dropGroups) delete fresh.groups[jid];
-  // Filtered by exact string, never a LID-resolved substitute - the
-  // candidate's jid is the untouched allowFrom entry precisely so this
-  // matches (see listConfiguredDms).
-  fresh.allowFrom = fresh.allowFrom.filter((j) => !dropDms.includes(j));
-  save(fresh);
-
-  const lines: string[] = [];
-  for (const jid of dropGroups) {
-    const label = groups.find((c) => c.jid === jid)?.label ?? jid;
-    lines.push(`- ${label}: Claude will not reply there any more.`);
-  }
-  for (const jid of dropDms) {
-    const label = dms.find((c) => c.jid === jid)?.label ?? jid;
-    lines.push(
-      `- ${label}: DM access removed.${CACHE_NOTE[revokeCachedIdentity(fresh.allowFrom, jid)]}`,
-    );
-  }
-
-  process.stdout.write(`\n${lines.join("\n")}\n`);
-  if (dropGroups.length > 0) {
-    process.stdout.write(
-      "\nTheir config.md and memory.md are kept, in case you add them back.\n",
-    );
-  }
-  process.stdout.write(`\n${highlight(PRIVACY_DISCLOSURE)}\n`);
+  disclose();
 }
 
 // Read-only JSON for the in-session `review` and `manage` screens in
@@ -1280,12 +1319,13 @@ switch (command) {
     group(rest);
     break;
   case "wizard":
-    // --undo before --revoke: the flags are mutually exclusive and this is the
-    // only ordering that cannot silently open a revoke prompt for someone who
-    // asked to undo. `wizard --undo` is exactly `undo` - the wizard's own
-    // screens are untouched by this change.
-    if (rest.includes("--undo")) undo(rest.filter((f) => f !== "--undo"));
-    else if (rest.includes("--revoke")) await wizardRevoke();
+    // --help first: it must never open a prompt, whatever else was passed.
+    // --undo before everything else for the same reason it was added in T14 -
+    // it is exactly `undo`, and must not open a screen for someone who asked
+    // to undo. `--revoke` is now an ALIAS: the one screen already does both,
+    // so it needs no branch of its own, only a name that keeps working.
+    if (rest.includes("--help")) process.stdout.write(USAGE + "\n");
+    else if (rest.includes("--undo")) undo(rest.filter((f) => f !== "--undo"));
     else await wizard(rest);
     break;
   case "candidates":

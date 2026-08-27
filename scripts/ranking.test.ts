@@ -6,12 +6,14 @@ import {
   filterCandidates,
   listConfiguredDms,
   listConfiguredGroups,
+  mergePools,
   normalizeJid,
   publicCandidates,
   rankDms,
   rankGroups,
   refFor,
   rosterMemberPool,
+  type Candidate,
   type GroupMeta,
 } from "./ranking";
 import type { ContactsMap } from "./contacts";
@@ -785,6 +787,86 @@ describe("listConfiguredDms", () => {
       {},
     );
     expect(result.map((c) => c.label)).toEqual(["Alpha", "Bravo"]);
+  });
+});
+
+// The wizard's one-screen-per-kind merge (#14, terminal half): configured
+// first and ticked, then the ranked candidates that fit, unticked. Pure, so
+// plain object literals typed as Candidate are enough - no ranking involved.
+describe("mergePools", () => {
+  const candidate = (jid: string, label = jid): Candidate => ({
+    jid,
+    ref: refFor(jid),
+    label,
+    description: label,
+  });
+
+  test("order: configured (in their given order) first, then candidates (in theirs)", () => {
+    const configured = [candidate("c1"), candidate("c2")];
+    const candidates = [candidate("a1"), candidate("a2")];
+    const result = mergePools(candidates, configured, 5);
+    expect(result.map((c) => c.value)).toEqual(["c1", "c2", "a1", "a2"]);
+  });
+
+  test("checked flags: configured true, candidates false", () => {
+    const result = mergePools([candidate("a1")], [candidate("c1")], 5);
+    expect(result.find((c) => c.value === "c1")?.checked).toBe(true);
+    expect(result.find((c) => c.value === "a1")?.checked).toBe(false);
+  });
+
+  test("cap applies to candidates only: 3 configured + 7 candidates with cap 2 -> 5 choices, all 3 configured present", () => {
+    const configured = [candidate("c1"), candidate("c2"), candidate("c3")];
+    const candidates = Array.from({ length: 7 }, (_, i) => candidate(`a${i}`));
+    const result = mergePools(candidates, configured, 2);
+    expect(result).toHaveLength(5);
+    expect(
+      ["c1", "c2", "c3"].every((v) => result.some((c) => c.value === v)),
+    ).toBe(true);
+  });
+
+  test("configured are never sliced away: 6 configured + 0 candidates with cap 1 -> 6 choices, all checked", () => {
+    const configured = Array.from({ length: 6 }, (_, i) => candidate(`c${i}`));
+    const result = mergePools([], configured, 1);
+    expect(result).toHaveLength(6);
+    expect(result.every((c) => c.checked)).toBe(true);
+  });
+
+  test("empty pools", () => {
+    expect(mergePools([], [], 5)).toEqual([]);
+    const candidates = [candidate("a1")];
+    expect(mergePools(candidates, [], 5).map((c) => c.value)).toEqual(["a1"]);
+    const configured = [candidate("c1")];
+    expect(mergePools([], configured, 5).map((c) => c.value)).toEqual(["c1"]);
+  });
+
+  test("fields map straight through: value/name/description, no jid key", () => {
+    // description deliberately differs from label - equal values here would
+    // let a name/description swap in mergePools' mapping pass unnoticed.
+    const c: Candidate = {
+      ...candidate("a1", "Alpha"),
+      description: "a1@g.us",
+    };
+    const result = mergePools([c], [], 5);
+    expect(result[0]).toEqual({
+      value: "a1",
+      name: "Alpha",
+      description: "a1@g.us",
+      checked: false,
+    });
+    expect(Object.keys(result[0]).sort()).toEqual([
+      "checked",
+      "description",
+      "name",
+      "value",
+    ]);
+  });
+
+  test("a jid in both pools appears once, as the configured (checked) row, and does not consume a cap slot", () => {
+    const configured = [candidate("dup")];
+    const candidates = [candidate("dup"), candidate("other")];
+    const result = mergePools(candidates, configured, 1);
+    expect(result.map((c) => c.value)).toEqual(["dup", "other"]);
+    expect(result.find((c) => c.value === "dup")?.checked).toBe(true);
   });
 });
 

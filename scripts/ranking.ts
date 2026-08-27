@@ -336,6 +336,48 @@ export function listConfiguredDms(
   return disambiguate(listed);
 }
 
+// The wizard's one screen per kind (#14, terminal half): what is already
+// configured comes first and ticked - so the screen SHOWS current state, and
+// unticking IS the revoke - then the ranked candidates that fit, unticked.
+// Configured entries never count against `cap` and are never sliced away: an
+// entry the screen hid could not be unticked, and a revoke you cannot reach is
+// exactly the bug a cap over the merged list would introduce. `cap` therefore
+// applies to `candidates` alone - the same number capLine() discloses.
+// Pure: no I/O, no ranking, no relabelling. Every string here is whatever
+// rankGroups/listConfiguredGroups (or the DM pair) already produced, so a
+// label rule still lives in exactly one place.
+export type WizardChoice = {
+  value: string;
+  name: string;
+  description: string;
+  checked: boolean;
+};
+
+export function mergePools(
+  candidates: readonly Candidate[],
+  configured: readonly Candidate[],
+  cap: number,
+): WizardChoice[] {
+  const choice = (c: Candidate, checked: boolean): WizardChoice => ({
+    value: c.jid,
+    name: c.label,
+    description: c.description,
+    checked,
+  });
+  const taken = new Set(configured.map((c) => c.jid));
+  return [
+    ...configured.map((c) => choice(c, true)),
+    // Filtered BEFORE the slice: a duplicate must not eat a cap slot. The same
+    // jid in both pools should be impossible (rankGroups/rankDms each exclude
+    // what is configured) - filtered anyway, because two checkbox rows sharing
+    // a `value` cannot be told apart once ticked.
+    ...candidates
+      .filter((c) => !taken.has(c.jid))
+      .slice(0, cap)
+      .map((c) => choice(c, false)),
+  ];
+}
+
 // The +/- delta the in-session review shows before it writes anything, and the
 // body of `undo --dry-run`. Pure: takes two access.json snapshots, returns the
 // JIDs that differ. A group whose `roster` flag changed is neither added nor

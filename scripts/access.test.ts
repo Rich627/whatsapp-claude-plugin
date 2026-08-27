@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
@@ -49,6 +49,69 @@ function runWithInput(
     const e = err as { stdout?: string; stderr?: string; status?: number };
     return { out: (e.stdout ?? "") + (e.stderr ?? ""), code: e.status ?? 1 };
   }
+}
+
+// Like runWithInput, but drives a checkbox()-then-confirm() prompt chain.
+// runWithInput's execFileSync writes the WHOLE keystroke blob before the
+// process even starts reading and closes stdin the moment it's written - the
+// checkbox prompt lands fine on that, but the confirm() prompt right after it
+// never sees its own trailing "\n" and hangs forever (reproduced directly,
+// independent of this suite, on this exact machine - Windows, not just CI).
+// Spawning instead and writing one prompt's keystrokes at a time, a beat
+// apart, lets each prompt's own readline actually attach before the next
+// byte arrives, and the process then exits BY ITSELF once it's done - no
+// forced kill on the happy path. `keystrokes` is one string per prompt, e.g.
+// [" \n", "\n"] for "toggle the row, submit the checkbox" then "accept the
+// confirm default". Still gated by the SAME checkbox-toggle-on-Linux gap the
+// rest of this file documents (see the block comment above `describe("wizard"
+// ...)`), so callers still skip it under CI.
+// `between`, when given, runs once - right before the LAST keystroke is
+// written (the confirm) - so a test can mutate access.json on disk while the
+// process is blocked waiting on that prompt, the same window a concurrent
+// server write (a pairing approval) lands in for real.
+function runWizardWrite(
+  dir: string,
+  keystrokes: string[],
+  args: string[],
+  opts?: { between?: () => void },
+): Promise<{ out: string; code: number }> {
+  return new Promise((resolve) => {
+    const child = spawn("bun", [CLI, ...args], {
+      env: { ...process.env, WHATSAPP_STATE_DIR: dir },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let out = "";
+    child.stdout.on("data", (d) => (out += d.toString()));
+    child.stderr.on("data", (d) => (out += d.toString()));
+    (async () => {
+      for (let i = 0; i < keystrokes.length; i++) {
+        await new Promise((r) => setTimeout(r, 400));
+        if (i === keystrokes.length - 1) opts?.between?.();
+        child.stdin.write(keystrokes[i]);
+      }
+    })();
+    const timer = setTimeout(() => {
+      child.kill();
+      resolve({
+        out: out + "\n[runWizardWrite gave up waiting for the process to exit]",
+        code: -1,
+      });
+    }, 10_000);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve({ out, code: code ?? 1 });
+    });
+  });
+}
+
+// @inquirer/prompts hard-wraps a long `message` to the terminal width it sees
+// from a piped, non-TTY stdout (no word-boundary awareness - it can and does
+// split mid-word, re-opening the bold ANSI code on the far side of the
+// break). Stripping ANSI codes and newlines turns that back into the
+// original sentence for a substring check, without weakening what's being
+// checked - only where the literal bytes place a line break.
+function flatten(out: string): string {
+  return out.replace(/\x1b\[[0-9;]*m/g, "").replace(/\n/g, "");
 }
 
 function writeContacts(
@@ -479,6 +542,19 @@ describe("groups", () => {
 // resolves as an interrupt without needing that same keypress-by-keypress
 // handling. Every affected test runs fine locally on either platform; only
 // CI (Linux) skips them.
+//
+// T15 chains a checkbox() with a SECOND prompt, confirm() - a different pair
+// from the checkbox-then-checkbox case above, and runWithInput's one-shot
+// execFileSync `input` hangs on it everywhere, Windows included (reproduced
+// directly: the checkbox's own toggle/submit lands fine, "Apply these
+// changes? (Y/n)" renders, then the process never reads the trailing "\n").
+// The four write-path tests below use `runWizardWrite` instead (see its own
+// comment) - spawning and pacing the keystrokes a beat apart, rather than
+// writing them all before the process starts reading, is enough for the
+// confirm() prompt to see its own input. They are still `skipIf(CI)`: the
+// checkbox toggle itself is the OTHER, unrelated gap this file documents
+// above (Linux never sees the piped " " keypress), and `runWizardWrite`
+// does nothing to fix that one.
 describe("wizard", () => {
   test("no group or DM activity cached at all: refuses with a clear message", () => {
     const dir = freshStateDir();
@@ -487,7 +563,55 @@ describe("wizard", () => {
     expect(res.out).toContain("Nothing to review");
   });
 
-  test("archived groups skipped by default; already-configured groups skipped too: nothing left", () => {
+  test("wizard --help prints USAGE and opens no prompt", () => {
+    const dir = freshStateDir();
+    // Empty stdin: a prompt here would hang/fail the test, which is the point.
+    const res = run(dir, "wizard", "--help");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("PRE-TICKED");
+    expect(res.out).toContain("--revoke");
+    expect(res.out).toContain("--undo");
+  });
+
+  test("a configured group is shown pre-ticked, not skipped", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": {
+        name: "Family",
+        memberCount: 4,
+        archived: false,
+        updatedAt: 0,
+      },
+    });
+    run(dir, "group", "add", "1@g.us");
+    const before = readFileSync(join(dir, "access.json"), "utf8");
+    const res = runWithInput(dir, "\x03", "wizard");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("Family");
+    expect(flatten(res.out)).toContain("untick to take that away");
+    expect(res.out).toContain("Cancelled");
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
+  });
+
+  test("--revoke opens the same screen as plain wizard", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": {
+        name: "Family",
+        memberCount: 4,
+        archived: false,
+        updatedAt: 0,
+      },
+    });
+    run(dir, "group", "add", "1@g.us");
+    const plain = runWithInput(dir, "\x03", "wizard");
+    const revoke = runWithInput(dir, "\x03", "wizard", "--revoke");
+    expect(revoke.out).toContain("Family");
+    expect(flatten(revoke.out)).toContain("untick to take that away");
+    expect(revoke.code).toBe(plain.code);
+  });
+
+  test("an already-configured group is offered pre-ticked instead of leaving nothing to review", () => {
     const dir = freshStateDir();
     writeGroupsMeta(dir, {
       "1@g.us": {
@@ -504,9 +628,9 @@ describe("wizard", () => {
       },
     });
     run(dir, "group", "add", "1@g.us"); // already configured
-    const res = run(dir, "wizard");
-    expect(res.code).toBe(1);
-    expect(res.out).toContain("Nothing to review");
+    const res = runWithInput(dir, "\x03", "wizard");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("Active");
     expect(access(dir).groups["2@g.us"]).toBeUndefined();
   });
 
@@ -524,7 +648,9 @@ describe("wizard", () => {
       });
       const res = runWithInput(dir, "\n", "wizard"); // enter immediately, 0 selected
       expect(res.code).toBe(0);
-      expect(res.out).toContain("0 group(s), 0 contact(s) configured.");
+      expect(res.out).toContain(
+        "Nothing changed - your ticks match what was already set up.",
+      );
       expect(existsSync(join(dir, "access.json"))).toBe(false);
     },
   );
@@ -559,21 +685,44 @@ describe("wizard", () => {
       writeDmActivity(dir, { "1@s.whatsapp.net": 1000 });
       const res = runWithInput(dir, "\n", "wizard");
       expect(res.code).toBe(0);
-      expect(res.out).toContain("0 group(s), 0 contact(s) configured.");
+      expect(res.out).toContain(
+        "Nothing changed - your ticks match what was already set up.",
+      );
       expect(existsSync(join(dir, "access.json"))).toBe(false);
     },
   );
 
+  // Two prompts: checkbox (space ticks, enter submits) then confirm (enter
+  // accepts the Y/n default) - see runWizardWrite's own comment for why this
+  // needs it instead of runWithInput.
   test.skipIf(!!process.env.CI)(
     "DMs only, select the one candidate: added to the allowlist",
-    () => {
+    async () => {
       const dir = freshStateDir();
       writeDmActivity(dir, { "61403911675@s.whatsapp.net": 1000 });
       writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
-      const res = runWithInput(dir, " \n", "wizard"); // space selects, enter submits
+      const res = await runWizardWrite(dir, [" \n", "\n"], ["wizard"]);
       expect(res.code).toBe(0);
-      expect(res.out).toContain("0 group(s), 1 contact(s) configured.");
+      expect(res.out).toContain("Applied:");
       expect(access(dir).allowFrom).toEqual(["61403911675@s.whatsapp.net"]);
+      // First-ever run: save() takes no .bak (there was no access.json to
+      // copy), so the undo hint would point at a command that only answers
+      // "no previous access file - nothing to undo".
+      expect(res.out).not.toContain("Changed your mind?");
+    },
+  );
+
+  test.skipIf(!!process.env.CI)(
+    "a run against an already-existing access.json prints the undo hint",
+    async () => {
+      const dir = freshStateDir();
+      run(dir, "allow", "61403911675@s.whatsapp.net"); // access.json now exists
+      writeDmActivity(dir, { "61499999999@s.whatsapp.net": 1000 });
+      writeContacts(dir, { "61499999999@s.whatsapp.net": { name: "Priya" } });
+      const res = await runWizardWrite(dir, [" \n", "\n"], ["wizard"]);
+      expect(res.code).toBe(0);
+      expect(res.out).toContain("Applied:");
+      expect(res.out).toContain("Changed your mind?");
     },
   );
 
@@ -586,6 +735,67 @@ describe("wizard", () => {
       const res = runWithInput(dir, "\n", "wizard");
       expect(res.out).toContain("Rohan");
       expect(res.out).not.toContain("61403911675");
+    },
+  );
+
+  // Three prompts this time: the group checkbox (already-configured, no
+  // candidates - just submit), the DM checkbox (tick the one candidate),
+  // then confirm. Proves access.ts:636's "kept, not re-granted" comment for
+  // real: a group with a per-group allowFrom and roster:true must come out
+  // of a run that only touches the DM screen byte-identical to how it went
+  // in - not merely requireMention/roster, which every other group test
+  // already covers via `group add`.
+  test.skipIf(!!process.env.CI)(
+    "a kept group's requireMention/roster/allowFrom survive a run that only changes a DM",
+    async () => {
+      const dir = freshStateDir();
+      run(
+        dir,
+        "group",
+        "add",
+        "1@g.us",
+        "--roster",
+        "--allow",
+        "119@s.whatsapp.net",
+      );
+      const groupBefore = access(dir).groups["1@g.us"];
+      writeDmActivity(dir, { "61403911675@s.whatsapp.net": 1000 });
+      writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
+      const res = await runWizardWrite(dir, ["\n", " \n", "\n"], ["wizard"]);
+      expect(res.code).toBe(0);
+      expect(res.out).toContain("Applied:");
+      expect(access(dir).allowFrom).toEqual(["61403911675@s.whatsapp.net"]);
+      expect(access(dir).groups["1@g.us"]).toEqual(groupBefore);
+    },
+  );
+
+  // Simulates the server appending a pairing approval to allowFrom while the
+  // wizard is sitting on its confirm prompt - the exact window access.ts:643's
+  // comment says survives because the write reloads AFTER confirm.
+  test.skipIf(!!process.env.CI)(
+    "an allowFrom entry the server adds while the confirm prompt is open is not dropped",
+    async () => {
+      const dir = freshStateDir();
+      writeDmActivity(dir, { "61403911675@s.whatsapp.net": 1000 });
+      writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
+      const res = await runWizardWrite(dir, [" \n", "\n"], ["wizard"], {
+        between: () => {
+          writeFileSync(
+            join(dir, "access.json"),
+            JSON.stringify({
+              dmPolicy: "pairing",
+              allowFrom: ["61499999999@s.whatsapp.net"],
+              groups: {},
+              pending: {},
+            }),
+          );
+        },
+      });
+      expect(res.code).toBe(0);
+      expect(res.out).toContain("Applied:");
+      expect([...access(dir).allowFrom].sort()).toEqual(
+        ["61403911675@s.whatsapp.net", "61499999999@s.whatsapp.net"].sort(),
+      );
     },
   );
 
@@ -961,31 +1171,40 @@ describe("wizard --revoke", () => {
     const dir = freshStateDir();
     const res = run(dir, "wizard", "--revoke");
     expect(res.code).toBe(1);
-    expect(res.out).toContain("no access to take away");
+    expect(res.out).toContain("Nothing to review");
     expect(existsSync(join(dir, "access.json"))).toBe(false);
   });
 
   test.skipIf(!!process.env.CI)(
-    "select none: an empty selection removes NOTHING, never everything",
+    "select none: an untouched screen removes NOTHING, never everything",
     () => {
       const dir = freshStateDir();
       run(dir, "allow", "61403911675@s.whatsapp.net");
       const before = readFileSync(join(dir, "access.json"), "utf8");
       const res = runWithInput(dir, "\n", "wizard", "--revoke");
       expect(res.code).toBe(0);
-      expect(res.out).toContain("Nothing selected");
+      expect(res.out).toContain(
+        "Nothing changed - your ticks match what was already set up.",
+      );
       expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
     },
   );
 
+  // Two prompts: checkbox then confirm. The row is pre-ticked, so space now
+  // UNticks it - see runWizardWrite's own comment for why this needs it
+  // instead of runWithInput.
   test.skipIf(!!process.env.CI)(
     "select the one contact: dropped from the allowlist and forgotten",
-    () => {
+    async () => {
       const dir = freshStateDir();
       writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
       writeDmActivity(dir, { "61403911675@s.whatsapp.net": 1000 });
       run(dir, "allow", "61403911675@s.whatsapp.net");
-      const res = runWithInput(dir, " \n", "wizard", "--revoke");
+      const res = await runWizardWrite(
+        dir,
+        [" \n", "\n"],
+        ["wizard", "--revoke"],
+      );
       expect(res.code).toBe(0);
       // Labelled, not raw-numbered.
       expect(res.out).toContain("Rohan");
@@ -995,9 +1214,10 @@ describe("wizard --revoke", () => {
     },
   );
 
+  // Same checkbox-then-confirm pair as above.
   test.skipIf(!!process.env.CI)(
     "select the one group: dropped, but its config.md and memory.md are kept",
-    () => {
+    async () => {
       const dir = freshStateDir();
       writeGroupsMeta(dir, {
         "1@g.us": {
@@ -1010,7 +1230,11 @@ describe("wizard --revoke", () => {
       run(dir, "group", "add", "1@g.us");
       const config = join(dir, "groups", "1@g.us", "config.md");
       expect(existsSync(config)).toBe(true);
-      const res = runWithInput(dir, " \n", "wizard", "--revoke");
+      const res = await runWizardWrite(
+        dir,
+        [" \n", "\n"],
+        ["wizard", "--revoke"],
+      );
       expect(res.code).toBe(0);
       expect(res.out).toContain("Family");
       expect(access(dir).groups["1@g.us"]).toBeUndefined();
@@ -1018,9 +1242,10 @@ describe("wizard --revoke", () => {
     },
   );
 
+  // Same checkbox-then-confirm pair as above.
   test.skipIf(!!process.env.CI)(
     "revoking one form of a doubly-allowlisted contact keeps the shared cache",
-    () => {
+    async () => {
       // Same guard `remove` applies - shared through revokeCachedIdentity so
       // the two screens cannot drift apart on it.
       const dir = freshStateDir();
@@ -1031,8 +1256,12 @@ describe("wizard --revoke", () => {
       run(dir, "allow", "228896205193224@lid");
       run(dir, "allow", "61432609386@s.whatsapp.net");
       // Rows sort by label then JID, so the @lid form is first; space ticks
-      // it, enter submits.
-      const res = runWithInput(dir, " \n", "wizard", "--revoke");
+      // it, enter submits, enter confirms.
+      const res = await runWizardWrite(
+        dir,
+        [" \n", "\n"],
+        ["wizard", "--revoke"],
+      );
       expect(res.code).toBe(0);
       expect(res.out).toContain("Kept their cached name");
       expect(access(dir).allowFrom).toEqual(["61432609386@s.whatsapp.net"]);

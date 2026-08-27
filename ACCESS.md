@@ -104,24 +104,38 @@ A group with roster access also has its member list (JIDs only, no names) cached
 
 ## Guided bulk setup (wizard)
 
-`bun scripts/access.ts wizard` shows a checkbox screen of your **5 most recently active groups** and a second one for your **10 most recently active DM contacts** — the same recency signal the WhatsApp app itself sorts its own chat list by — so review stays to one screen each instead of scaling with how many groups or contacts you actually have. Navigate with the arrow keys, toggle with space, submit with enter.
+`bun scripts/access.ts wizard` shows one checkbox screen per kind - groups, then
+contacts. **Everything Claude can already reach is pre-ticked**, so the screen shows
+you the current state instead of an empty list: untick to take access away, tick to
+grant. Below the ticked entries sit your **5 most recently active groups** and **10
+most recently active DM contacts** that are not configured yet - the same recency
+signal the WhatsApp app itself sorts its own chat list by. Navigate with the arrow
+keys, toggle with space, submit with enter.
 
 The in-session `/whatsapp-channel:access review` covers the same ground without leaving the session: it shows groups and contacts three at a time, searches the whole cached pool when you type part of a name, folds removals into the same pass, and shows you the complete list of additions and removals to approve before it writes anything. If you change your mind, `bun scripts/access.ts undo` (or `wizard --undo`) restores the access list from just before that run — one step back, access list only, caches not restored.
 
-- **Groups**: pick which ones Claude can reply in, then (only for the ones you just picked) a second checkbox for which also get roster access.
+- **Groups**: pick which ones Claude can reply in, then (only for the ones you just picked) a second checkbox for which also get roster access. The roster question is asked only about groups you are granting in this run; a group that was already configured keeps the roster flag it has (change it with `group add --roster` / `--no-roster`).
 - **Contacts**: pick which ones can message Claude — added straight to the allowlist, no second question.
-- Each screen shows only the most recent 5 groups / 10 contacts and says so when there are more (`Only showing 5 of 23 (most recent)`). Anything past the cap is still reachable in the same run: after each checkbox a search prompt lets you type part of a name and add one at a time, repeating until you pick `Done`. Archived groups are skipped by default and the wizard says how many it hid — pass `--include-archived` to include them. Anything already configured is never offered again.
-- Ctrl-C cancels cleanly at any point; nothing is written until every question on screen has been answered.
+- Each screen shows only the most recent 5 groups / 10 contacts and says so when there are more (`Only showing 5 of 23 (most recent)`). Already-configured entries are never capped and never hidden - a revoke you cannot reach would be worse than a long screen. In the search round a hit is marked `[on]`/`[off]` and picking it toggles it, so search can take access away as well as grant it — each entry toggles once per search round, so answer `n` at the confirm and re-run the wizard to correct a mis-toggle. Archived groups are skipped by default and the wizard says how many it hid — pass `--include-archived` to include them.
+- Nothing is written until you have seen the full `+`/`-` list and answered **Apply these changes?**. Answer `n`, or press Ctrl-C at any point, and nothing is written at all.
+- After a write, `bun scripts/access.ts wizard --undo` (or plain `undo`) puts the access list back to just before that run - run it with `--dry-run` first. Cached names are not restored, only the access list.
 - A group the wizard adds gets `requireMention: true` (only reply when addressed) — a more cautious default than `group add`'s own CLI default of `false` (reply to everything), deliberately: the wizard is the guided path for a less technical setup, the CLI is for someone already comfortable with explicit flags. Change it after the fact with `group add --mention` or `--no-mention`.
 
 ### Taking access back (`wizard --revoke`)
 
-`bun scripts/access.ts wizard --revoke` is the same screen in reverse: it lists **everything currently configured** — every group in `access.json`'s `groups`, every contact in `allowFrom` — and you tick what should lose access. Unlike the grant screen it is never capped or ranked: a revoke list that left entries off could leave them permanently unrevokable.
+`--revoke` is now an **alias for the same screen** - there is only one wizard, and
+revoking is unticking a row that came pre-ticked. The old command keeps working so a
+habit or an old note does not break.
 
-- **Leaving everything unticked removes nothing.** An empty selection is never read as "remove all".
-- Revoking a group keeps its `config.md` and `memory.md`, same as `group rm`, in case you add it back.
-- Revoking a contact also forgets their cached name and recency — unless another allowlist entry still resolves to the same person (someone allowlisted under both their `@lid` and phone form), in which case the cache is kept, because the surviving grant still needs it.
-- Ctrl-C cancels cleanly, and nothing is written until every question on screen has been answered.
+- **An untouched screen changes nothing.** Submitting without touching a tick is
+  read as "leave everything as it is" - it can neither remove nor grant.
+- Revoking a group keeps its `config.md` and `memory.md`, same as `group rm`, in case
+  you add it back.
+- Revoking a contact also forgets their cached name and recency - unless another
+  allowlist entry still resolves to the same person (someone allowlisted under both
+  their `@lid` and phone form), in which case the cache is kept, because the surviving
+  grant still needs it.
+- Ctrl-C cancels cleanly, and nothing is written until you approve the `+`/`-` list.
 
 It reads the same two functions the in-session `/whatsapp-channel:access manage` screen reads, so the terminal and the chat path cannot disagree about what is configured or what a revoke cleans up.
 

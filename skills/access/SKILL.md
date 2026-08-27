@@ -257,9 +257,11 @@ knew, `review` is the one to run: this refusal is about who may run the
 wizard, never a reason to leave adding access undone.
 Continue helping with everything else in this skill as normal.
 
-The same applies to `wizard --revoke`, its revoke screen: same terminal-only
-guarantee, same refusal here. `wizard` in either mode is the ONLY subcommand
-of that script you may not run. The `review` and `manage` flows below do run
+The same applies to `wizard --revoke`: it is now just an alias for the same screen
+(everything already configured shows pre-ticked, and unticking is the revoke), so the
+terminal-only guarantee and the refusal here cover both names. `wizard` in either
+mode is the ONLY subcommand of that script you may not run. The `review` and
+`manage` flows below do run
 it, for `state`, `candidates`, `configured`, `allow`, `remove`, `group add`,
 `group rm` and `undo` — none of which is interactive, and none of which
 decides anything on its own. `wizard --undo` is not a screen and is allowed —
@@ -570,11 +572,12 @@ the two are interchangeable. This skill stays the friendlier path: it can ask th
 group personality questions and write a tailored config.md, which the CLI does not.
 
 The CLI also has one command this skill deliberately does not implement:
-`bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" wizard`, a checkbox screen (arrow keys + space +
-enter) over the account's 5 most recently active groups and 10 most
-recently active DM contacts, so review stays to one screen each instead
-of scaling with how many groups/contacts exist. Its `--revoke` mode is the
-same screen over everything already configured, uncapped. It's terminal-only by
+`bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" wizard`, a checkbox screen (arrow keys to
+move, space to toggle, enter to confirm) with everything already configured pre-ticked,
+followed by the account's 5 most recently active groups and 10 most recently active DM
+contacts, so one pass both grants and takes away and review stays to one screen per
+kind. It shows the full `+`/`-` list and asks before it writes, and `--undo` puts the
+last run back. `--revoke` is an alias for the same screen. It's terminal-only by
 design (see the `wizard` entry above) so the decision can be made with a
 verifiable guarantee that no AI model was involved in making it. Point the
 user at it when that guarantee is the point — not for volume: `review`
