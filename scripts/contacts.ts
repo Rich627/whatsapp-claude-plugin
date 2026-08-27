@@ -40,6 +40,17 @@ export function contactName(map: ContactsMap, jid: string): string | undefined {
   return entry?.name || entry?.notify;
 }
 
+// The picker resolves people by the name the OWNER saved (`.name`), never by
+// the self-reported `.notify` - see resolveByName below for why. So "is the
+// cache usable yet?" is specifically "does any entry have a saved name?", not
+// "is the map non-empty": a cache full of notify-only entries (everyone who
+// has ever messaged this account) is exactly the state a server that paired
+// before WhatsApp's contact sync was being kept ends up in, and it is
+// indistinguishable from a healthy cache by size alone.
+export function hasSavedName(map: ContactsMap): boolean {
+  return Object.values(map).some((entry) => !!entry.name);
+}
+
 // A contact cached under its raw @lid key (before Baileys' lid-mapping.update
 // told us the matching phone number) would otherwise be permanently
 // unfindable once server.ts's contactKey() starts resolving that LID to its

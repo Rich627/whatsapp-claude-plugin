@@ -60,6 +60,7 @@ import { RECENT_LIMIT, recentWindow, renderLogEntry } from "./lib/message-view";
 import { formatSentLine, parseSentLog } from "./lib/sent-log";
 import {
   contactName,
+  hasSavedName,
   mergeContact,
   migrateContactKey,
   type ContactsMap,
@@ -1529,6 +1530,80 @@ async function refreshGroupsMeta(
   }
   if (metaChanged) saveGroupsMeta();
   return groups;
+}
+
+// WhatsApp delivers the names the OWNER saved on their phone
+// (contactAction.fullName -> contacts.upsert, see
+// node_modules/@whiskeysockets/baileys/lib/Utils/chat-utils.js:667) exactly
+// once: during the app-state sync Baileys runs at PAIRING, and only while its
+// own syncState is Syncing (lib/Socket/chats.js:824-834). A server that paired
+// before this cache existed dropped that single delivery, and no reconnect
+// ever repeats it - leaving contacts.json full of notify-only entries that
+// nothing can resolve by saved name.
+//
+// Asking for a plain resync is not enough: the request carries the version
+// this device last synced to, and WhatsApp answers with only what changed
+// since - nothing, on an account that already synced (chats.js:376-384). A
+// FULL re-send happens only for a collection at version 0, which is why the
+// version is cleared first. That is Baileys' own recovery move, verbatim from
+// chats.js:437 ("removing and trying from scratch"), through the same
+// authState.keys API it uses (typed on the socket, Socket/index.d.ts:203):
+// this server never opens, reads or edits a file under .baileys_auth itself.
+//
+// Only critical_unblock_low, never all five collections: that is the one
+// carrying contactAction (chat-utils.js:440-449), and a snapshot re-fires
+// EVERY mutation in whatever collection it is asked for. The other four hold
+// archive/mute/pin/star/block/privacy state this task has no use for, and
+// replaying those would push a pile of chats.update/messages.delete events
+// through the listeners for nothing.
+//
+// The guard is the CACHE ON DISK, never an in-memory "already tried" flag: a
+// connect whose sync produced nothing retries on the next connect past the
+// cooldown below, a connect
+// after one that worked does not, and both of those survive a restart, which
+// a flag cannot. Nothing here writes contacts.json itself - the existing
+// contacts.upsert listener does, exactly as it does for Baileys' own sync.
+//
+// The cooldown is the same one refreshGroupsMeta's connect call site needs
+// and for the same reason: an owner whose phone has NO saved contacts (a
+// second number run just for this plugin) never satisfies the disk guard, and
+// a flaky-network reconnect storm (backoff caps at 30s) would otherwise
+// clear the version and pull a full snapshot on every single reconnect. A
+// restart still retries at once - the timestamp lives in memory only.
+const CONTACT_PATCH_COLLECTION = "critical_unblock_low" as const;
+const ADDRESS_BOOK_FLUSH_GRACE_MS = 2000;
+const ADDRESS_BOOK_SYNC_COOLDOWN_MS = GROUPS_META_CONNECT_COOLDOWN_MS;
+let addressBookSyncAttemptedAt = 0;
+
+async function syncSavedNamesOnce(
+  activeSock: NonNullable<typeof sock>,
+): Promise<void> {
+  if (!CACHE_CONTACTS) return;
+  reloadContactsMap();
+  if (hasSavedName(contactsMap)) return;
+  if (Date.now() - addressBookSyncAttemptedAt < ADDRESS_BOOK_SYNC_COOLDOWN_MS)
+    return;
+  addressBookSyncAttemptedAt = Date.now();
+  // Typed on the rc.9 socket (Socket/index.d.ts:178); checked at runtime
+  // anyway so a Baileys that drops it degrades to "no names" rather than
+  // throwing inside the connection handler.
+  if (typeof activeSock.resyncAppState !== "function") return;
+  await activeSock.authState.keys.set({
+    "app-state-sync-version": { [CONTACT_PATCH_COLLECTION]: null },
+  });
+  await activeSock.resyncAppState([CONTACT_PATCH_COLLECTION], true);
+  // resyncAppState is wrapped in createBufferedFunction: the contacts.upsert
+  // events it produces are flushed on a 100ms timer that fires AFTER the
+  // promise above resolves (Utils/event-buffer.js:135-141), so counting here
+  // and now would always read the pre-sync number. Count from disk after a
+  // grace window instead.
+  // ponytail: fixed grace window, not an event handshake - this only affects
+  // the accuracy of one log line, never the cache itself or the guard above.
+  setTimeout(() => {
+    reloadContactsMap();
+    const saved = Object.values(contactsMap).filter((c) => c.name).length;
+    logDiag(`${LOG_PREFIX}: address book synced: ${saved} saved name(s)\n`);
+  }, ADDRESS_BOOK_FLUSH_GRACE_MS);
 }
 
 async function resolveGroupName(groupJid: string): Promise<string> {
@@ -3912,8 +3987,13 @@ async function connectWhatsApp(): Promise<void> {
     let changed = false;
     for (const c of contacts) {
       if (c.name || c.notify) {
+        // A snapshot entry can arrive under its @lid id while also carrying
+        // the phone form: key on the phone form when it is there, so the
+        // name never lands under an @lid key that resolveByName would hand
+        // back verbatim. No recordLidMapping here - it reloads contactsMap
+        // from disk and would wipe every merge made so far in this batch.
         if (
-          mergeContact(contactsMap, contactKey(c.id), {
+          mergeContact(contactsMap, contactKey(c.phoneNumber ?? c.id), {
             name: c.name,
             notify: c.notify,
           })
@@ -4093,6 +4173,14 @@ async function connectWhatsApp(): Promise<void> {
         logDiag(
           `${LOG_PREFIX}: failed to warm groups-meta cache on connect: ${err}\n`,
         );
+      });
+
+      // Same fire-and-forget contract as the groups-meta warm-up above: a
+      // failure here must never break the connection, and it must never block
+      // startup. Guarded inside on the on-disk cache, so this is a no-op on
+      // every connect once names are actually cached.
+      syncSavedNamesOnce(sock!).catch((err) => {
+        logDiag(`${LOG_PREFIX}: address book sync failed: ${err}\n`);
       });
     }
 
