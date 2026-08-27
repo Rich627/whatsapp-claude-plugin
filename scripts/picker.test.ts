@@ -194,6 +194,16 @@ describe("reducePicker", () => {
     let s = initPicker(model({ dms: [alice], groups: [zeta] }), 100, 24);
     s = press(s, { type: "tab" }); // groups focused
     s = press(s, { type: "char", ch: "a" }); // snaps to search; both match
+    // Move a column cursor off row 0, then come back to the search line:
+    // the marker is on row 0 of the target, and Space must follow it.
+    s = press(
+      s,
+      { type: "tab" },
+      { type: "down" },
+      { type: "tab" },
+      { type: "tab" },
+    );
+    expect(s.focus).toBe("search");
     const marked = layout(s, 100, 24)
       .map(stripAnsi)
       .find((l) => l.startsWith(">"));

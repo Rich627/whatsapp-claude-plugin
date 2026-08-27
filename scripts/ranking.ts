@@ -223,10 +223,14 @@ export function rankDms(
     .map(([jid]) => {
       // Same key the address-book loop de-dupes on, so one person cached
       // under @lid activity and a phone-keyed saved name is one row.
-      seen.add(contactKeyFor(lidMap, jid));
+      const key = contactKeyFor(lidMap, jid);
+      seen.add(key);
       return {
         jid,
-        label: dmLabel(contacts, jid),
+        // The saved name may sit under the phone key while the activity is
+        // lid-keyed: look it up where it lives, or the row shows a masked
+        // number and "Search: <name>" finds nothing.
+        label: dmLabel(contacts, contacts[jid] ? jid : key),
         description: maskNumber(jid),
       };
     });

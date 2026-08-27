@@ -332,9 +332,12 @@ function highlighted(state: PickerState): PickerItem | null {
   // line and a filter typed, that is enterTarget's column, not the column
   // that was focused before typing - otherwise Space could tick a row the
   // screen never marked (review finding on aab1036).
-  const column = enterTarget(state) ?? focusedColumn(state);
+  const target = enterTarget(state);
+  const column = target ?? focusedColumn(state);
   const visible = visibleItems(state, column);
-  const idx = state.cursor[column];
+  // ...and the same ROW: the marker sits on row 0 of the target column
+  // while the caret is in the search line, whatever the column's cursor is.
+  const idx = target ? 0 : state.cursor[column];
   return visible[idx] ?? null;
 }
 

@@ -435,6 +435,7 @@ describe("rankDms", () => {
     const lidMap = { "123456@lid": "61403911675@s.whatsapp.net" };
     const result = rankDms(activity, contacts, [], lidMap, 10);
     expect(result).toHaveLength(1);
+    expect(result[0].label).toBe("Thilian");
   });
 
   test("the limit slices the combined pool, activity first", () => {
