@@ -30,20 +30,26 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { checkbox, search } from "@inquirer/prompts";
 import { forgetContact, type ContactsMap } from "./contacts";
+import { groupAnchor, maskNumber } from "./mask";
 import {
   contactKeyFor,
+  diffAccess,
   filterCandidates,
   listConfiguredDms,
   listConfiguredGroups,
+  publicCandidates,
   rankDms,
   rankGroups,
+  rosterMemberPool,
   type Candidate,
   type GroupMeta,
+  type PublicCandidate,
 } from "./ranking";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
 const ACCESS_FILE = join(STATE_DIR, "access.json");
+const ACCESS_BAK_FILE = ACCESS_FILE + ".bak";
 const APPROVED_DIR = join(STATE_DIR, "approved");
 const GROUPS_DIR = join(STATE_DIR, "groups");
 const GROUPS_META_FILE = join(STATE_DIR, "groups-meta.json");
@@ -100,8 +106,26 @@ function load(): Access {
 // load → mutate → save with no lock: a pending entry the server adds in that
 // few-ms window is lost. Accepted — the sender just messages again for a new
 // code. Atomic (tmp + rename) like server.ts, so it never reads a torn file.
-function save(access: Access): void {
+//
+// `backup: true` copies the CURRENT access.json to access.json.bak before
+// overwriting it - the one-step undo behind `undo` / `wizard --undo` (#14).
+// Opt-in so the wizard and every other caller behave exactly as before: the
+// in-session review passes it on the FIRST write of a run and on no other, so
+// one `undo` reverses the whole run rather than only its last command.
+function save(access: Access, opts: { backup?: boolean } = {}): void {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  if (opts.backup && existsSync(ACCESS_FILE)) {
+    // tmp + rename like every other write here, and written fresh with mode
+    // 0o600 rather than copied: writeFileSync's `mode` is ignored when the
+    // destination already exists, so a plain copy over an older .bak could
+    // leave whatever permissions that file had.
+    const bakTmp = ACCESS_BAK_FILE + ".tmp";
+    writeFileSync(bakTmp, readFileSync(ACCESS_FILE), { mode: 0o600 });
+    renameSync(bakTmp, ACCESS_BAK_FILE);
+    process.stdout.write(
+      `Saved the previous access.json to ${ACCESS_BAK_FILE} - "undo" restores it.\n`,
+    );
+  }
   const tmp = ACCESS_FILE + ".tmp";
   writeFileSync(tmp, JSON.stringify(access, null, 2) + "\n", { mode: 0o600 });
   renameSync(tmp, ACCESS_FILE);
@@ -122,22 +146,27 @@ const USAGE = `Usage: bun scripts/access.ts <command>
   status                          show policy, allowlist, pending, groups
   pair <code>                     approve a pending pairing by its code
   deny <code>                     drop a pending pairing
-  allow <jid>                     add a JID to the allowlist
-  remove <jid>                    remove a JID from the allowlist
+  allow <jid> | --ref <ref>       add a JID to the allowlist
+  remove <jid> | --ref <ref>      remove a JID from the allowlist
   forget <jid>                    purge a cached name/activity entry, even
                                    for a JID never allowlisted (see remove)
   policy <${POLICIES.join("|")}>   set the DM policy
-  group add <groupJid> [--mention|--no-mention] [--allow a,b] [--roster|--no-roster]
+  group add <groupJid> | --ref <ref> [--mention|--no-mention] [--allow a,b] [--roster|--no-roster]
   group rm <groupJid>             stop responding in a group (files kept)
   wizard [--include-archived]     guided group setup: can-act / can-see-roster,
                                    per group, from names cached by list_groups
   wizard --revoke                 the same screen in reverse: tick what to
                                    take access AWAY from
-  candidates [--include-archived] JSON: groups/contacts not configured yet
-  configured                      JSON: groups/contacts already configured
+  state [--include-archived]      JSON: candidates + configured, both pools
+  candidates [--include-archived] [--search <text>]
+                                  JSON: groups/contacts not configured yet
+  configured [--search <text>]    JSON: groups/contacts already configured
+  undo [--dry-run]                put back the access.json saved by the last
+                                   --backup write (wizard --undo does the same)
   set <key> <value>               ${SET_KEYS.join(", ")}
 
-JIDs look like 886912345678@s.whatsapp.net or 1203634244@g.us.`;
+JIDs look like 886912345678@s.whatsapp.net or 1203634244@g.us.
+Any writing command takes --backup to save the current access.json to access.json.bak first.`;
 
 function loadGroupsMeta(): Record<string, GroupMeta> {
   if (!existsSync(GROUPS_META_FILE)) return {};
@@ -293,6 +322,8 @@ function group(args: string[]): void {
         allow: { type: "string" },
         roster: { type: "boolean" },
         "no-roster": { type: "boolean" },
+        ref: { type: "string" },
+        backup: { type: "boolean" },
       },
       allowPositionals: true,
     });
@@ -300,14 +331,17 @@ function group(args: string[]): void {
     die(`${(err as Error).message}\n\n${USAGE}`);
   }
   const [sub, jidArg] = parsed.positionals;
-  const jid = requireArg(jidArg, "group JID");
   const {
     mention = false,
     "no-mention": noMention = false,
     allow,
     roster = false,
     "no-roster": noRoster = false,
+    ref,
+    backup,
   } = parsed.values;
+  const jid = targetJid(ref, jidArg, "group", "group JID");
+  const viaRef = !!ref;
   // parseArgs has no built-in negation, so --mention/--no-mention (and the
   // roster pair) are two separate flags - passing both at once is
   // ambiguous, never silently resolved one way.
@@ -315,11 +349,13 @@ function group(args: string[]): void {
   if (roster && noRoster) die("Cannot pass both --roster and --no-roster.");
   const a = load();
   if (sub === "rm") {
-    if (!a.groups[jid]) die(`Group ${jid} is not configured.`);
+    if (!a.groups[jid]) {
+      die(`Group ${displayJid(jid, viaRef, "group")} is not configured.`);
+    }
     delete a.groups[jid];
-    save(a);
+    save(a, { backup });
     process.stdout.write(
-      `Removed ${jid}. Its config.md and memory.md are kept in case you re-add it.\n`,
+      `Removed ${displayJid(jid, viaRef, "group")}. Its config.md and memory.md are kept in case you re-add it.\n`,
     );
     return;
   }
@@ -351,11 +387,14 @@ function group(args: string[]): void {
         : (existing?.allowFrom ?? []),
     roster: roster ? true : noRoster ? false : (existing?.roster ?? false),
   };
-  save(a);
+  save(a, { backup });
 
   const config = provisionGroupFiles(jid);
+  // The config path embeds the raw JID; a --ref caller (the in-session skill)
+  // gets the masked path instead, same rule as the sentence before it.
+  const shownConfig = viaRef ? config.replace(jid, groupAnchor(jid)) : config;
   process.stdout.write(
-    `${existing ? "Updated" : "Added"} ${jid} (mention required: ${a.groups[jid].requireMention}, roster: ${a.groups[jid].roster}).\nEdit its personality at ${config}\n`,
+    `${existing ? "Updated" : "Added"} ${displayJid(jid, viaRef, "group")} (mention required: ${a.groups[jid].requireMention}, roster: ${a.groups[jid].roster}).\nEdit its personality at ${shownConfig}\n`,
   );
 }
 
@@ -691,6 +730,142 @@ function emitJson(payload: unknown): void {
   process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
 }
 
+// Every pool a ref can legitimately come from: not-yet-configured and already
+// configured, groups and DMs. Archived groups are always included here - a ref
+// the caller was shown must still resolve, whatever archive filter produced
+// the screen it came from.
+function allCandidates(): Candidate[] {
+  const a = load();
+  const meta = loadGroupsMeta();
+  const contacts = loadContacts();
+  const lidMap = loadLidMap();
+  return [
+    ...rankGroups(meta, new Set(Object.keys(a.groups)), true, Infinity),
+    ...listConfiguredGroups(a.groups, meta),
+    ...rankDms(
+      loadDmActivity(),
+      contacts,
+      a.allowFrom,
+      lidMap,
+      Infinity,
+      rosterMemberPool(meta, a.groups),
+    ),
+    ...listConfiguredDms(a.allowFrom, contacts, lidMap),
+  ];
+}
+
+// A ref resolves to exactly one JID or the command dies. Never a "closest
+// match", never a prefix: the caller is a model relaying a token it was given,
+// and a wrong resolution here is a grant or a revoke against the wrong person.
+function resolveRef(ref: string, want: "group" | "dm"): string {
+  const jids = [
+    ...new Set(
+      allCandidates()
+        .filter((c) => c.ref === ref)
+        .map((c) => c.jid),
+    ),
+  ];
+  if (jids.length === 0) {
+    die(
+      `No group or contact matches ref "${ref}". Re-run "state" (or "candidates"/"configured") to get current refs.`,
+    );
+  }
+  if (jids.length > 1) {
+    die(
+      `Ref "${ref}" is ambiguous - it matches more than one entry. Re-run "state".`,
+    );
+  }
+  const jid = jids[0];
+  const isGroup = jid.endsWith("@g.us");
+  if (want === "group" && !isGroup) {
+    die(
+      `Ref "${ref}" is a contact, not a group. Use "allow"/"remove" for a contact.`,
+    );
+  }
+  if (want === "dm" && isGroup) {
+    die(
+      `Ref "${ref}" is a group, not a contact. Use "group add"/"group rm" for a group.`,
+    );
+  }
+  return jid;
+}
+
+// A subcommand takes EITHER a positional JID (a human in a terminal) or
+// --ref (the in-session skill, which never sees a JID). Both, or neither, is
+// an error rather than a silent precedence rule.
+function targetJid(
+  ref: string | undefined,
+  positional: string | undefined,
+  want: "group" | "dm",
+  what: string,
+): string {
+  if (ref && positional) die(`Pass either ${what} or --ref, not both.`);
+  if (ref) return resolveRef(ref, want);
+  return requireArg(positional, what);
+}
+
+// A confirmation line prints the JID either way. When it was resolved from
+// --ref (the in-session skill, which never sees a raw JID - see resolveRef)
+// the confirmation must not hand one back either, or the ref/description
+// split is pointless. A positional JID came from a human who typed it
+// themselves, so it keeps today's output unmasked.
+function displayJid(
+  jid: string,
+  viaRef: boolean,
+  kind: "group" | "dm",
+): string {
+  if (!viaRef) return jid;
+  return kind === "group" ? groupAnchor(jid) : maskNumber(jid);
+}
+
+function pool(list: readonly Candidate[]): {
+  items: PublicCandidate[];
+  total: number;
+} {
+  return { items: publicCandidates(list), total: list.length };
+}
+
+// The two pools' ranked (not-yet-configured) candidates - shared by
+// `candidates` and `state` so there is exactly one place that assembles them.
+function rankedPools(
+  a: Access,
+  meta: Record<string, GroupMeta>,
+  contacts: ContactsMap,
+  lidMap: Record<string, string>,
+  includeArchived: boolean,
+): { groups: Candidate[]; dms: Candidate[] } {
+  return {
+    groups: rankGroups(
+      meta,
+      new Set(Object.keys(a.groups)),
+      includeArchived,
+      Infinity,
+    ),
+    dms: rankDms(
+      loadDmActivity(),
+      contacts,
+      a.allowFrom,
+      lidMap,
+      Infinity,
+      rosterMemberPool(meta, a.groups),
+    ),
+  };
+}
+
+// The two pools' already-configured candidates - shared by `configured` and
+// `state` for the same reason.
+function configuredPools(
+  a: Access,
+  meta: Record<string, GroupMeta>,
+  contacts: ContactsMap,
+  lidMap: Record<string, string>,
+): { groups: Candidate[]; dms: Candidate[] } {
+  return {
+    groups: listConfiguredGroups(a.groups, meta),
+    dms: listConfiguredDms(a.allowFrom, contacts, lidMap),
+  };
+}
+
 // Not yet configured: the grant screen. Uncapped, for the same reason
 // `configured` is - a caller that shows four at a time and re-asks for a
 // fresh first page would offer the same top four forever, so a candidate
@@ -699,39 +874,229 @@ function emitJson(payload: unknown): void {
 // gets back. Still ranked most-recently-active first, so the four that
 // matter are the four it shows first.
 function candidates(args: string[]): void {
-  const includeArchived = args.includes("--include-archived");
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args,
+      options: {
+        search: { type: "string" },
+        "include-archived": { type: "boolean" },
+      },
+      allowPositionals: false,
+    }));
+  } catch (err) {
+    die(`${(err as Error).message}\n\n${USAGE}`);
+  }
+  const includeArchived = !!values["include-archived"];
   const a = load();
-  const groups = rankGroups(
-    loadGroupsMeta(),
-    new Set(Object.keys(a.groups)),
-    includeArchived,
-    Infinity,
-  );
-  const dms = rankDms(
-    loadDmActivity(),
+  const meta = loadGroupsMeta();
+  const ranked = rankedPools(
+    a,
+    meta,
     loadContacts(),
-    a.allowFrom,
     loadLidMap(),
-    Infinity,
+    includeArchived,
   );
-  emitJson({
-    groups: { items: groups, total: groups.length },
-    dms: { items: dms, total: dms.length },
-  });
+  // The wizard's own matcher, not a second one: case-insensitive substring
+  // over label and description, never a RegExp built from user text (see
+  // filterCandidates in ranking.ts). Applied AFTER ranking, so matches come
+  // back in the same order the unfiltered list would have had.
+  const groups = filterCandidates(ranked.groups, values.search);
+  const dms = filterCandidates(ranked.dms, values.search);
+  emitJson({ groups: pool(groups), dms: pool(dms) });
 }
 
 // Already configured: the revoke screen. Uncapped on purpose - `manage`
 // only ever removes, so a list truncated here would leave later entries
 // permanently unrevokable (a caller showing 4 at a time has to walk the
-// whole list it gets back, not re-ask for a fresh first page).
-function configured(): void {
+// whole list it gets back, not re-ask for a fresh first page). `--search`
+// mirrors `candidates`' - the revoke question needs the same way out of
+// paging a large install three at a time (#14 review).
+function configured(args: string[]): void {
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args,
+      options: { search: { type: "string" } },
+      allowPositionals: false,
+    }));
+  } catch (err) {
+    die(`${(err as Error).message}\n\n${USAGE}`);
+  }
   const a = load();
-  const groups = listConfiguredGroups(a.groups, loadGroupsMeta());
-  const dms = listConfiguredDms(a.allowFrom, loadContacts(), loadLidMap());
+  const c = configuredPools(a, loadGroupsMeta(), loadContacts(), loadLidMap());
+  const groups = filterCandidates(c.groups, values.search);
+  const dms = filterCandidates(c.dms, values.search);
+  emitJson({ groups: pool(groups), dms: pool(dms) });
+}
+
+// One JSON for the in-session review's opening screen (#12): what could be
+// granted and what is already granted, for both pools, in one read - so the
+// skill makes one Bash call instead of two and can print its state line
+// straight from the four totals. Both halves are the SAME shape `candidates`
+// and `configured` already emit, so the skill has one rule to follow, and both
+// are uncapped for the same reason those two are (a caller that re-asks for a
+// fresh first page would serve the same top four forever).
+//
+// ponytail: uncapped means the whole ranked pool lands in the model's context
+// - ~18KB for 178 groups. If that becomes the cost that matters, add
+// --limit/--offset here rather than a silent cap, which would make declined
+// entries unreachable.
+function state(args: string[]): void {
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args,
+      options: { "include-archived": { type: "boolean" } },
+      allowPositionals: false,
+    }));
+  } catch (err) {
+    die(`${(err as Error).message}\n\n${USAGE}`);
+  }
+  const includeArchived = !!values["include-archived"];
+  const a = load();
+  const meta = loadGroupsMeta();
+  const contacts = loadContacts();
+  const lidMap = loadLidMap();
+  const candidatePools = rankedPools(
+    a,
+    meta,
+    contacts,
+    lidMap,
+    includeArchived,
+  );
+  const configuredPoolsResult = configuredPools(a, meta, contacts, lidMap);
   emitJson({
-    groups: { items: groups, total: groups.length },
-    dms: { items: dms, total: dms.length },
+    groups: {
+      candidates: pool(candidatePools.groups),
+      configured: pool(configuredPoolsResult.groups),
+    },
+    dms: {
+      candidates: pool(candidatePools.dms),
+      configured: pool(configuredPoolsResult.dms),
+    },
   });
+}
+
+// One step back (#14). Restores access.json from the .bak that a `--backup`
+// write left behind, and leaves the state it replaced in the .bak - so `undo`
+// is its own inverse (a second one is a redo) without any multi-level history.
+// Restores access.json and NOTHING else: contacts.json / dm-activity.json
+// entries a `remove` purged are gone, and this says so rather than implying a
+// full rewind.
+function undo(args: string[]): void {
+  // Strict: a typo'd flag on the one destructive subcommand must not run it.
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args,
+      options: { "dry-run": { type: "boolean" } },
+      allowPositionals: false,
+    }));
+  } catch (err) {
+    die(`${(err as Error).message}\n\n${USAGE}`);
+  }
+  const dryRun = values["dry-run"] === true;
+  if (!existsSync(ACCESS_BAK_FILE)) {
+    process.stdout.write("No previous access file - nothing to undo\n");
+    return;
+  }
+  // access.json itself can be missing here - the exact state load()'s own
+  // "Fix or delete it, then retry" advice leaves a corrupt file in, which is
+  // also the moment undo is most useful. Treat it as an empty snapshot rather
+  // than crash: the diff still renders (everything in .bak looks "added")
+  // and the restore still works.
+  const currentBytes = existsSync(ACCESS_FILE)
+    ? readFileSync(ACCESS_FILE)
+    : Buffer.from(
+        JSON.stringify(
+          { dmPolicy: "pairing", allowFrom: [], groups: {}, pending: {} },
+          null,
+          2,
+        ) + "\n",
+      );
+  const bakBytes = readFileSync(ACCESS_BAK_FILE);
+  let current: Access;
+  let bak: Access;
+  try {
+    current = JSON.parse(currentBytes.toString("utf8"));
+  } catch {
+    die(`${ACCESS_FILE} is not valid JSON. Fix or delete it, then retry.`);
+  }
+  try {
+    bak = JSON.parse(bakBytes.toString("utf8"));
+  } catch {
+    die(
+      "access.json.bak is not valid JSON. Delete it to clear the undo point.",
+    );
+  }
+  const d = diffAccess(current, bak);
+  if (
+    d.added.groups.length === 0 &&
+    d.added.dms.length === 0 &&
+    d.removed.groups.length === 0 &&
+    d.removed.dms.length === 0
+  ) {
+    process.stdout.write(
+      "The previous access.json is identical to the current one - undo would change nothing.\n",
+    );
+    return;
+  }
+  const mergedGroups = { ...bak.groups, ...current.groups };
+  const mergedMeta = loadGroupsMeta();
+  const groupLabels = new Map(
+    listConfiguredGroups(mergedGroups, mergedMeta).map((c) => [c.jid, c]),
+  );
+  const mergedAllowFrom = [
+    ...new Set([...(bak.allowFrom ?? []), ...(current.allowFrom ?? [])]),
+  ];
+  const dmLabels = new Map(
+    listConfiguredDms(mergedAllowFrom, loadContacts(), loadLidMap()).map(
+      (c) => [c.jid, c],
+    ),
+  );
+  // One line builder for both kinds: a candidate map plus its masked
+  // fallback (groupAnchor for a group, maskNumber for a DM) when the JID
+  // has no entry in either merged snapshot's candidate list.
+  const line = (
+    jid: string,
+    labels: Map<string, Candidate>,
+    fallback: (jid: string) => string,
+  ): string => {
+    const c = labels.get(jid);
+    const label = c?.label ?? fallback(jid);
+    const description = c?.description ?? fallback(jid);
+    return `${label}  [${description}]`;
+  };
+  const lines: string[] = [];
+  for (const jid of d.added.groups) {
+    lines.push(`+ ${line(jid, groupLabels, groupAnchor)}`);
+  }
+  for (const jid of d.added.dms)
+    lines.push(`+ ${line(jid, dmLabels, maskNumber)}`);
+  for (const jid of d.removed.groups) {
+    lines.push(`- ${line(jid, groupLabels, groupAnchor)}`);
+  }
+  for (const jid of d.removed.dms) {
+    lines.push(`- ${line(jid, dmLabels, maskNumber)}`);
+  }
+  lines.push("(+ = access this brings back, - = access this takes away)");
+
+  if (dryRun) {
+    process.stdout.write(
+      `Undo would restore the previous access.json:\n${lines.join("\n")}\n`,
+    );
+    return;
+  }
+
+  writeFileSync(ACCESS_FILE + ".tmp", bakBytes, { mode: 0o600 });
+  renameSync(ACCESS_FILE + ".tmp", ACCESS_FILE);
+  writeFileSync(ACCESS_BAK_FILE + ".tmp", currentBytes, { mode: 0o600 });
+  renameSync(ACCESS_BAK_FILE + ".tmp", ACCESS_BAK_FILE);
+  process.stdout.write(
+    `Restored the previous access.json.\n${lines.join("\n")}\n` +
+      "Cached names and recency are not restored. access.json.bak now holds the state from before this undo, so running undo again puts it back.\n",
+  );
 }
 
 // Shared by `remove` (which also drops the allowlist entry) and `forget`
@@ -836,25 +1201,53 @@ switch (command) {
     break;
   }
   case "allow": {
-    const jid = requireArg(rest[0], "JID");
+    let values, positionals;
+    try {
+      ({ values, positionals } = parseArgs({
+        args: rest,
+        options: { ref: { type: "string" }, backup: { type: "boolean" } },
+        allowPositionals: true,
+      }));
+    } catch (err) {
+      die(`${(err as Error).message}\n\n${USAGE}`);
+    }
+    const jid = targetJid(values.ref, positionals[0], "dm", "JID");
+    const viaRef = !!values.ref;
     const a = load();
     if (a.allowFrom.includes(jid)) {
-      process.stdout.write(`${jid} was already allowed.\n`);
+      process.stdout.write(
+        `${displayJid(jid, viaRef, "dm")} was already allowed.\n`,
+      );
       break;
     }
     a.allowFrom.push(jid);
-    save(a);
-    process.stdout.write(`Allowed ${jid}.\n`);
+    save(a, { backup: values.backup });
+    process.stdout.write(`Allowed ${displayJid(jid, viaRef, "dm")}.\n`);
     break;
   }
   case "remove": {
-    const jid = requireArg(rest[0], "JID");
+    let values, positionals;
+    try {
+      ({ values, positionals } = parseArgs({
+        args: rest,
+        options: { ref: { type: "string" }, backup: { type: "boolean" } },
+        allowPositionals: true,
+      }));
+    } catch (err) {
+      die(`${(err as Error).message}\n\n${USAGE}`);
+    }
+    const jid = targetJid(values.ref, positionals[0], "dm", "JID");
+    const viaRef = !!values.ref;
     const a = load();
-    if (!a.allowFrom.includes(jid)) die(`${jid} is not on the allowlist.`);
+    if (!a.allowFrom.includes(jid)) {
+      die(`${displayJid(jid, viaRef, "dm")} is not on the allowlist.`);
+    }
     a.allowFrom = a.allowFrom.filter((j) => j !== jid);
-    save(a);
+    save(a, { backup: values.backup });
     const outcome = revokeCachedIdentity(a.allowFrom, jid);
-    process.stdout.write(`Removed ${jid}.` + CACHE_NOTE[outcome] + "\n");
+    process.stdout.write(
+      `Removed ${displayJid(jid, viaRef, "dm")}.` + CACHE_NOTE[outcome] + "\n",
+    );
     break;
   }
   case "forget": {
@@ -887,14 +1280,25 @@ switch (command) {
     group(rest);
     break;
   case "wizard":
-    if (rest.includes("--revoke")) await wizardRevoke();
+    // --undo before --revoke: the flags are mutually exclusive and this is the
+    // only ordering that cannot silently open a revoke prompt for someone who
+    // asked to undo. `wizard --undo` is exactly `undo` - the wizard's own
+    // screens are untouched by this change.
+    if (rest.includes("--undo")) undo(rest.filter((f) => f !== "--undo"));
+    else if (rest.includes("--revoke")) await wizardRevoke();
     else await wizard(rest);
     break;
   case "candidates":
     candidates(rest);
     break;
   case "configured":
-    configured();
+    configured(rest);
+    break;
+  case "state":
+    state(rest);
+    break;
+  case "undo":
+    undo(rest);
     break;
   case "set":
     set(requireArg(rest[0], "key"), requireArg(rest[1], "value"));

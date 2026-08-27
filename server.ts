@@ -1305,6 +1305,11 @@ type GroupMeta = {
   // chats.upsert/update has been seen for this group.
   lastActivityAt?: number;
   updatedAt: number;
+  // Participant JIDs of a group the owner granted roster access to, written by
+  // the server (never by this script) - phone-resolved and normalised, names
+  // resolved here at read time through the contacts cache. Absent for every
+  // group without roster access.
+  members?: string[];
 };
 
 let groupsMeta: Record<string, GroupMeta> = {};
@@ -1395,6 +1400,9 @@ function applyChatArchive(
     lastActivityAt: existing?.lastActivityAt,
     archived,
     updatedAt: Date.now(),
+    // An archive toggle is not a membership change - carry a stored member
+    // list through, or it would be silently dropped by this rebuild.
+    ...(existing?.members ? { members: existing.members } : {}),
   };
   return true;
 }
@@ -1420,6 +1428,9 @@ function applyChatActivity(
       archived: existing?.archived ?? false,
       lastActivityAt: activityMs,
       updatedAt: Date.now(),
+      // An activity update is not a membership change - carry a stored member
+      // list through, or it would be silently dropped by this rebuild.
+      ...(existing?.members ? { members: existing.members } : {}),
     };
     return { groups: true, dms: false };
   }
@@ -1465,15 +1476,45 @@ async function refreshGroupsMeta(
   groupsMetaRefreshedAt = Date.now();
   const groups = Object.values(meta);
   let metaChanged = false;
+  // Which groups may have a member list persisted at all. Read once per
+  // refresh, from the CURRENT access.json, so a roster grant revoked since the
+  // last connect drops the stored members on the very next refresh.
+  const access = loadAccess();
   for (const g of groups) {
     const name = g.subject || "(no name)";
     if (g.subject) groupNameCache[g.id] = g.subject;
     const existing = groupsMeta[g.id];
     const memberCount = g.participants?.length ?? 0;
+    // #12: the offline access.ts has no socket, so the contact pool it can
+    // offer has to include people the owner only knows through a group they
+    // granted roster access to. JIDs only - phone-resolved the same way
+    // group_roster does (Baileys hands the phone number back with the roster
+    // fetch itself), de-duplicated, sorted so an unchanged membership is
+    // byte-identical between refreshes, and never the owner's own JID.
+    // CACHE_CONTACTS gates it for the same reason it gates contacts.json and
+    // dm-activity.json: this is per-person data about someone who never
+    // messaged this account.
+    const wantsMembers = CACHE_CONTACTS && access.groups[g.id]?.roster === true;
+    const members = wantsMembers
+      ? [
+          ...new Set(
+            (g.participants ?? [])
+              .map((p) => contactKey(p.phoneNumber ?? p.id))
+              .filter((jid) => jid && jid !== ownJid),
+          ),
+        ].sort()
+      : undefined;
+    const sameMembers =
+      members === undefined
+        ? existing?.members === undefined
+        : existing?.members !== undefined &&
+          existing.members.length === members.length &&
+          existing.members.every((m, i) => m === members[i]);
     if (
       !existing ||
       existing.name !== name ||
-      existing.memberCount !== memberCount
+      existing.memberCount !== memberCount ||
+      !sameMembers
     ) {
       groupsMeta[g.id] = {
         name,
@@ -1481,6 +1522,7 @@ async function refreshGroupsMeta(
         archived: existing?.archived ?? false,
         lastActivityAt: existing?.lastActivityAt,
         updatedAt: Date.now(),
+        ...(members ? { members } : {}),
       };
       metaChanged = true;
     }

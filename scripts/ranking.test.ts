@@ -2,12 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { groupAnchor } from "./mask";
 import {
   contactKeyFor,
+  diffAccess,
   filterCandidates,
   listConfiguredDms,
   listConfiguredGroups,
   normalizeJid,
+  publicCandidates,
   rankDms,
   rankGroups,
+  refFor,
+  rosterMemberPool,
   type GroupMeta,
 } from "./ranking";
 import type { ContactsMap } from "./contacts";
@@ -79,6 +83,153 @@ describe("normalizeJid", () => {
     expect(normalizeJid("120363424405607157@g.us")).toBe(
       "120363424405607157@g.us",
     );
+  });
+});
+
+describe("refFor", () => {
+  test("the same JID twice produces the same ref", () => {
+    expect(refFor("61403911675@s.whatsapp.net")).toBe(
+      refFor("61403911675@s.whatsapp.net"),
+    );
+  });
+
+  test("12 lowercase hex characters", () => {
+    expect(refFor("61403911675@s.whatsapp.net")).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  test("different JIDs produce different refs", () => {
+    expect(refFor("61403911675@s.whatsapp.net")).not.toBe(
+      refFor("61432609386@s.whatsapp.net"),
+    );
+  });
+
+  test("a device suffix and an _agent suffix produce the SAME ref as the bare JID", () => {
+    const bare = refFor("61403911675@s.whatsapp.net");
+    expect(refFor("61403911675:5@s.whatsapp.net")).toBe(bare);
+    expect(refFor("61403911675_9@s.whatsapp.net")).toBe(bare);
+  });
+
+  test("an @lid form and its mapped phone form produce DIFFERENT refs - no LID resolution in refFor", () => {
+    expect(refFor("184710990000999@lid")).not.toBe(
+      refFor("61403911675@s.whatsapp.net"),
+    );
+  });
+});
+
+describe("publicCandidates", () => {
+  test("returns exactly ref/label/description, no jid", () => {
+    const meta = { "a@g.us": group({ name: "Alpha" }) };
+    const candidates = rankGroups(meta, new Set(), false);
+    const result = publicCandidates(candidates);
+    expect(result).toEqual([
+      {
+        ref: refFor("a@g.us"),
+        label: "Alpha  (1 member(s))",
+        description: "a@g.us",
+      },
+    ]);
+    expect(Object.keys(result[0]).sort()).toEqual([
+      "description",
+      "label",
+      "ref",
+    ]);
+  });
+});
+
+describe("diffAccess", () => {
+  test("additions and removals in both pools", () => {
+    const prev = { allowFrom: ["a@s.whatsapp.net"], groups: { "g1@g.us": {} } };
+    const next = {
+      allowFrom: ["b@s.whatsapp.net"],
+      groups: { "g2@g.us": {} },
+    };
+    expect(diffAccess(prev, next)).toEqual({
+      added: { groups: ["g2@g.us"], dms: ["b@s.whatsapp.net"] },
+      removed: { groups: ["g1@g.us"], dms: ["a@s.whatsapp.net"] },
+    });
+  });
+
+  test("identical snapshots produce four empty arrays", () => {
+    const snap = { allowFrom: ["a@s.whatsapp.net"], groups: { "g1@g.us": {} } };
+    expect(diffAccess(snap, snap)).toEqual({
+      added: { groups: [], dms: [] },
+      removed: { groups: [], dms: [] },
+    });
+  });
+
+  test("two snapshots with neither allowFrom nor groups present produce four empty arrays", () => {
+    expect(diffAccess({}, {})).toEqual({
+      added: { groups: [], dms: [] },
+      removed: { groups: [], dms: [] },
+    });
+  });
+
+  test("returned arrays are sorted", () => {
+    const prev = { allowFrom: [], groups: {} };
+    const next = {
+      allowFrom: ["z@s.whatsapp.net", "a@s.whatsapp.net"],
+      groups: { "z@g.us": {}, "a@g.us": {} },
+    };
+    const result = diffAccess(prev, next);
+    expect(result.added.dms).toEqual(["a@s.whatsapp.net", "z@s.whatsapp.net"]);
+    expect(result.added.groups).toEqual(["a@g.us", "z@g.us"]);
+  });
+
+  test("a group whose roster flag flipped but whose key is present in both is in neither bucket", () => {
+    const prev = { allowFrom: [], groups: { "g1@g.us": { roster: false } } };
+    const next = { allowFrom: [], groups: { "g1@g.us": { roster: true } } };
+    expect(diffAccess(prev, next)).toEqual({
+      added: { groups: [], dms: [] },
+      removed: { groups: [], dms: [] },
+    });
+  });
+
+  test("duplicate allowFrom entries do not produce a phantom add", () => {
+    const prev = { allowFrom: ["a@s.whatsapp.net"], groups: {} };
+    const next = {
+      allowFrom: ["a@s.whatsapp.net", "a@s.whatsapp.net"],
+      groups: {},
+    };
+    expect(diffAccess(prev, next)).toEqual({
+      added: { groups: [], dms: [] },
+      removed: { groups: [], dms: [] },
+    });
+  });
+});
+
+describe("rosterMemberPool", () => {
+  test("only roster: true groups contribute", () => {
+    const meta = {
+      "a@g.us": group({ members: ["m1@s.whatsapp.net"] }),
+      "b@g.us": group({ members: ["m2@s.whatsapp.net"] }),
+    };
+    const groups = { "a@g.us": { roster: true }, "b@g.us": { roster: false } };
+    expect(rosterMemberPool(meta, groups)).toEqual(["m1@s.whatsapp.net"]);
+  });
+
+  test("a roster: true group with no members key contributes nothing", () => {
+    const meta = { "a@g.us": group() };
+    const groups = { "a@g.us": { roster: true } };
+    expect(rosterMemberPool(meta, groups)).toEqual([]);
+  });
+
+  test("a members array on a group whose access entry has no roster is ignored", () => {
+    const meta = { "a@g.us": group({ members: ["m1@s.whatsapp.net"] }) };
+    const groups = { "a@g.us": {} };
+    expect(rosterMemberPool(meta, groups)).toEqual([]);
+  });
+
+  test("members shared by two roster groups appear once", () => {
+    const meta = {
+      "a@g.us": group({ members: ["m1@s.whatsapp.net", "m2@s.whatsapp.net"] }),
+      "b@g.us": group({ members: ["m2@s.whatsapp.net", "m3@s.whatsapp.net"] }),
+    };
+    const groups = { "a@g.us": { roster: true }, "b@g.us": { roster: true } };
+    expect(rosterMemberPool(meta, groups)).toEqual([
+      "m1@s.whatsapp.net",
+      "m2@s.whatsapp.net",
+      "m3@s.whatsapp.net",
+    ]);
   });
 });
 
@@ -209,7 +360,12 @@ describe("rankDms", () => {
     const contacts: ContactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
     const result = rankDms(activity, contacts, [], {}, 10);
     expect(result).toEqual([
-      { jid: "x@s.whatsapp.net", label: "Akash", description: "•••••" },
+      {
+        jid: "x@s.whatsapp.net",
+        ref: refFor("x@s.whatsapp.net"),
+        label: "Akash",
+        description: "•••••",
+      },
     ]);
   });
 
@@ -219,6 +375,7 @@ describe("rankDms", () => {
     expect(result).toEqual([
       {
         jid: "61403911675@s.whatsapp.net",
+        ref: refFor("61403911675@s.whatsapp.net"),
         label: "•••••1675",
         description: "•••••1675",
       },
@@ -234,6 +391,7 @@ describe("rankDms", () => {
     expect(result).toEqual([
       {
         jid: "61403911675@s.whatsapp.net",
+        ref: refFor("61403911675@s.whatsapp.net"),
         label: "•••••1675",
         description: "•••••1675",
       },
@@ -252,6 +410,7 @@ describe("rankDms", () => {
     expect(result).toEqual([
       {
         jid: "61403911675@s.whatsapp.net",
+        ref: refFor("61403911675@s.whatsapp.net"),
         label: "Mum (unverified) - •••••1675",
         description: "•••••1675",
       },
@@ -265,7 +424,12 @@ describe("rankDms", () => {
     };
     const result = rankDms(activity, contacts, [], {}, 10);
     expect(result).toEqual([
-      { jid: "x@s.whatsapp.net", label: "Akash", description: "•••••" },
+      {
+        jid: "x@s.whatsapp.net",
+        ref: refFor("x@s.whatsapp.net"),
+        label: "Akash",
+        description: "•••••",
+      },
     ]);
   });
 
@@ -300,6 +464,69 @@ describe("rankDms", () => {
     };
     const result = rankDms(activity, contacts, [], {});
     expect(new Set(result.map((c) => c.label)).size).toBe(2);
+  });
+
+  describe("with a member pool", () => {
+    test("a member with no DM activity appears and sorts after every chat that has activity", () => {
+      const activity = { "old@s.whatsapp.net": 5 };
+      const result = rankDms(activity, {}, [], {}, Infinity, [
+        "member@s.whatsapp.net",
+      ]);
+      expect(result.map((c) => c.jid)).toEqual([
+        "old@s.whatsapp.net",
+        "member@s.whatsapp.net",
+      ]);
+    });
+
+    test("a member already on allowFrom never appears, including via their @lid form", () => {
+      const lidMap = { "184710990000999@lid": "member@s.whatsapp.net" };
+      const result = rankDms(
+        {},
+        {},
+        ["184710990000999@lid"],
+        lidMap,
+        Infinity,
+        ["member@s.whatsapp.net"],
+      );
+      expect(result).toEqual([]);
+    });
+
+    test("a member who also has DM activity appears once and keeps their activity position", () => {
+      const activity = {
+        "member@s.whatsapp.net": 200,
+        "other@s.whatsapp.net": 100,
+      };
+      const result = rankDms(activity, {}, [], {}, Infinity, [
+        "member@s.whatsapp.net",
+      ]);
+      expect(result.map((c) => c.jid)).toEqual([
+        "member@s.whatsapp.net",
+        "other@s.whatsapp.net",
+      ]);
+    });
+
+    test("a member with a saved contact name is labelled by name, one with none renders as the masked number", () => {
+      const contacts: ContactsMap = {
+        "61403911675@s.whatsapp.net": { name: "Akash" },
+      };
+      const result = rankDms({}, contacts, [], {}, Infinity, [
+        "61403911675@s.whatsapp.net",
+        "61432609386@s.whatsapp.net",
+      ]);
+      expect(
+        result.find((c) => c.jid === "61403911675@s.whatsapp.net")?.label,
+      ).toBe("Akash");
+      expect(
+        result.find((c) => c.jid === "61432609386@s.whatsapp.net")?.label,
+      ).toBe("•••••9386");
+    });
+
+    test("an empty member pool leaves the existing ordering byte-identical to the pre-change result", () => {
+      const activity = { "a@s.whatsapp.net": 1, "b@s.whatsapp.net": 2 };
+      const withoutArg = rankDms(activity, {}, [], {}, 10);
+      const withEmptyPool = rankDms(activity, {}, [], {}, 10, []);
+      expect(withEmptyPool).toEqual(withoutArg);
+    });
   });
 });
 
@@ -432,6 +659,7 @@ describe("listConfiguredGroups", () => {
     expect(result).toEqual([
       {
         jid: "a@g.us",
+        ref: refFor("a@g.us"),
         label: "Alpha  (1 member(s))  [archived]",
         description: "a@g.us",
       },
@@ -444,6 +672,7 @@ describe("listConfiguredGroups", () => {
     expect(result).toEqual([
       {
         jid: "unknown@g.us",
+        ref: refFor("unknown@g.us"),
         label: "unknown@g.us",
         description: "unknown@g.us",
       },
@@ -470,7 +699,12 @@ describe("listConfiguredDms", () => {
     const contacts: ContactsMap = { "x@s.whatsapp.net": { name: "Akash" } };
     const result = listConfiguredDms(["x@s.whatsapp.net"], contacts, {});
     expect(result).toEqual([
-      { jid: "x@s.whatsapp.net", label: "Akash", description: "•••••" },
+      {
+        jid: "x@s.whatsapp.net",
+        ref: refFor("x@s.whatsapp.net"),
+        label: "Akash",
+        description: "•••••",
+      },
     ]);
   });
 
@@ -486,6 +720,7 @@ describe("listConfiguredDms", () => {
     expect(result).toEqual([
       {
         jid: "61403911675@s.whatsapp.net",
+        ref: refFor("61403911675@s.whatsapp.net"),
         label: "Mum (unverified) - •••••1675",
         description: "•••••1675",
       },
@@ -504,6 +739,7 @@ describe("listConfiguredDms", () => {
     expect(result).toEqual([
       {
         jid: "61403911675@s.whatsapp.net",
+        ref: refFor("61403911675@s.whatsapp.net"),
         label: "•••••1675",
         description: "•••••1675",
       },
@@ -515,6 +751,7 @@ describe("listConfiguredDms", () => {
     expect(result).toEqual([
       {
         jid: "61403911675@s.whatsapp.net",
+        ref: refFor("61403911675@s.whatsapp.net"),
         label: "•••••1675",
         description: "•••••1675",
       },
@@ -530,6 +767,7 @@ describe("listConfiguredDms", () => {
     expect(result).toEqual([
       {
         jid: "184710990000999@lid",
+        ref: refFor("184710990000999@lid"),
         label: "Akash",
         description: "•••••1675",
       },
@@ -669,6 +907,54 @@ describe("label disambiguation", () => {
     };
     const result = rankGroups(meta, new Set(), false, 5);
     expect(result.map((c) => c.jid)).toEqual(["111999@g.us", "222888@g.us"]);
+  });
+});
+
+// Every candidate list this module produces must carry a ref, and every ref
+// must be unique WITHIN one list - a shared ref would be exactly as
+// unresolvable as a shared label, just discovered later (at `allow --ref`
+// time instead of at pick time).
+describe("ref uniqueness across every candidate list", () => {
+  const groups = { "111999@g.us": {}, "222888@g.us": {} };
+  const meta = {
+    "111999@g.us": group({ name: "Team", memberCount: 4 }),
+    "222888@g.us": group({ name: "Team", memberCount: 4 }),
+  };
+  const activity = {
+    "61403911675@s.whatsapp.net": 200,
+    "61432609386@s.whatsapp.net": 100,
+  };
+  const contacts: ContactsMap = {
+    "61403911675@s.whatsapp.net": { name: "Alex" },
+    "61432609386@s.whatsapp.net": { name: "Alex" },
+  };
+  const allowFrom = [
+    "61403911675@s.whatsapp.net",
+    "61432609386@s.whatsapp.net",
+  ];
+
+  test("rankGroups", () => {
+    const result = rankGroups(meta, new Set(), false);
+    expect(result.every((c) => typeof c.ref === "string")).toBe(true);
+    expect(new Set(result.map((c) => c.ref)).size).toBe(result.length);
+  });
+
+  test("listConfiguredGroups", () => {
+    const result = listConfiguredGroups(groups, meta);
+    expect(result.every((c) => typeof c.ref === "string")).toBe(true);
+    expect(new Set(result.map((c) => c.ref)).size).toBe(result.length);
+  });
+
+  test("rankDms", () => {
+    const result = rankDms(activity, contacts, [], {}, 10);
+    expect(result.every((c) => typeof c.ref === "string")).toBe(true);
+    expect(new Set(result.map((c) => c.ref)).size).toBe(result.length);
+  });
+
+  test("listConfiguredDms", () => {
+    const result = listConfiguredDms(allowFrom, contacts, {});
+    expect(result.every((c) => typeof c.ref === "string")).toBe(true);
+    expect(new Set(result.map((c) => c.ref)).size).toBe(result.length);
   });
 });
 

@@ -89,6 +89,8 @@ With it off, name resolution and masking still work for the lifetime of the runn
 
 This is a **best-effort mitigation, not a hard guarantee**: it depends on a saved contact actually being a name and not, say, a phone number typed into the name field, and on `.notify` not being trusted in place of it (checked explicitly for group rosters — see below). If you'd rather no name data ever reaches an AI model at all, don't grant any group `roster` access and use raw JIDs/numbers in `mentions` instead of names.
 
+The in-session review and manage screens go one step further: the JSON they read carries an opaque per-entry reference instead of the JID, so a contact's number never enters the session at all — only a saved name, or the masked form.
+
 ## Group roster & @all mentions
 
 `group_roster` (an MCP tool) and `"all"` (a reserved value in the `reply` tool's `mentions` array) both require a group's `roster` flag — separate from whether Claude can act in the group at all, so you can let Claude reply in a large group without ever handing it the member list.
@@ -98,9 +100,13 @@ This is a **best-effort mitigation, not a hard guarantee**: it depends on a save
 
 Both fail with a clear error if the group's `roster` flag isn't granted.
 
+A group with roster access also has its member list (JIDs only, no names) cached in `groups-meta.json`, so those members can be offered as allowlist candidates during setup even if they have never messaged you — it follows `WHATSAPP_CACHE_CONTACTS`, is written only while the flag is on, disappears from the cache on the next refresh after you revoke the flag, and refreshes when the server connects or `list_groups` runs.
+
 ## Guided bulk setup (wizard)
 
 `bun scripts/access.ts wizard` shows a checkbox screen of your **5 most recently active groups** and a second one for your **10 most recently active DM contacts** — the same recency signal the WhatsApp app itself sorts its own chat list by — so review stays to one screen each instead of scaling with how many groups or contacts you actually have. Navigate with the arrow keys, toggle with space, submit with enter.
+
+The in-session `/whatsapp-channel:access review` covers the same ground without leaving the session: it shows groups and contacts three at a time, searches the whole cached pool when you type part of a name, folds removals into the same pass, and shows you the complete list of additions and removals to approve before it writes anything. If you change your mind, `bun scripts/access.ts undo` (or `wizard --undo`) restores the access list from just before that run — one step back, access list only, caches not restored.
 
 - **Groups**: pick which ones Claude can reply in, then (only for the ones you just picked) a second checkbox for which also get roster access.
 - **Contacts**: pick which ones can message Claude — added straight to the allowlist, no second question.

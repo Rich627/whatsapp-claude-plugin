@@ -1,8 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { refFor } from "./ranking";
 
 const CLI = join(import.meta.dir, "access.ts");
 
@@ -71,6 +78,7 @@ function writeGroupsMeta(
       archived: boolean;
       lastActivityAt?: number;
       updatedAt: number;
+      members?: string[];
     }
   >,
 ): void {
@@ -818,11 +826,11 @@ describe("candidates (JSON for the in-session review screen)", () => {
     expect(parsed.dms.total).toBe(5);
     // Ranked, so a caller showing four at a time still shows the four that
     // matter first.
-    expect(parsed.groups.items[0].jid).toBe("6@g.us");
-    expect(parsed.dms.items[0].jid).toBe("5@s.whatsapp.net");
+    expect(parsed.groups.items[0].ref).toBe(refFor("6@g.us"));
+    expect(parsed.dms.items[0].ref).toBe(refFor("5@s.whatsapp.net"));
   });
 
-  test("every option carries the jid, label and description the screen needs", () => {
+  test("every option carries the ref, label and description the screen needs - never a jid", () => {
     const dir = freshStateDir();
     writeGroupsMeta(dir, {
       "120363424405607157@g.us": {
@@ -836,12 +844,12 @@ describe("candidates (JSON for the in-session review screen)", () => {
     writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Akash" } });
     const parsed = JSON.parse(run(dir, "candidates").out);
     expect(parsed.groups.items[0]).toEqual({
-      jid: "120363424405607157@g.us",
+      ref: refFor("120363424405607157@g.us"),
       label: "Team  (4 member(s))",
       description: "120363424405607157@g.us",
     });
     expect(parsed.dms.items[0]).toEqual({
-      jid: "61403911675@s.whatsapp.net",
+      ref: refFor("61403911675@s.whatsapp.net"),
       label: "Akash",
       // Masked, never the raw number - a full one in an option payload is
       // a real phone number written into the session transcript.
@@ -928,7 +936,11 @@ describe("configured (JSON for the in-session manage/revoke screen)", () => {
     run(dir, "group", "add", "ghost@g.us");
     const items = JSON.parse(run(dir, "configured").out).groups.items;
     expect(items).toEqual([
-      { jid: "ghost@g.us", label: "ghost@g.us", description: "ghost@g.us" },
+      {
+        ref: refFor("ghost@g.us"),
+        label: "ghost@g.us",
+        description: "ghost@g.us",
+      },
     ]);
   });
 
@@ -1039,4 +1051,417 @@ describe("wizard --revoke", () => {
       expect(res.out).toContain("No group or contact data was sent to any AI");
     },
   );
+});
+
+// #12/#14: the in-session review's opening screen (state) and the ref
+// handshake (--ref) that lets a model act on a candidate without ever
+// seeing a raw JID.
+describe("state (JSON for the in-session review's opening screen)", () => {
+  test("prints the four { items, total } blocks, no jid key, no raw number", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "120363424405607157@g.us": {
+        name: "Team",
+        memberCount: 4,
+        archived: false,
+        updatedAt: 0,
+      },
+    });
+    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
+    run(dir, "allow", "61432609386@s.whatsapp.net");
+    const { out, code } = run(dir, "state");
+    expect(code).toBe(0);
+    expect(out).not.toContain('"jid"');
+    expect(out).not.toContain("61403911675");
+    expect(out).not.toContain("61432609386");
+    const parsed = JSON.parse(out);
+    expect(parsed.groups.candidates.total).toBe(1);
+    expect(parsed.groups.configured.total).toBe(0);
+    expect(parsed.dms.candidates.total).toBe(1);
+    expect(parsed.dms.configured.total).toBe(1);
+    expect(parsed.groups.candidates.items[0]).toEqual({
+      ref: refFor("120363424405607157@g.us"),
+      label: "Team  (4 member(s))",
+      description: "120363424405607157@g.us",
+    });
+  });
+});
+
+describe("state flag parsing", () => {
+  test("an unknown flag exits 1, same strictness as candidates", () => {
+    const dir = freshStateDir();
+    expect(run(dir, "state", "--bogus").code).toBe(1);
+  });
+});
+
+describe("candidates --search", () => {
+  test("returns only label/description matches, still ranked", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "a@g.us": {
+        name: "Family",
+        memberCount: 3,
+        archived: false,
+        updatedAt: 0,
+      },
+      "b@g.us": { name: "Work", memberCount: 2, archived: false, updatedAt: 0 },
+    });
+    const parsed = JSON.parse(run(dir, "candidates", "--search", "family").out);
+    expect(parsed.groups.items).toHaveLength(1);
+    expect(parsed.groups.items[0].label).toBe("Family  (3 member(s))");
+    expect(parsed.groups.total).toBe(1);
+  });
+
+  test("is case-insensitive", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "a@g.us": {
+        name: "Family",
+        memberCount: 3,
+        archived: false,
+        updatedAt: 0,
+      },
+    });
+    const parsed = JSON.parse(run(dir, "candidates", "--search", "FAMILY").out);
+    expect(parsed.groups.items).toHaveLength(1);
+    expect(parsed.groups.items[0].label).toBe("Family  (3 member(s))");
+  });
+
+  test("a term matching nothing returns empty items, total 0, exit 0", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "a@g.us": {
+        name: "Family",
+        memberCount: 3,
+        archived: false,
+        updatedAt: 0,
+      },
+    });
+    const { out, code } = run(dir, "candidates", "--search", "nonexistent");
+    expect(code).toBe(0);
+    const parsed = JSON.parse(out);
+    expect(parsed.groups.items).toEqual([]);
+    expect(parsed.groups.total).toBe(0);
+  });
+
+  test("--search composes with --include-archived", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "a@g.us": {
+        name: "Family",
+        memberCount: 3,
+        archived: true,
+        updatedAt: 0,
+      },
+    });
+    expect(
+      JSON.parse(run(dir, "candidates", "--search", "family").out).groups.total,
+    ).toBe(0);
+    expect(
+      JSON.parse(
+        run(dir, "candidates", "--search", "family", "--include-archived").out,
+      ).groups.total,
+    ).toBe(1);
+  });
+
+  test("an unknown flag still exits 1", () => {
+    const dir = freshStateDir();
+    expect(run(dir, "candidates", "--bogus").code).toBe(1);
+  });
+});
+
+describe("configured --search", () => {
+  test("filters the configured pool the same way candidates --search does", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "a@g.us": {
+        name: "Family",
+        memberCount: 3,
+        archived: false,
+        updatedAt: 0,
+      },
+      "b@g.us": { name: "Work", memberCount: 2, archived: false, updatedAt: 0 },
+    });
+    run(dir, "group", "add", "a@g.us");
+    run(dir, "group", "add", "b@g.us");
+    const parsed = JSON.parse(run(dir, "configured", "--search", "family").out);
+    expect(parsed.groups.items).toHaveLength(1);
+    expect(parsed.groups.items[0].label).toBe("Family  (3 member(s))");
+    expect(parsed.groups.total).toBe(1);
+  });
+
+  test("a term matching nothing returns empty items, total 0, exit 0", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    const { out, code } = run(dir, "configured", "--search", "nonexistent");
+    expect(code).toBe(0);
+    const parsed = JSON.parse(out);
+    expect(parsed.dms.items).toEqual([]);
+    expect(parsed.dms.total).toBe(0);
+  });
+
+  test("an unknown flag still exits 1", () => {
+    const dir = freshStateDir();
+    expect(run(dir, "configured", "--bogus").code).toBe(1);
+  });
+});
+
+describe("--ref resolution", () => {
+  test("a ref taken from state resolves back to the right JID via allow --ref", () => {
+    const dir = freshStateDir();
+    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
+    const parsed = JSON.parse(run(dir, "state").out);
+    const ref = parsed.dms.candidates.items[0].ref;
+    expect(run(dir, "allow", "--ref", ref).code).toBe(0);
+    expect(access(dir).allowFrom).toEqual(["61403911675@s.whatsapp.net"]);
+  });
+
+  test("the same ref is stable across a second state run", () => {
+    const dir = freshStateDir();
+    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
+    const first = JSON.parse(run(dir, "state").out).dms.candidates.items[0].ref;
+    const second = JSON.parse(run(dir, "state").out).dms.candidates.items[0]
+      .ref;
+    expect(second).toBe(first);
+  });
+
+  test("remove --ref on a contact allowlisted under their @lid form removes that exact string, not the phone form", () => {
+    const dir = freshStateDir();
+    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
+    run(dir, "allow", "184710990000999@lid");
+    run(dir, "allow", "61403911675@s.whatsapp.net");
+    const items = JSON.parse(run(dir, "configured").out).dms.items;
+    const lidItem = items.find(
+      (c: { ref: string }) => c.ref === refFor("184710990000999@lid"),
+    );
+    expect(run(dir, "remove", "--ref", lidItem.ref).code).toBe(0);
+    expect(access(dir).allowFrom).toEqual(["61403911675@s.whatsapp.net"]);
+  });
+
+  test("group add --ref and group rm --ref act on the right group", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "a@g.us": { name: "Team", memberCount: 2, archived: false, updatedAt: 0 },
+    });
+    const ref = JSON.parse(run(dir, "state").out).groups.candidates.items[0]
+      .ref;
+    expect(run(dir, "group", "add", "--ref", ref).code).toBe(0);
+    expect(access(dir).groups["a@g.us"]).toBeDefined();
+    expect(run(dir, "group", "rm", "--ref", ref).code).toBe(0);
+    expect(access(dir).groups["a@g.us"]).toBeUndefined();
+  });
+
+  test("allow --ref on a group ref exits 1 and writes nothing", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "a@g.us": { name: "Team", memberCount: 2, archived: false, updatedAt: 0 },
+    });
+    const ref = JSON.parse(run(dir, "state").out).groups.candidates.items[0]
+      .ref;
+    const res = run(dir, "allow", "--ref", ref);
+    expect(res.code).toBe(1);
+    expect(res.out).toContain("is a group, not a contact");
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
+  });
+
+  test("remove --ref on an unknown ref exits 1", () => {
+    const dir = freshStateDir();
+    expect(run(dir, "remove", "--ref", "deadbeef0000").code).toBe(1);
+  });
+
+  test("a ref matching more than one allowlisted entry dies as ambiguous and writes nothing", () => {
+    // Two distinct allowFrom strings that normalizeJid collapses to the same
+    // JID (bare vs. device-suffixed) hash to the SAME ref, since refFor
+    // normalizes internally - the one realistic way two different pool
+    // entries can share a ref without forging a hash collision.
+    const dir = freshStateDir();
+    run(dir, "allow", "61403911675@s.whatsapp.net");
+    run(dir, "allow", "61403911675:5@s.whatsapp.net");
+    const ref = refFor("61403911675@s.whatsapp.net");
+    const before = access(dir);
+    const res = run(dir, "remove", "--ref", ref);
+    expect(res.code).toBe(1);
+    expect(res.out).toContain("ambiguous");
+    expect(access(dir)).toEqual(before);
+  });
+
+  test("passing both a positional JID and --ref exits 1", () => {
+    const dir = freshStateDir();
+    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
+    const ref = JSON.parse(run(dir, "state").out).dms.candidates.items[0].ref;
+    expect(run(dir, "allow", "1@s.whatsapp.net", "--ref", ref).code).toBe(1);
+  });
+});
+
+// A ref exists so a raw JID never has to reach the model - the confirmation
+// line of the command it drives must hold to that too, not just the JSON.
+describe("--ref confirmations never print a raw number", () => {
+  test("allow --ref prints the masked form, not the raw JID", () => {
+    const dir = freshStateDir();
+    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
+    const ref = JSON.parse(run(dir, "state").out).dms.candidates.items[0].ref;
+    const res = run(dir, "allow", "--ref", ref);
+    expect(res.code).toBe(0);
+    expect(res.out).not.toContain("@s.whatsapp.net");
+    expect(res.out).not.toContain("61403911675");
+  });
+
+  test("remove --ref prints the masked form, not the raw JID", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "61403911675@s.whatsapp.net");
+    const ref = JSON.parse(run(dir, "configured").out).dms.items[0].ref;
+    const res = run(dir, "remove", "--ref", ref);
+    expect(res.code).toBe(0);
+    expect(res.out).not.toContain("@s.whatsapp.net");
+    expect(res.out).not.toContain("61403911675");
+  });
+
+  test("a positional JID (typed by a human) still prints unmasked, as before", () => {
+    const dir = freshStateDir();
+    const res = run(dir, "allow", "61403911675@s.whatsapp.net");
+    expect(res.out).toContain("Allowed 61403911675@s.whatsapp.net.");
+  });
+
+  test("group add --ref / group rm --ref print the group JID (not personal for a modern group), never a raw contact number", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "a@g.us": { name: "Team", memberCount: 2, archived: false, updatedAt: 0 },
+    });
+    const ref = JSON.parse(run(dir, "state").out).groups.candidates.items[0]
+      .ref;
+    const added = run(dir, "group", "add", "--ref", ref);
+    expect(added.code).toBe(0);
+    const removed = run(dir, "group", "rm", "--ref", ref);
+    expect(removed.code).toBe(0);
+    expect(added.out).not.toContain("@s.whatsapp.net");
+    expect(removed.out).not.toContain("@s.whatsapp.net");
+  });
+});
+
+describe("--backup", () => {
+  test("allow <jid> --backup creates access.json.bak holding the pre-write content", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    const before = readFileSync(join(dir, "access.json"), "utf8");
+    run(dir, "allow", "2@s.whatsapp.net", "--backup");
+    expect(readFileSync(join(dir, "access.json.bak"), "utf8")).toBe(before);
+  });
+
+  test("without --backup no .bak file exists", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    expect(existsSync(join(dir, "access.json.bak"))).toBe(false);
+  });
+
+  test("a second --backup overwrites it (documented behaviour)", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    run(dir, "allow", "2@s.whatsapp.net", "--backup");
+    const afterFirstBackup = readFileSync(join(dir, "access.json"), "utf8");
+    run(dir, "allow", "3@s.whatsapp.net", "--backup");
+    expect(readFileSync(join(dir, "access.json.bak"), "utf8")).toBe(
+      afterFirstBackup,
+    );
+  });
+});
+
+describe("undo", () => {
+  test("no .bak: prints the nothing-to-undo line, exit 0, access.json byte-identical", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    const before = readFileSync(join(dir, "access.json"), "utf8");
+    const res = run(dir, "undo", "--dry-run");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("No previous access file - nothing to undo");
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
+  });
+
+  test("a misspelled --dry-run flag is refused instead of performing a real undo", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    run(dir, "allow", "--backup", "2@s.whatsapp.net");
+    const before = readFileSync(join(dir, "access.json"), "utf8");
+    const res = run(dir, "undo", "--dryrun");
+    expect(res.code).not.toBe(0);
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
+  });
+
+  test("group add --ref on a legacy <phone>-<ts>@g.us group masks the number in the config path line too", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "61403911675-1610000000@g.us": {
+        name: "Legacy",
+        memberCount: 3,
+        archived: false,
+        updatedAt: 1,
+      },
+    });
+    const cand = JSON.parse(run(dir, "candidates").out);
+    const ref = cand.groups.items[0].ref;
+    const res = run(dir, "group", "add", "--ref", ref, "--mention");
+    expect(res.code).toBe(0);
+    expect(res.out).not.toContain("61403911675");
+    expect(res.out).toContain("config.md");
+  });
+
+  test("--dry-run after a backed-up change prints a +/- line per changed entry, no raw number, modifies neither file", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "61403911675@s.whatsapp.net");
+    run(dir, "allow", "61432609386@s.whatsapp.net", "--backup");
+    const accessBefore = readFileSync(join(dir, "access.json"), "utf8");
+    const bakBefore = readFileSync(join(dir, "access.json.bak"), "utf8");
+    const res = run(dir, "undo", "--dry-run");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("+");
+    expect(res.out).toContain("-");
+    expect(res.out).not.toContain("61403911675");
+    expect(res.out).not.toContain("61432609386");
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(accessBefore);
+    expect(readFileSync(join(dir, "access.json.bak"), "utf8")).toBe(bakBefore);
+  });
+
+  test("restores the previous access.json; a second undo puts the change back (swap semantics)", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    const beforeChange = readFileSync(join(dir, "access.json"), "utf8");
+    run(dir, "allow", "2@s.whatsapp.net", "--backup");
+    const afterChange = readFileSync(join(dir, "access.json"), "utf8");
+
+    expect(run(dir, "undo").code).toBe(0);
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(beforeChange);
+
+    expect(run(dir, "undo").code).toBe(0);
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(afterChange);
+  });
+
+  test("access.json missing but .bak present (a corrupt file deleted per load()'s own advice): restores instead of crashing", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    run(dir, "allow", "2@s.whatsapp.net", "--backup");
+    const bak = readFileSync(join(dir, "access.json.bak"), "utf8");
+    rmSync(join(dir, "access.json"));
+
+    const dry = run(dir, "undo", "--dry-run");
+    expect(dry.code).toBe(0);
+    expect(dry.out).toContain("+");
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
+
+    const res = run(dir, "undo");
+    expect(res.code).toBe(0);
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(bak);
+  });
+
+  test("wizard --undo produces the same output as undo and never blocks on a prompt", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    run(dir, "allow", "2@s.whatsapp.net", "--backup");
+    const dir2 = freshStateDir();
+    run(dir2, "allow", "1@s.whatsapp.net");
+    run(dir2, "allow", "2@s.whatsapp.net", "--backup");
+
+    const viaUndo = run(dir, "undo", "--dry-run");
+    const viaWizard = run(dir2, "wizard", "--undo", "--dry-run");
+    expect(viaWizard.code).toBe(0);
+    expect(viaWizard.out).toBe(viaUndo.out);
+  });
 });
