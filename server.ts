@@ -2629,10 +2629,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           {
             name: "catch_up",
             description:
-              'Recover conversation context after a restart. For every chat with a line still in the log (up to 7 days of context; a message addressed to you lives 24h), returns the recent messages in BOTH directions (sender name for incoming, "You" for a reply this agent sent, and the owner\'s own name for a message they typed on their phone — those show only their most recent hour, older ones read "replied (text expired)"), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
+              'Recover conversation context. Pass `chat` (a chat_id, or part of a group or contact name, case-insensitive) to get ONE chat - do this before drafting a message to someone, so the room is in view without dumping every chat. Without `chat`: every chat. For every chat with a line still in the log (up to 7 days of context; a message addressed to you lives 24h), returns the recent messages in BOTH directions (sender name for incoming, "You" for a reply this agent sent, and the owner\'s own name for a message they typed on their phone — those show only their most recent hour, older ones read "replied (text expired)"), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
             inputSchema: {
               type: "object",
-              properties: {},
+              properties: {
+                chat: {
+                  type: "string",
+                  description:
+                    "Optional: a chat_id, or part of a group/contact name (case-insensitive). Only that chat is returned.",
+                },
+              },
             },
           },
           {
@@ -3005,11 +3011,22 @@ const handleToolCall = async (req: {
         const byChat = getRecentByChat();
         const sections: string[] = [];
         const owner = ownerDisplayName();
+        // One chat on request: the owner drafts a message to someone and
+        // wants that room in view, not every chat they have (2026-08-27).
+        const want = String(args.chat ?? "")
+          .trim()
+          .toLowerCase();
         for (const [chatId, { entries, unreplied }] of byChat) {
           const name =
             entries.find((e) => e.group_name)?.group_name ??
             entries.find((e) => (e.direction ?? "in") === "in")?.user ??
             chatId;
+          if (
+            want &&
+            chatId.toLowerCase() !== want &&
+            !name.toLowerCase().includes(want)
+          )
+            continue;
           const header = `=== ${name} (chat_id=${chatId})${unreplied ? ` — ${unreplied} unreplied` : ""} ===`;
           const lines = entries.map((e) => {
             const view = renderLogEntry(e, owner);
@@ -3022,7 +3039,9 @@ const handleToolCall = async (req: {
         }
         let text = sections.length
           ? sections.join("\n\n")
-          : "No chat activity on record.";
+          : want
+            ? `No chat on record matching "${want}".`
+            : "No chat activity on record.";
         try {
           if (existsSync(TASKS_FILE)) {
             const open = readFileSync(TASKS_FILE, "utf8")
