@@ -250,7 +250,11 @@ describe("rankGroups", () => {
 describe("rankDms", () => {
   test("orders by most recent activity first", () => {
     const activity = { "old@s.whatsapp.net": 100, "new@s.whatsapp.net": 200 };
-    const result = rankDms(activity, {}, [], {}, 10);
+    const named: ContactsMap = {
+      "old@s.whatsapp.net": { name: "Old" },
+      "new@s.whatsapp.net": { name: "New" },
+    };
+    const result = rankDms(activity, named, [], {}, 10);
     expect(result.map((c) => c.jid)).toEqual([
       "new@s.whatsapp.net",
       "old@s.whatsapp.net",
@@ -278,9 +282,14 @@ describe("rankDms", () => {
     ]);
   });
 
-  test("shows a masked number when no name is known", () => {
+  test("a number with no saved name is not offered as a candidate at all", () => {
+    // Owner's rule: not worth saving on the phone = not worth a row here.
     const activity = { "61403911675@s.whatsapp.net": 100 };
-    const result = rankDms(activity, {}, [], {}, 10);
+    expect(rankDms(activity, {}, [], {}, 10)).toEqual([]);
+  });
+
+  test("an ALLOWED number with no saved name is still listed (masked) so it can be revoked", () => {
+    const result = listConfiguredDms(["61403911675@s.whatsapp.net"], {}, {});
     expect(result).toEqual([
       {
         jid: "61403911675@s.whatsapp.net",
@@ -295,14 +304,13 @@ describe("rankDms", () => {
     const contacts: ContactsMap = {
       "61403911675@s.whatsapp.net": { notify: "61403911675" },
     };
-    const result = rankDms(activity, contacts, [], {}, 10);
-    expect(result).toEqual([
-      {
-        jid: "61403911675@s.whatsapp.net",
-        label: "•••••1675",
-        description: "•••••1675",
-      },
-    ]);
+    expect(rankDms(activity, contacts, [], {}, 10)).toEqual([]);
+    const allowed = listConfiguredDms(
+      ["61403911675@s.whatsapp.net"],
+      contacts,
+      {},
+    );
+    expect(allowed[0].label).toBe("•••••1675");
   });
 
   test("a notify-only label is marked unverified and paired with the masked number, not shown plain like a saved name", () => {
@@ -313,8 +321,15 @@ describe("rankDms", () => {
     const contacts: ContactsMap = {
       "61403911675@s.whatsapp.net": { notify: "Mum" },
     };
-    const result = rankDms(activity, contacts, [], {}, 10);
-    expect(result).toEqual([
+    // Never a candidate (no saved name)...
+    expect(rankDms(activity, contacts, [], {}, 10)).toEqual([]);
+    // ...and if already allowed, labelled as unverified, never plain.
+    const allowed = listConfiguredDms(
+      ["61403911675@s.whatsapp.net"],
+      contacts,
+      {},
+    );
+    expect(allowed).toEqual([
       {
         jid: "61403911675@s.whatsapp.net",
         label: "Mum (unverified) - •••••1675",
@@ -344,16 +359,23 @@ describe("rankDms", () => {
       "b@s.whatsapp.net": 2,
       "c@s.whatsapp.net": 3,
     };
-    expect(rankDms(activity, {}, [], {}, 2)).toHaveLength(2);
+    const named: ContactsMap = {
+      "a@s.whatsapp.net": { name: "A" },
+      "b@s.whatsapp.net": { name: "B" },
+      "c@s.whatsapp.net": { name: "C" },
+    };
+    expect(rankDms(activity, named, [], {}, 2)).toHaveLength(2);
   });
 
   test("omitting the limit returns the whole pool - the total the wizard discloses", () => {
     const activity: Record<string, number> = {};
+    const named: ContactsMap = {};
     for (let i = 1; i <= 12; i++) {
       activity[`${i}@s.whatsapp.net`] = i;
+      named[`${i}@s.whatsapp.net`] = { name: `Person ${i}` };
     }
-    expect(rankDms(activity, {}, [], {})).toHaveLength(12);
-    expect(rankDms(activity, {}, [], {}, 2)).toHaveLength(2);
+    expect(rankDms(activity, named, [], {})).toHaveLength(12);
+    expect(rankDms(activity, named, [], {}, 2)).toHaveLength(2);
   });
 
   test("labels are disambiguated across the WHOLE pool when uncapped", () => {
@@ -441,6 +463,7 @@ describe("rankDms", () => {
   test("the limit slices the combined pool, activity first", () => {
     const activity = { "61403911675@s.whatsapp.net": 100 };
     const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Recent" },
       "a@s.whatsapp.net": { name: "Alex" },
       "b@s.whatsapp.net": { name: "Bella" },
     };
@@ -763,7 +786,10 @@ describe("candidate descriptions", () => {
 
   test("a contact's description is the MASKED number, never the raw one", () => {
     const activity = { "61403911675@s.whatsapp.net": 100 };
-    const result = rankDms(activity, {}, [], {}, 10);
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Alex" },
+    };
+    const result = rankDms(activity, contacts, [], {}, 10);
     expect(result[0].description).toBe("•••••1675");
     expect(result[0].description).not.toContain("61403911675");
   });
@@ -796,7 +822,12 @@ describe("long names", () => {
     const contacts: ContactsMap = {
       "61403911675@s.whatsapp.net": { notify: long },
     };
-    const result = rankDms(activity, contacts, [], {}, 10);
+    expect(rankDms(activity, contacts, [], {}, 10)).toEqual([]);
+    const result = listConfiguredDms(
+      ["61403911675@s.whatsapp.net"],
+      contacts,
+      {},
+    );
     expect(result[0].label).toContain("(unverified) - •••••1675");
     expect(result[0].label.length).toBeLessThan(80);
   });

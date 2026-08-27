@@ -552,7 +552,13 @@ async function wizard(args: string[]): Promise<void> {
     // .notify-only entries is indistinguishable from a healthy one by size.
     const model: PickerModel = {
       dms: [
-        ...configuredDms.map((c) => buildItem(c, "dm", true)),
+        // Named grants first; an allowed number nobody saved sinks to the
+        // bottom (still shown - it must stay revocable).
+        ...[...configuredDms]
+          .sort(
+            (x, y) => Number(/^•/.test(x.label)) - Number(/^•/.test(y.label)),
+          )
+          .map((c) => buildItem(c, "dm", true)),
         ...dmCandidates.map((c) => buildItem(c, "dm", false)),
       ],
       groups: [

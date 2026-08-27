@@ -217,8 +217,18 @@ export function rankDms(
     allowFrom.map((jid) => contactKeyFor(lidMap, jid)),
   );
   const seen = new Set<string>();
+  // Owner's rule (2026-08-27): a number with no saved name is not worth a
+  // row - if it was not worth saving on the phone, it is not worth offering
+  // here. Only candidates are filtered; an already-allowed unnamed entry is
+  // still listed by listConfiguredDms so it can be revoked.
+  const hasSavedName = (jid: string) => {
+    const key = contactKeyFor(lidMap, jid);
+    const entry = contacts[jid] ?? contacts[key];
+    return Boolean(entry?.name && !looksLikeNumber(entry.name));
+  };
   const activityRows = Object.entries(activity)
     .filter(([jid]) => !alreadyAllowed.has(contactKeyFor(lidMap, jid)))
+    .filter(([jid]) => hasSavedName(jid))
     .sort(([aj, a], [bj, b]) => b - a || aj.localeCompare(bj))
     .map(([jid]) => {
       // Same key the address-book loop de-dupes on, so one person cached
