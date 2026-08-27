@@ -80,7 +80,7 @@ with no AI model involved.
    - Add or remove groups and contacts: `/whatsapp-channel:access review` —
      it opens the access screen in a new terminal window; you pick there, and
      this session is told only what changed.
-   - Rather do it entirely yourself: run <resolved absolute path> wizard in
+   - Rather do it entirely yourself: run `bun "<resolved absolute path>" wizard` in
      your own terminal.
 
    In that last line write the **resolved absolute path** to
