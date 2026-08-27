@@ -91,7 +91,7 @@ Names sync once, on first connect. WhatsApp hands a linked device the names you 
 
 This is a **best-effort mitigation, not a hard guarantee**: it depends on a saved contact actually being a name and not, say, a phone number typed into the name field, and on `.notify` not being trusted in place of it (checked explicitly for group rosters — see below). If you'd rather no name data ever reaches an AI model at all, don't grant any group `roster` access and use raw JIDs/numbers in `mentions` instead of names.
 
-The in-session review and manage screens go one step further: the JSON they read carries an opaque per-entry reference instead of the JID, so a contact's number never enters the session at all — only a saved name, or the masked form.
+The in-session `review` opens the same terminal screen in a new window, so the candidate lists never enter the session at all — only the `+`/`-` list comes back, by saved name or masked number.
 
 ## Group roster & @all mentions
 
@@ -101,8 +101,6 @@ The in-session review and manage screens go one step further: the JSON they read
 - **`"all"` in `mentions`** expands server-side to every current participant, fetched live from WhatsApp group metadata — so it mentions everyone even for members with no saved contact name, and however many there are. A saved contact literally named "All" is unaffected: name resolution always wins over the reserved value.
 
 Both fail with a clear error if the group's `roster` flag isn't granted.
-
-A group with roster access also has its member list (JIDs only, no names) cached in `groups-meta.json`, so those members can be offered as allowlist candidates during setup even if they have never messaged you — it follows `WHATSAPP_CACHE_CONTACTS`, is written only while the flag is on, disappears from the cache on the next refresh after you revoke the flag, and refreshes when the server connects or `list_groups` runs.
 
 ## Guided bulk setup (wizard)
 
@@ -128,7 +126,7 @@ it says so and exits, rather than hanging.
 No caps any more: both columns list everything on record and scroll - the search line
 is how you reach a long list without paging through it.
 
-The in-session `/whatsapp-channel:access review` covers the same ground without leaving the session: it shows groups and contacts three at a time, searches the whole cached pool when you type part of a name, folds removals into the same pass, and shows you the complete list of additions and removals to approve before it writes anything. If you change your mind, `bun scripts/access.ts undo` (or `wizard --undo`) restores the access list from just before that run — one step back, access list only, caches not restored.
+`/whatsapp-channel:access review` opens this same screen in a new terminal window, waits for you, and reports back only what changed; `bun scripts/access.ts undo` (or `wizard --undo`) is still the one step back.
 
 - Roster is still asked only for groups you are granting in this run - flag one with
   `r` while it is ticked. An already-granted group keeps whatever roster flag it has
@@ -157,7 +155,7 @@ habit or an old note does not break.
   granted access" below.
 - Ctrl-C cancels cleanly, and nothing is written until you approve the `+`/`-` list.
 
-It reads the same two functions the in-session `/whatsapp-channel:access manage` screen reads, so the terminal and the chat path cannot disagree about what is configured or what a revoke cleans up.
+The in-session path opens this very screen, so there is nothing left to disagree about what is configured or what a revoke cleans up.
 
 Group/contact names and recency come from caches (`~/.whatsapp-channel/groups-meta.json`, `dm-activity.json`, `contacts.json`) that only the running server writes — automatically, as WhatsApp reports chat activity, no manual step needed once the account has connected at least once. If it's never connected yet, the wizard has nothing to show; pair it first. `groups-meta.json` is always written; `dm-activity.json` and `contacts.json` follow `WHATSAPP_CACHE_CONTACTS`, which is on unless you set it to `0` (see "Names and privacy" above) — with it off, the CONTACTS column has nothing to rank. The wizard says so on screen instead of silently leaving the column empty: one line when no DM activity is on record at all, another when there is a record but nothing new in it. Its search line runs over the whole cached pool, so every contact on record is reachable without paging.
 

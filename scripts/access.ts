@@ -18,15 +18,17 @@
  * singleton lock at module load).
  */
 
+import { spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { parseArgs } from "node:util";
 import { confirm } from "@inquirer/prompts";
 import { forgetContact, hasSavedName, type ContactsMap } from "./contacts";
@@ -41,16 +43,13 @@ import {
 import {
   contactKeyFor,
   diffAccess,
-  filterCandidates,
   listConfiguredDms,
   listConfiguredGroups,
-  publicCandidates,
   rankDms,
   rankGroups,
-  rosterMemberPool,
+  type AccessDiff,
   type Candidate,
   type GroupMeta,
-  type PublicCandidate,
 } from "./ranking";
 import { wizardCmd } from "./wizard-cmd";
 
@@ -64,6 +63,12 @@ const GROUPS_META_FILE = join(STATE_DIR, "groups-meta.json");
 const DM_ACTIVITY_FILE = join(STATE_DIR, "dm-activity.json");
 const CONTACTS_FILE = join(STATE_DIR, "contacts.json");
 const LID_MAP_FILE = join(STATE_DIR, "lid-map.json");
+// `review`'s wait signal: the wizard's window returns instantly (`start`,
+// `osascript`), so `review` cannot wait on the child process exiting - it
+// polls for this file instead. Written by touchPickerDone from a
+// process.on("exit") handler registered at the top of the wizard branch (see
+// there for why exactly there and not inside wizard()/runPicker()).
+const PICKER_DONE_FILE = join(STATE_DIR, ".picker-done");
 
 const POLICIES = ["pairing", "allowlist", "disabled"];
 const SET_KEYS = [
@@ -139,6 +144,18 @@ function save(access: Access, opts: { backup?: boolean } = {}): void {
   renameSync(tmp, ACCESS_FILE);
 }
 
+// `review` polls for this file rather than the child process, since every
+// launcher (`start`, `osascript`) returns the instant the new window exists.
+// Swallows its own error: this runs from a process.on("exit") handler, where
+// a throw would replace the wizard's own last message with a stack trace,
+// and review's 30-minute cap already covers "the marker never appeared".
+function touchPickerDone(): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+    writeFileSync(PICKER_DONE_FILE, String(Date.now()), { mode: 0o600 });
+  } catch {}
+}
+
 function die(message: string): never {
   process.stderr.write(`${message}\n`);
   process.exit(1);
@@ -154,25 +171,24 @@ const USAGE = `Usage: bun scripts/access.ts <command>
   status                          show policy, allowlist, pending, groups
   pair <code>                     approve a pending pairing by its code
   deny <code>                     drop a pending pairing
-  allow <jid> | --ref <ref>       add a JID to the allowlist
-  remove <jid> | --ref <ref>      remove a JID from the allowlist
+  allow <jid>                     add a JID to the allowlist
+  remove <jid>                    remove a JID from the allowlist
   forget <jid>                    purge a cached name/activity entry, even
                                    for a JID never allowlisted (see remove)
   policy <${POLICIES.join("|")}>   set the DM policy
-  group add <groupJid> | --ref <ref> [--mention|--no-mention] [--allow a,b] [--roster|--no-roster]
+  group add <groupJid> [--mention|--no-mention] [--allow a,b] [--roster|--no-roster]
   group rm <groupJid>             stop responding in a group (files kept)
-  wizard [--include-archived]     one screen: contacts and groups side by side,
-                                   what Claude can reach today PRE-TICKED. Type to
-                                   filter, space/enter to tick, Submit shows the +/-
-                                   list before anything is written. Needs a real
-                                   terminal.
+  review                          open the access screen in a NEW terminal
+                                   window, wait for it, then print what
+                                   changed. Takes no arguments.
+  wizard [--include-archived]     the access screen itself: contacts and groups
+                                   side by side, what Claude can reach today
+                                   PRE-TICKED. Type to filter, space/enter to
+                                   tick, Submit shows the +/- list before
+                                   anything is written. Needs a real terminal.
   wizard --revoke                 accepted, same screen (revoking is unticking)
   wizard --undo                   put back the access.json from before the
                                    last wizard run (same as "undo")
-  state [--include-archived]      JSON: candidates + configured, both pools
-  candidates [--include-archived] [--search <text>]
-                                  JSON: groups/contacts not configured yet
-  configured [--search <text>]    JSON: groups/contacts already configured
   undo [--dry-run]                put back the access.json saved by the last
                                    --backup write (wizard --undo does the same)
   set <key> <value>               ${SET_KEYS.join(", ")}
@@ -334,7 +350,6 @@ function group(args: string[]): void {
         allow: { type: "string" },
         roster: { type: "boolean" },
         "no-roster": { type: "boolean" },
-        ref: { type: "string" },
         backup: { type: "boolean" },
       },
       allowPositionals: true,
@@ -349,11 +364,9 @@ function group(args: string[]): void {
     allow,
     roster = false,
     "no-roster": noRoster = false,
-    ref,
     backup,
   } = parsed.values;
-  const jid = targetJid(ref, jidArg, "group", "group JID");
-  const viaRef = !!ref;
+  const jid = requireArg(jidArg, "group JID");
   // parseArgs has no built-in negation, so --mention/--no-mention (and the
   // roster pair) are two separate flags - passing both at once is
   // ambiguous, never silently resolved one way.
@@ -362,12 +375,12 @@ function group(args: string[]): void {
   const a = load();
   if (sub === "rm") {
     if (!a.groups[jid]) {
-      die(`Group ${displayJid(jid, viaRef, "group")} is not configured.`);
+      die(`Group ${jid} is not configured.`);
     }
     delete a.groups[jid];
     save(a, { backup });
     process.stdout.write(
-      `Removed ${displayJid(jid, viaRef, "group")}. Its config.md and memory.md are kept in case you re-add it.\n`,
+      `Removed ${jid}. Its config.md and memory.md are kept in case you re-add it.\n`,
     );
     return;
   }
@@ -402,11 +415,8 @@ function group(args: string[]): void {
   save(a, { backup });
 
   const config = provisionGroupFiles(jid);
-  // The config path embeds the raw JID; a --ref caller (the in-session skill)
-  // gets the masked path instead, same rule as the sentence before it.
-  const shownConfig = viaRef ? config.replace(jid, groupAnchor(jid)) : config;
   process.stdout.write(
-    `${existing ? "Updated" : "Added"} ${displayJid(jid, viaRef, "group")} (mention required: ${a.groups[jid].requireMention}, roster: ${a.groups[jid].roster}).\nEdit its personality at ${shownConfig}\n`,
+    `${existing ? "Updated" : "Added"} ${jid} (mention required: ${a.groups[jid].requireMention}, roster: ${a.groups[jid].roster}).\nEdit its personality at ${config}\n`,
   );
 }
 
@@ -417,7 +427,7 @@ const PRIVACY_DISCLOSURE =
 // wizard mention is (see scripts/wizard-cmd.ts) - a marketplace install is not
 // run from a repo checkout, so "bun scripts/access.ts" resolves to nothing
 // there. Printed only after a write, and it is the same one-step undo the
-// in-session review/manage flow points at (skills/access/SKILL.md, `undo`).
+// in-session `review` launcher points at (skills/access/SKILL.md, `undo`).
 const UNDO_HINT = `Changed your mind? Run \`${wizardCmd(join(import.meta.dir, ".."))} --undo --dry-run\` to see what would come back, then the same command without --dry-run.`;
 
 const NOTHING_TO_REVIEW =
@@ -685,274 +695,159 @@ async function wizard(args: string[]): Promise<void> {
   }
 }
 
-// Read-only JSON for the in-session `review` and `manage` screens in
-// skills/access/SKILL.md. The skill EXECUTES these instead of restating
-// the ranking and labelling rules in prose: every drift a review has caught
-// so far - a dropped `[archived]` tag, a label rule that lost its
-// looksLikeNumber() guard, a candidate cap that disagreed with the real
-// limits - came from the paraphrase, not from the code.
-//
-// Neither command writes anything, and neither is interactive, so this does
-// not touch the `wizard` guarantee: the wizard is still the only path where
-// a group/contact decision is made with no AI model in the room. These two
-// only tell a model what the code already computes; a human still ticks the
-// boxes, and every write still goes through `allow`/`group add`/`remove`/
-// `group rm` below.
-//
-// Shape is the same for both, so the skill has one rule to follow:
-//   { groups: { items: Candidate[], total: n }, dms: { ... } }
-// `total` is the size of the whole pool, so a caller can say how many did
-// not fit; `items` is what to show.
-function emitJson(payload: unknown): void {
-  process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
-}
+const PICKER_OPENING =
+  "Opening the access screen in a new terminal window. Pick there; I only see what changed.";
 
-// Every pool a ref can legitimately come from: not-yet-configured and already
-// configured, groups and DMs. Archived groups are always included here - a ref
-// the caller was shown must still resolve, whatever archive filter produced
-// the screen it came from.
-function allCandidates(): Candidate[] {
-  const a = load();
-  const meta = loadGroupsMeta();
-  const contacts = loadContacts();
-  const lidMap = loadLidMap();
-  return [
-    ...rankGroups(meta, new Set(Object.keys(a.groups)), true, Infinity),
-    ...listConfiguredGroups(a.groups, meta),
-    ...rankDms(
-      loadDmActivity(),
-      contacts,
-      a.allowFrom,
-      lidMap,
-      Infinity,
-      rosterMemberPool(meta, a.groups),
-    ),
-    ...listConfiguredDms(a.allowFrom, contacts, lidMap),
-  ];
-}
+const PICKER_NO_CHANGE =
+  "Nothing changed - the access screen was closed without applying anything.\n" +
+  "If the window closed by itself, run " +
+  `${wizardCmd(join(import.meta.dir, ".."))} ` +
+  "in your own terminal to see why.";
 
-// A ref resolves to exactly one JID or the command dies. Never a "closest
-// match", never a prefix: the caller is a model relaying a token it was given,
-// and a wrong resolution here is a grant or a revoke against the wrong person.
-function resolveRef(ref: string, want: "group" | "dm"): string {
-  const jids = [
-    ...new Set(
-      allCandidates()
-        .filter((c) => c.ref === ref)
-        .map((c) => c.jid),
-    ),
-  ];
-  if (jids.length === 0) {
-    die(
-      `No group or contact matches ref "${ref}". Re-run "state" (or "candidates"/"configured") to get current refs.`,
-    );
+const PICKER_STILL_OPEN =
+  "The access screen is still open after 30 minutes - nothing has been reported back. " +
+  "Finish in that window, then run review again.";
+
+// D2. `wizardCmd(join(import.meta.dir, ".."))` is the same resolved absolute
+// command UNDO_HINT already uses - a marketplace install is not a repo
+// checkout.
+const PICKER_NO_LAUNCHER = (cmd: string) =>
+  "Could not open a terminal window from here.\n" +
+  `Run this in your own terminal, then come back:\n  ${cmd}\n` +
+  "Nothing was changed.";
+
+const PICKER_ONLY_DELTA =
+  "Only this list came back to the session - the picking happened in the other window.";
+
+type Launch = { cmd: string; args: string[] };
+
+// No `which` binary is guaranteed; PATH + existsSync is stdlib and
+// synchronous.
+function firstOnPath(names: readonly string[]): string | null {
+  const dirs = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
+  for (const name of names) {
+    if (dirs.some((d) => existsSync(join(d, name)))) return name;
   }
-  if (jids.length > 1) {
-    die(
-      `Ref "${ref}" is ambiguous - it matches more than one entry. Re-run "state".`,
-    );
+  return null;
+}
+
+function pickerLaunch(): Launch | null {
+  const accessPath = join(import.meta.dir, "access.ts");
+  // What every launcher ends up running. "bun", not process.execPath: it
+  // matches wizardCmd()'s printed command, and anything running this plugin
+  // already has bun on PATH.
+  // ponytail: if a report ever shows bun missing from PATH in the new
+  // window, process.execPath is the upgrade path.
+  const argv = ["bun", accessPath, "wizard"];
+
+  // Test hook, not a user-facing knob: names the launcher command. A .ts/.js
+  // value is run with this same bun, so a fixture script can stand in for a
+  // terminal without any shell-style splitting (this repo's own install
+  // path contains a space).
+  const override = process.env.WHATSAPP_PICKER_LAUNCH?.trim();
+  if (override) {
+    return /\.(ts|js|mjs)$/.test(override)
+      ? { cmd: process.execPath, args: [override, ...argv] }
+      : { cmd: override, args: argv };
   }
-  const jid = jids[0];
-  const isGroup = jid.endsWith("@g.us");
-  if (want === "group" && !isGroup) {
-    die(
-      `Ref "${ref}" is a contact, not a group. Use "allow"/"remove" for a contact.`,
-    );
+
+  if (process.platform === "win32") {
+    // The empty title argument is load-bearing: `start` reads the FIRST
+    // quoted token as the window title, and an install path with a space
+    // arrives quoted.
+    return { cmd: "cmd", args: ["/c", "start", "", ...argv] };
   }
-  if (want === "dm" && isGroup) {
-    die(
-      `Ref "${ref}" is a group, not a contact. Use "group add"/"group rm" for a group.`,
-    );
+  if (process.platform === "darwin") {
+    // wizardCmd() is already `bun "<abs>" wizard` with the path quoted;
+    // JSON.stringify then escapes " and \ exactly the way an AppleScript
+    // string literal does.
+    const sh = wizardCmd(join(import.meta.dir, ".."));
+    return {
+      cmd: "osascript",
+      args: [
+        "-e",
+        `tell application "Terminal" to do script ${JSON.stringify(sh)}`,
+      ],
+    };
   }
-  return jid;
-}
-
-// A subcommand takes EITHER a positional JID (a human in a terminal) or
-// --ref (the in-session skill, which never sees a JID). Both, or neither, is
-// an error rather than a silent precedence rule.
-function targetJid(
-  ref: string | undefined,
-  positional: string | undefined,
-  want: "group" | "dm",
-  what: string,
-): string {
-  if (ref && positional) die(`Pass either ${what} or --ref, not both.`);
-  if (ref) return resolveRef(ref, want);
-  return requireArg(positional, what);
-}
-
-// A confirmation line prints the JID either way. When it was resolved from
-// --ref (the in-session skill, which never sees a raw JID - see resolveRef)
-// the confirmation must not hand one back either, or the ref/description
-// split is pointless. A positional JID came from a human who typed it
-// themselves, so it keeps today's output unmasked.
-function displayJid(
-  jid: string,
-  viaRef: boolean,
-  kind: "group" | "dm",
-): string {
-  if (!viaRef) return jid;
-  return kind === "group" ? groupAnchor(jid) : maskNumber(jid);
-}
-
-function pool(list: readonly Candidate[]): {
-  items: PublicCandidate[];
-  total: number;
-} {
-  return { items: publicCandidates(list), total: list.length };
-}
-
-// The two pools' ranked (not-yet-configured) candidates - shared by
-// `candidates` and `state` so there is exactly one place that assembles them.
-function rankedPools(
-  a: Access,
-  meta: Record<string, GroupMeta>,
-  contacts: ContactsMap,
-  lidMap: Record<string, string>,
-  includeArchived: boolean,
-): { groups: Candidate[]; dms: Candidate[] } {
+  const term = firstOnPath(["x-terminal-emulator", "gnome-terminal", "xterm"]);
+  if (!term) return null;
   return {
-    groups: rankGroups(
-      meta,
-      new Set(Object.keys(a.groups)),
-      includeArchived,
-      Infinity,
-    ),
-    dms: rankDms(
-      loadDmActivity(),
-      contacts,
-      a.allowFrom,
-      lidMap,
-      Infinity,
-      rosterMemberPool(meta, a.groups),
-    ),
+    cmd: term,
+    args: [term === "gnome-terminal" ? "--" : "-e", ...argv],
   };
 }
 
-// The two pools' already-configured candidates - shared by `configured` and
-// `state` for the same reason.
-function configuredPools(
-  a: Access,
-  meta: Record<string, GroupMeta>,
-  contacts: ContactsMap,
-  lidMap: Record<string, string>,
-): { groups: Candidate[]; dms: Candidate[] } {
-  return {
-    groups: listConfiguredGroups(a.groups, meta),
-    dms: listConfiguredDms(a.allowFrom, contacts, lidMap),
-  };
-}
-
-// Not yet configured: the grant screen. Uncapped, for the same reason
-// `configured` is - a caller that shows four at a time and re-asks for a
-// fresh first page would offer the same top four forever, so a candidate
-// the user DECLINES once could never be reached again (approving one drops
-// it from the pool; declining one does not). The caller batches the list it
-// gets back. Still ranked most-recently-active first, so the four that
-// matter are the four it shows first.
-function candidates(args: string[]): void {
-  let values;
+// Opens the access screen in a NEW terminal window, waits for it, and
+// reports back only the +/- delta by name - the model never sees a
+// candidate list (brief, "Security surface"). Takes no arguments: nothing
+// that could come from a WhatsApp message reaches the launched command line.
+async function review(args: string[]): Promise<void> {
   try {
-    ({ values } = parseArgs({
-      args,
-      options: {
-        search: { type: "string" },
-        "include-archived": { type: "boolean" },
-      },
-      allowPositionals: false,
-    }));
+    parseArgs({ args, options: {}, allowPositionals: false });
   } catch (err) {
     die(`${(err as Error).message}\n\n${USAGE}`);
   }
-  const includeArchived = !!values["include-archived"];
-  const a = load();
-  const meta = loadGroupsMeta();
-  const ranked = rankedPools(
-    a,
-    meta,
-    loadContacts(),
-    loadLidMap(),
-    includeArchived,
-  );
-  // The wizard's own matcher, not a second one: case-insensitive substring
-  // over label and description, never a RegExp built from user text (see
-  // filterCandidates in ranking.ts). Applied AFTER ranking, so matches come
-  // back in the same order the unfiltered list would have had.
-  const groups = filterCandidates(ranked.groups, values.search);
-  const dms = filterCandidates(ranked.dms, values.search);
-  emitJson({ groups: pool(groups), dms: pool(dms) });
-}
 
-// Already configured: the revoke screen. Uncapped on purpose - `manage`
-// only ever removes, so a list truncated here would leave later entries
-// permanently unrevokable (a caller showing 4 at a time has to walk the
-// whole list it gets back, not re-ask for a fresh first page). `--search`
-// mirrors `candidates`' - the revoke question needs the same way out of
-// paging a large install three at a time (#14 review).
-function configured(args: string[]): void {
-  let values;
-  try {
-    ({ values } = parseArgs({
-      args,
-      options: { search: { type: "string" } },
-      allowPositionals: false,
-    }));
-  } catch (err) {
-    die(`${(err as Error).message}\n\n${USAGE}`);
-  }
-  const a = load();
-  const c = configuredPools(a, loadGroupsMeta(), loadContacts(), loadLidMap());
-  const groups = filterCandidates(c.groups, values.search);
-  const dms = filterCandidates(c.dms, values.search);
-  emitJson({ groups: pool(groups), dms: pool(dms) });
-}
+  // Before anything is launched, so a marker left by an earlier run can
+  // never short-circuit this one.
+  rmSync(PICKER_DONE_FILE, { force: true });
 
-// One JSON for the in-session review's opening screen (#12): what could be
-// granted and what is already granted, for both pools, in one read - so the
-// skill makes one Bash call instead of two and can print its state line
-// straight from the four totals. Both halves are the SAME shape `candidates`
-// and `configured` already emit, so the skill has one rule to follow, and both
-// are uncapped for the same reason those two are (a caller that re-asks for a
-// fresh first page would serve the same top four forever).
-//
-// ponytail: uncapped means the whole ranked pool lands in the model's context
-// - ~18KB for 178 groups. If that becomes the cost that matters, add
-// --limit/--offset here rather than a silent cap, which would make declined
-// entries unreachable.
-function state(args: string[]): void {
-  let values;
-  try {
-    ({ values } = parseArgs({
-      args,
-      options: { "include-archived": { type: "boolean" } },
-      allowPositionals: false,
-    }));
-  } catch (err) {
-    die(`${(err as Error).message}\n\n${USAGE}`);
+  const before = load();
+  const launch = pickerLaunch();
+  if (!launch) {
+    process.stdout.write(
+      PICKER_NO_LAUNCHER(wizardCmd(join(import.meta.dir, ".."))) + "\n",
+    );
+    process.exit(2);
   }
-  const includeArchived = !!values["include-archived"];
-  const a = load();
-  const meta = loadGroupsMeta();
-  const contacts = loadContacts();
-  const lidMap = loadLidMap();
-  const candidatePools = rankedPools(
-    a,
-    meta,
-    contacts,
-    lidMap,
-    includeArchived,
-  );
-  const configuredPoolsResult = configuredPools(a, meta, contacts, lidMap);
-  emitJson({
-    groups: {
-      candidates: pool(candidatePools.groups),
-      configured: pool(configuredPoolsResult.groups),
-    },
-    dms: {
-      candidates: pool(candidatePools.dms),
-      configured: pool(configuredPoolsResult.dms),
-    },
-  });
+
+  process.stdout.write(PICKER_OPENING + "\n");
+  // spawnSync, not async spawn: stdlib, matches the house style
+  // (execFileSync elsewhere), needs no detached/unref bookkeeping, and
+  // every default launcher returns immediately (start, osascript) or blocks
+  // until the terminal closes (Linux) - correct either way, since the
+  // marker is already there by then. stdio: "inherit" so the launcher's own
+  // error text (and, in tests, the fake launcher's argv echo) reaches the
+  // caller. No hand-built env: WHATSAPP_STATE_DIR must reach the child via
+  // the default inherited env, or a custom state dir (and the tests) point
+  // the child at ~/.whatsapp-channel instead.
+  const res = spawnSync(launch.cmd, launch.args, { stdio: "inherit" });
+  if (res.error || res.status !== 0) {
+    process.stdout.write(
+      PICKER_NO_LAUNCHER(wizardCmd(join(import.meta.dir, ".."))) + "\n",
+    );
+    process.exit(2);
+  }
+
+  const POLL_MS = 250;
+  const PICKER_WAIT_MS = 30 * 60_000;
+  let waited = 0;
+  while (!existsSync(PICKER_DONE_FILE)) {
+    if (waited >= PICKER_WAIT_MS) die(PICKER_STILL_OPEN);
+    await new Promise((r) => setTimeout(r, POLL_MS));
+    waited += POLL_MS;
+  }
+  rmSync(PICKER_DONE_FILE, { force: true });
+
+  const after = load();
+  const d = diffAccess(before, after);
+  const nothing =
+    d.added.groups.length === 0 &&
+    d.added.dms.length === 0 &&
+    d.removed.groups.length === 0 &&
+    d.removed.dms.length === 0;
+  if (nothing) {
+    process.stdout.write(PICKER_NO_CHANGE + "\n");
+    return;
+  }
+
+  const lines = [
+    ...deltaLines(d, before, after),
+    "(+ = access this grants, - = access this takes away)",
+    PICKER_ONLY_DELTA,
+  ];
+  process.stdout.write(lines.join("\n") + "\n");
 }
 
 // One step back (#14). Restores access.json from the .bak that a `--backup`
@@ -961,6 +856,58 @@ function state(args: string[]): void {
 // Restores access.json and NOTHING else: contacts.json / dm-activity.json
 // entries a `remove` purged are gone, and this says so rather than implying a
 // full rewind.
+// The +/- lines for a diff between two access.json snapshots, labelled from
+// the MERGED snapshots so an entry present in only one of them still
+// resolves to a name, and masked (groupAnchor / maskNumber) when nothing is
+// cached for it. Shared by `undo` and `review` so the two can never disagree
+// about how an entry reads. Legend line left to the caller - `undo` and
+// `review` word it differently.
+function deltaLines(d: AccessDiff, a: Access, b: Access): string[] {
+  const mergedGroups = { ...b.groups, ...a.groups };
+  const mergedMeta = loadGroupsMeta();
+  const groupLabels = new Map(
+    listConfiguredGroups(mergedGroups, mergedMeta).map((c) => [c.jid, c]),
+  );
+  const mergedAllowFrom = [
+    ...new Set([...(b.allowFrom ?? []), ...(a.allowFrom ?? [])]),
+  ];
+  const dmLabels = new Map(
+    listConfiguredDms(mergedAllowFrom, loadContacts(), loadLidMap()).map(
+      (c) => [c.jid, c],
+    ),
+  );
+  // One line builder for both kinds: a candidate map plus its masked
+  // fallback (groupAnchor for a group, maskNumber for a DM) when the JID
+  // has no entry in either merged snapshot's candidate list. formatLabel,
+  // not the raw label: a self-reported group/contact name is
+  // attacker-chosen, and this line is read by a terminal AND, via `review`,
+  // a model (review finding 3).
+  const line = (
+    jid: string,
+    labels: Map<string, Candidate>,
+    fallback: (jid: string) => string,
+  ): string => {
+    const c = labels.get(jid);
+    const label = c ? formatLabel(c.label) : fallback(jid);
+    const description = c?.description ?? fallback(jid);
+    return `${label}  [${description}]`;
+  };
+  const lines: string[] = [];
+  for (const jid of d.added.groups) {
+    lines.push(`+ ${line(jid, groupLabels, groupAnchor)}`);
+  }
+  for (const jid of d.added.dms) {
+    lines.push(`+ ${line(jid, dmLabels, maskNumber)}`);
+  }
+  for (const jid of d.removed.groups) {
+    lines.push(`- ${line(jid, groupLabels, groupAnchor)}`);
+  }
+  for (const jid of d.removed.dms) {
+    lines.push(`- ${line(jid, dmLabels, maskNumber)}`);
+  }
+  return lines;
+}
+
 function undo(args: string[]): void {
   // Strict: a typo'd flag on the one destructive subcommand must not run it.
   let values;
@@ -1019,45 +966,10 @@ function undo(args: string[]): void {
     );
     return;
   }
-  const mergedGroups = { ...bak.groups, ...current.groups };
-  const mergedMeta = loadGroupsMeta();
-  const groupLabels = new Map(
-    listConfiguredGroups(mergedGroups, mergedMeta).map((c) => [c.jid, c]),
-  );
-  const mergedAllowFrom = [
-    ...new Set([...(bak.allowFrom ?? []), ...(current.allowFrom ?? [])]),
+  const lines = [
+    ...deltaLines(d, current, bak),
+    "(+ = access this brings back, - = access this takes away)",
   ];
-  const dmLabels = new Map(
-    listConfiguredDms(mergedAllowFrom, loadContacts(), loadLidMap()).map(
-      (c) => [c.jid, c],
-    ),
-  );
-  // One line builder for both kinds: a candidate map plus its masked
-  // fallback (groupAnchor for a group, maskNumber for a DM) when the JID
-  // has no entry in either merged snapshot's candidate list.
-  const line = (
-    jid: string,
-    labels: Map<string, Candidate>,
-    fallback: (jid: string) => string,
-  ): string => {
-    const c = labels.get(jid);
-    const label = c?.label ?? fallback(jid);
-    const description = c?.description ?? fallback(jid);
-    return `${label}  [${description}]`;
-  };
-  const lines: string[] = [];
-  for (const jid of d.added.groups) {
-    lines.push(`+ ${line(jid, groupLabels, groupAnchor)}`);
-  }
-  for (const jid of d.added.dms)
-    lines.push(`+ ${line(jid, dmLabels, maskNumber)}`);
-  for (const jid of d.removed.groups) {
-    lines.push(`- ${line(jid, groupLabels, groupAnchor)}`);
-  }
-  for (const jid of d.removed.dms) {
-    lines.push(`- ${line(jid, dmLabels, maskNumber)}`);
-  }
-  lines.push("(+ = access this brings back, - = access this takes away)");
 
   if (dryRun) {
     process.stdout.write(
@@ -1182,24 +1094,21 @@ switch (command) {
     try {
       ({ values, positionals } = parseArgs({
         args: rest,
-        options: { ref: { type: "string" }, backup: { type: "boolean" } },
+        options: { backup: { type: "boolean" } },
         allowPositionals: true,
       }));
     } catch (err) {
       die(`${(err as Error).message}\n\n${USAGE}`);
     }
-    const jid = targetJid(values.ref, positionals[0], "dm", "JID");
-    const viaRef = !!values.ref;
+    const jid = requireArg(positionals[0], "JID");
     const a = load();
     if (a.allowFrom.includes(jid)) {
-      process.stdout.write(
-        `${displayJid(jid, viaRef, "dm")} was already allowed.\n`,
-      );
+      process.stdout.write(`${jid} was already allowed.\n`);
       break;
     }
     a.allowFrom.push(jid);
     save(a, { backup: values.backup });
-    process.stdout.write(`Allowed ${displayJid(jid, viaRef, "dm")}.\n`);
+    process.stdout.write(`Allowed ${jid}.\n`);
     break;
   }
   case "remove": {
@@ -1207,24 +1116,21 @@ switch (command) {
     try {
       ({ values, positionals } = parseArgs({
         args: rest,
-        options: { ref: { type: "string" }, backup: { type: "boolean" } },
+        options: { backup: { type: "boolean" } },
         allowPositionals: true,
       }));
     } catch (err) {
       die(`${(err as Error).message}\n\n${USAGE}`);
     }
-    const jid = targetJid(values.ref, positionals[0], "dm", "JID");
-    const viaRef = !!values.ref;
+    const jid = requireArg(positionals[0], "JID");
     const a = load();
     if (!a.allowFrom.includes(jid)) {
-      die(`${displayJid(jid, viaRef, "dm")} is not on the allowlist.`);
+      die(`${jid} is not on the allowlist.`);
     }
     a.allowFrom = a.allowFrom.filter((j) => j !== jid);
     save(a, { backup: values.backup });
     const outcome = revokeCachedIdentity(a.allowFrom, jid);
-    process.stdout.write(
-      `Removed ${displayJid(jid, viaRef, "dm")}.` + CACHE_NOTE[outcome] + "\n",
-    );
+    process.stdout.write(`Removed ${jid}.` + CACHE_NOTE[outcome] + "\n");
     break;
   }
   case "forget": {
@@ -1256,7 +1162,17 @@ switch (command) {
   case "group":
     group(rest);
     break;
-  case "wizard":
+  case "wizard": {
+    // `review` waits on this file, not on the child process: `cmd /c start`
+    // and `osascript` both return the instant the new window exists. 'exit'
+    // fires for a normal return, for an uncaught throw, for every die()
+    // (process.exit), and for runPicker's SIGINT/SIGTERM handler
+    // (picker.ts:1056-1059, which calls process.exit(1) and therefore skips
+    // the try/finally) - so every way this screen can end writes the marker
+    // exactly once. Registered for `wizard --help`/`--undo` too - harmless,
+    // since `review` never launches those and the marker is removed before
+    // every launch.
+    process.on("exit", touchPickerDone);
     // --help first: it must never open a prompt, whatever else was passed.
     // --undo before everything else for the same reason it was added in T14 -
     // it is exactly `undo`, and must not open a screen for someone who asked
@@ -1266,14 +1182,9 @@ switch (command) {
     else if (rest.includes("--undo")) undo(rest.filter((f) => f !== "--undo"));
     else await wizard(rest);
     break;
-  case "candidates":
-    candidates(rest);
-    break;
-  case "configured":
-    configured(rest);
-    break;
-  case "state":
-    state(rest);
+  }
+  case "review":
+    await review(rest);
     break;
   case "undo":
     undo(rest);

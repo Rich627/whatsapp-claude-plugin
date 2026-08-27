@@ -3,7 +3,6 @@
 // every case - access.ts's top-level switch executes immediately on any
 // import (same class of problem server.ts has, see its own comments on
 // why mentions.ts/contacts.ts/mask.ts were extracted the same way).
-import { createHash } from "node:crypto";
 import { type ContactsMap } from "./contacts";
 import { groupAnchor, looksLikeNumber, maskNumber } from "./mask";
 
@@ -13,47 +12,19 @@ export type GroupMeta = {
   archived: boolean;
   lastActivityAt?: number;
   updatedAt: number;
-  // Participant JIDs of a group the owner granted roster access to, written by
-  // the server (never by this script) - phone-resolved and normalised, names
-  // resolved here at read time through the contacts cache. Absent for every
-  // group without roster access.
-  members?: string[];
 };
 
 // `description` is the identity anchor rendered under the label on the
-// in-session review/manage screens: the raw JID for a group (a g.us id is
-// not personal data), the MASKED number for a contact (a raw one is
-// exactly what mask.ts exists to keep out of a transcript). Built here,
-// next to the label, so no caller has to re-derive the rule and get it
-// wrong - the old prose spec in skills/access/SKILL.md did.
+// picker screen: the raw JID for a group (a g.us id is not personal data),
+// the MASKED number for a contact (a raw one is exactly what mask.ts exists
+// to keep out of a transcript). Built here, next to the label, so no caller
+// has to re-derive the rule and get it wrong - the old prose spec in
+// skills/access/SKILL.md did.
 export type Candidate = {
   jid: string;
-  ref: string;
   label: string;
   description: string;
 };
-
-// What a JSON-emitting subcommand prints. `jid` is deliberately absent: for a
-// DM it is the full phone number, and for a LEGACY `<phone>-<ts>@g.us` group
-// it contains one, so "the model sees a name and a masked number only" is only
-// literally true if the raw JID never leaves the process. A modern group's JID
-// is still visible - as `description`, which is groupAnchor()'s output and is
-// masked for the legacy form.
-export type PublicCandidate = {
-  ref: string;
-  label: string;
-  description: string;
-};
-
-export function publicCandidates(
-  list: readonly Candidate[],
-): PublicCandidate[] {
-  return list.map(({ ref, label, description }) => ({
-    ref,
-    label,
-    description,
-  }));
-}
 
 // No live WhatsApp connection here (see access.ts's file header) and
 // deliberately no Baileys import just for its JID string utilities -
@@ -83,27 +54,6 @@ export function contactKeyFor(
   return normalizeJid(lidMap[normalized] ?? normalized);
 }
 
-// A short, stable, opaque handle for one JID - the ONLY identifier the
-// in-session review/manage screens (a model, and a transcript) ever see for a
-// contact. `description` masks the number for a human; `ref` is what the skill
-// passes back to `allow --ref` / `remove --ref` / `group add --ref` /
-// `group rm --ref`, so no code path needs the raw JID in the model's context
-// at all. Content-derived, not positional: a ref stays valid across writes, so
-// the refs collected before an Apply still resolve after the first command has
-// changed which pool an entry sits in.
-//
-// ponytail: a pseudonym, not a secret. Anyone who already knows the number can
-// recompute the same hash; the job is keeping the number out of the
-// transcript, not being unguessable. Salting it would break stability across
-// runs, which the flow depends on.
-const REF_LENGTH = 12;
-export function refFor(jid: string): string {
-  return createHash("sha256")
-    .update(normalizeJid(jid))
-    .digest("hex")
-    .slice(0, REF_LENGTH);
-}
-
 // A group name and a self-reported contact name are both attacker-chosen
 // and unbounded, and a label too long for its option used to be the
 // caller's problem to truncate - which broke the one thing the label has to
@@ -123,13 +73,14 @@ function groupLabel(g: GroupMeta): string {
   return `${clip(g.name)}  (${g.memberCount} member(s))${g.archived ? "  [archived]" : ""}`;
 }
 
-// AskUserQuestion - the checkbox UI behind the in-session `review`/`manage`
-// screens - returns a selection BY ITS LABEL, so two candidates that render
-// identically cannot be told apart once ticked: the wrong one gets revoked,
-// or both do. Three real ways they collide: two contacts saved under the
-// same name, two groups sharing a name and member count, and the @lid and
-// phone forms of ONE contact in allowFrom (both resolve to the same key, so
-// dmLabel returns the same string by construction - see listConfiguredDms).
+// The picker screen (scripts/picker.ts) selects by jid, not by label, but a
+// human still has to be able to tell two rows apart on screen to know which
+// one they are ticking or unticking - two candidates that render identically
+// read as one option to look at, even though the tick underneath is correct.
+// Three real ways they collide: two contacts saved under the same name, two
+// groups sharing a name and member count, and the @lid and phone forms of ONE
+// contact in allowFrom (both resolve to the same key, so dmLabel returns the
+// same string by construction - see listConfiguredDms).
 // Appends the masked JID, so a human can see which row is which, plus an
 // ordinal, so the label is unique even when two JIDs share their last four
 // digits. Never the raw JID - that is the whole point of mask.ts. Applied
@@ -179,7 +130,6 @@ export function rankGroups(
     .slice(0, limit)
     .map(([jid, g]) => ({
       jid,
-      ref: refFor(jid),
       label: groupLabel(g),
       description: groupAnchor(jid),
     }));
@@ -188,8 +138,8 @@ export function rankGroups(
 
 // Every group already in access.json's groups map, not just the top N new
 // ones - this is "what's already on" for a revoke screen, so no recency
-// sort, no archive filter and no limit (see listConfiguredGroups/manage in
-// skills/access/SKILL.md). A configured group with no meta.json entry still
+// sort, no archive filter and no limit (the picker's pre-ticked column). A
+// configured group with no meta.json entry still
 // has to appear (falls back to the raw JID) or it becomes unrevokable.
 export function listConfiguredGroups(
   groups: Readonly<Record<string, unknown>>,
@@ -198,7 +148,6 @@ export function listConfiguredGroups(
   const listed = Object.keys(groups)
     .map((jid) => ({
       jid,
-      ref: refFor(jid),
       // The no-meta fallback shows the anchor too, not the raw JID: a
       // configured legacy group with nothing cached about it would
       // otherwise print its creator's phone number as its label.
@@ -251,56 +200,21 @@ export function rankDms(
   allowFrom: readonly string[],
   lidMap: Record<string, string>,
   limit: number = Infinity,
-  memberPool: readonly string[] = [],
 ): Candidate[] {
   const alreadyAllowed = new Set(
     allowFrom.map((jid) => contactKeyFor(lidMap, jid)),
   );
   const entries = Object.entries(activity);
-  const seen = new Set(entries.map(([k]) => k));
-  for (const raw of memberPool) {
-    const key = contactKeyFor(lidMap, raw);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    // 0, not Date.now(): a member with no DM on record has no activity, and the
-    // existing comparator sorts it after every chat that does, tie-broken by
-    // JID. Ordering is explicitly out of scope for this change - search is how
-    // you reach a specific member, exactly as it is for a group.
-    entries.push([key, 0]);
-  }
   const ranked = entries
     .filter(([jid]) => !alreadyAllowed.has(jid))
     .sort(([aj, a], [bj, b]) => b - a || aj.localeCompare(bj))
     .slice(0, limit)
     .map(([jid]) => ({
       jid,
-      ref: refFor(jid),
       label: dmLabel(contacts, jid),
       description: maskNumber(jid),
     }));
   return disambiguate(ranked);
-}
-
-// `candidates --search` / `configured --search`'s source. Case-insensitive substring
-// over the two strings already on screen: the label, and the description -
-// a group's description IS its JID, the identity anchor, and a contact's is
-// the masked number, so typing either finds the row. Plain `includes`, never
-// a RegExp built from the term: the term and the labels are both
-// attacker-influenced text, and a term like `.*` or `(a+)+` has to stay a
-// literal search rather than become a pattern. Returns the SAME candidate
-// objects in the SAME (ranked) order - this never builds a candidate, so
-// nothing here can invent or alter a JID.
-export function filterCandidates(
-  pool: readonly Candidate[],
-  term: string | undefined,
-): Candidate[] {
-  const needle = (term ?? "").trim().toLowerCase();
-  if (!needle) return [...pool];
-  return pool.filter(
-    (c) =>
-      c.label.toLowerCase().includes(needle) ||
-      c.description.toLowerCase().includes(needle),
-  );
 }
 
 // Every DM contact already in allowFrom, not just the top N new ones - the
@@ -325,7 +239,6 @@ export function listConfiguredDms(
       // is what tells the @lid row apart from the phone one.
       return {
         jid,
-        ref: refFor(jid),
         label: dmLabel(contacts, key),
         description: maskNumber(key),
       };
@@ -336,8 +249,8 @@ export function listConfiguredDms(
   return disambiguate(listed);
 }
 
-// The +/- delta the in-session review shows before it writes anything, and the
-// body of `undo --dry-run`. Pure: takes two access.json snapshots, returns the
+// The +/- delta the picker shows before it writes anything, and what `review`
+// and `undo` report afterwards. Also the body of `undo --dry-run`. Pure: takes two access.json snapshots, returns the
 // JIDs that differ. A group whose `roster` flag changed is neither added nor
 // removed and is deliberately NOT reported - review only offers roster for
 // groups it is granting in the same run, so a roster-only change cannot arise
@@ -368,26 +281,4 @@ export function diffAccess(
       dms: [...prevDms].filter((d) => !nextDms.has(d)).sort(),
     },
   };
-}
-
-// The member half of the DM candidate pool (#12): everyone in a group the
-// owner granted `roster: true`, as JIDs the server already resolved and wrote
-// into groups-meta.json (see server.ts's refreshGroupsMeta). Gated on the
-// CURRENT access.json, not just on the presence of the key, so a `members`
-// array left behind by a revoked grant can never widen the pool.
-export function rosterMemberPool(
-  meta: Record<string, GroupMeta>,
-  groups: Readonly<Record<string, { roster?: boolean }>>,
-): string[] {
-  const pool: string[] = [];
-  const seen = new Set<string>();
-  for (const jid of Object.keys(groups)) {
-    if (groups[jid]?.roster !== true) continue;
-    for (const member of meta[jid]?.members ?? []) {
-      if (seen.has(member)) continue;
-      seen.add(member);
-      pool.push(member);
-    }
-  }
-  return pool;
 }

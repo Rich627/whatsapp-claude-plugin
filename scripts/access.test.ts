@@ -9,7 +9,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { refFor } from "./ranking";
 
 const CLI = join(import.meta.dir, "access.ts");
 
@@ -19,10 +18,19 @@ function freshStateDir(): string {
 
 /** Returns stdout+stderr and the exit code, since failures are part of the contract. */
 function run(dir: string, ...args: string[]): { out: string; code: number } {
+  return runEnv(dir, {}, ...args);
+}
+
+/** Same as `run`, with extra env vars overlaid (e.g. WHATSAPP_PICKER_LAUNCH). */
+function runEnv(
+  dir: string,
+  env: Record<string, string>,
+  ...args: string[]
+): { out: string; code: number } {
   try {
     const out = execFileSync("bun", [CLI, ...args], {
       encoding: "utf8",
-      env: { ...process.env, WHATSAPP_STATE_DIR: dir },
+      env: { ...process.env, WHATSAPP_STATE_DIR: dir, ...env },
       stdio: ["ignore", "pipe", "pipe"],
     });
     return { out, code: 0 };
@@ -30,6 +38,40 @@ function run(dir: string, ...args: string[]): { out: string; code: number } {
     const e = err as { stdout?: string; stderr?: string; status?: number };
     return { out: (e.stdout ?? "") + (e.stderr ?? ""), code: e.status ?? 1 };
   }
+}
+
+// Stands in for the terminal launcher. Prints the argv it was handed (so the
+// test can assert what the platform branch would have run), optionally edits
+// access.json via `body`, then writes the done marker the way the real
+// wizard's exit handler does - so `review` (which polls for that file) ends
+// its wait the same way a real window closing would.
+//
+// Filename has a space on purpose: pickerLaunch()'s .ts/.js override branch
+// runs this file under `process.execPath` with the file's own path as a
+// single args[] element (`{ cmd: process.execPath, args: [override, ...] }`).
+// A space in that path is exactly what would come apart if spawnSync ever
+// went through a shell instead of an argv array - this repo's own install
+// path (`Pull Requests`/`Whatsapp Plugin`, see CLI above) has one for real,
+// so the property is worth pinning down rather than trusting by inspection.
+function writeFakeLauncher(dir: string, body: string): string {
+  const path = join(dir, "fake launcher.ts");
+  writeFileSync(
+    path,
+    [
+      `import { writeFileSync, mkdirSync } from "node:fs";`,
+      `import { join } from "node:path";`,
+      // process.argv[1] is this file's own path, as bun/node resolved it -
+      // printed so the test can confirm it arrived whole, not split at the
+      // space into two argv entries.
+      `console.log("SELF=" + process.argv[1]);`,
+      `console.log(process.argv.slice(2).join(" "));`,
+      `const dir = process.env.WHATSAPP_STATE_DIR!;`,
+      body,
+      `mkdirSync(dir, { recursive: true, mode: 0o700 });`,
+      `writeFileSync(join(dir, ".picker-done"), String(Date.now()), { mode: 0o600 });`,
+    ].join("\n"),
+  );
+  return path;
 }
 
 function writeContacts(
@@ -59,7 +101,6 @@ function writeGroupsMeta(
       archived: boolean;
       lastActivityAt?: number;
       updatedAt: number;
-      members?: string[];
     }
   >,
 ): void {
@@ -104,6 +145,12 @@ describe("allowlist", () => {
   test("removing someone who is not listed fails loudly", () => {
     const dir = freshStateDir();
     expect(run(dir, "remove", "nobody@s.whatsapp.net").code).toBe(1);
+  });
+
+  test("a positional JID (typed by a human) prints unmasked", () => {
+    const dir = freshStateDir();
+    const res = run(dir, "allow", "61403911675@s.whatsapp.net");
+    expect(res.out).toContain("Allowed 61403911675@s.whatsapp.net.");
   });
 
   test("removing a contact also forgets their cached name, not just the allowlist entry", () => {
@@ -595,6 +642,32 @@ describe("wizard", () => {
     expect(res.out).toContain("1 archived group(s) are hidden");
     expect(res.out).not.toContain("2 archived group(s) are hidden");
   });
+
+  // The only proof, along with the test below, that Bun fires
+  // process.on("exit") on the die() path - `review` polls for this file, so
+  // if the wizard's exit handler ever stopped firing here, `review` would
+  // hang until its 30-minute cap on every single "nothing to review" run.
+  test("nothing cached: still writes .picker-done", () => {
+    const dir = freshStateDir();
+    const res = run(dir, "wizard");
+    expect(res.code).toBe(1);
+    expect(existsSync(join(dir, ".picker-done"))).toBe(true);
+  });
+
+  test("needs a real terminal: still writes .picker-done", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": {
+        name: "Family",
+        memberCount: 4,
+        archived: false,
+        updatedAt: 0,
+      },
+    });
+    const res = run(dir, "wizard");
+    expect(res.code).toBe(1);
+    expect(existsSync(join(dir, ".picker-done"))).toBe(true);
+  });
 });
 
 // Issue #1: until this existed the wizard could only ever GRANT, so an
@@ -616,289 +689,104 @@ describe("wizard --revoke", () => {
   });
 });
 
-// #12/#14: the in-session review's opening screen (state) and the ref
-// handshake (--ref) that lets a model act on a candidate without ever
-// seeing a raw JID.
-describe("state (JSON for the in-session review's opening screen)", () => {
-  test("prints the four { items, total } blocks, no jid key, no raw number", () => {
+// T18: `review` opens the picker in a NEW terminal window and reports back
+// only the delta. WHATSAPP_PICKER_LAUNCH names a fixture "launcher" (a .ts
+// run under this same bun) so these tests never open a real terminal.
+describe("review", () => {
+  test("spawn argv + delta + exit 0", () => {
     const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "120363424405607157@g.us": {
-        name: "Team",
-        memberCount: 4,
-        archived: false,
-        updatedAt: 0,
-      },
-    });
-    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
-    run(dir, "allow", "61432609386@s.whatsapp.net");
-    const { out, code } = run(dir, "state");
-    expect(code).toBe(0);
-    expect(out).not.toContain('"jid"');
-    expect(out).not.toContain("61403911675");
-    expect(out).not.toContain("61432609386");
-    const parsed = JSON.parse(out);
-    expect(parsed.groups.candidates.total).toBe(1);
-    expect(parsed.groups.configured.total).toBe(0);
-    expect(parsed.dms.candidates.total).toBe(1);
-    expect(parsed.dms.configured.total).toBe(1);
-    expect(parsed.groups.candidates.items[0]).toEqual({
-      ref: refFor("120363424405607157@g.us"),
-      label: "Team  (4 member(s))",
-      description: "120363424405607157@g.us",
-    });
-  });
-});
-
-describe("state flag parsing", () => {
-  test("an unknown flag exits 1, same strictness as candidates", () => {
-    const dir = freshStateDir();
-    expect(run(dir, "state", "--bogus").code).toBe(1);
-  });
-});
-
-describe("candidates --search", () => {
-  test("returns only label/description matches, still ranked", () => {
-    const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "a@g.us": {
-        name: "Family",
-        memberCount: 3,
-        archived: false,
-        updatedAt: 0,
-      },
-      "b@g.us": { name: "Work", memberCount: 2, archived: false, updatedAt: 0 },
-    });
-    const parsed = JSON.parse(run(dir, "candidates", "--search", "family").out);
-    expect(parsed.groups.items).toHaveLength(1);
-    expect(parsed.groups.items[0].label).toBe("Family  (3 member(s))");
-    expect(parsed.groups.total).toBe(1);
-  });
-
-  test("is case-insensitive", () => {
-    const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "a@g.us": {
-        name: "Family",
-        memberCount: 3,
-        archived: false,
-        updatedAt: 0,
-      },
-    });
-    const parsed = JSON.parse(run(dir, "candidates", "--search", "FAMILY").out);
-    expect(parsed.groups.items).toHaveLength(1);
-    expect(parsed.groups.items[0].label).toBe("Family  (3 member(s))");
-  });
-
-  test("a term matching nothing returns empty items, total 0, exit 0", () => {
-    const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "a@g.us": {
-        name: "Family",
-        memberCount: 3,
-        archived: false,
-        updatedAt: 0,
-      },
-    });
-    const { out, code } = run(dir, "candidates", "--search", "nonexistent");
-    expect(code).toBe(0);
-    const parsed = JSON.parse(out);
-    expect(parsed.groups.items).toEqual([]);
-    expect(parsed.groups.total).toBe(0);
-  });
-
-  test("--search composes with --include-archived", () => {
-    const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "a@g.us": {
-        name: "Family",
-        memberCount: 3,
-        archived: true,
-        updatedAt: 0,
-      },
-    });
-    expect(
-      JSON.parse(run(dir, "candidates", "--search", "family").out).groups.total,
-    ).toBe(0);
-    expect(
-      JSON.parse(
-        run(dir, "candidates", "--search", "family", "--include-archived").out,
-      ).groups.total,
-    ).toBe(1);
-  });
-
-  test("an unknown flag still exits 1", () => {
-    const dir = freshStateDir();
-    expect(run(dir, "candidates", "--bogus").code).toBe(1);
-  });
-});
-
-describe("configured --search", () => {
-  test("filters the configured pool the same way candidates --search does", () => {
-    const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "a@g.us": {
-        name: "Family",
-        memberCount: 3,
-        archived: false,
-        updatedAt: 0,
-      },
-      "b@g.us": { name: "Work", memberCount: 2, archived: false, updatedAt: 0 },
-    });
-    run(dir, "group", "add", "a@g.us");
-    run(dir, "group", "add", "b@g.us");
-    const parsed = JSON.parse(run(dir, "configured", "--search", "family").out);
-    expect(parsed.groups.items).toHaveLength(1);
-    expect(parsed.groups.items[0].label).toBe("Family  (3 member(s))");
-    expect(parsed.groups.total).toBe(1);
-  });
-
-  test("a term matching nothing returns empty items, total 0, exit 0", () => {
-    const dir = freshStateDir();
-    run(dir, "allow", "1@s.whatsapp.net");
-    const { out, code } = run(dir, "configured", "--search", "nonexistent");
-    expect(code).toBe(0);
-    const parsed = JSON.parse(out);
-    expect(parsed.dms.items).toEqual([]);
-    expect(parsed.dms.total).toBe(0);
-  });
-
-  test("an unknown flag still exits 1", () => {
-    const dir = freshStateDir();
-    expect(run(dir, "configured", "--bogus").code).toBe(1);
-  });
-});
-
-describe("--ref resolution", () => {
-  test("a ref taken from state resolves back to the right JID via allow --ref", () => {
-    const dir = freshStateDir();
-    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
-    const parsed = JSON.parse(run(dir, "state").out);
-    const ref = parsed.dms.candidates.items[0].ref;
-    expect(run(dir, "allow", "--ref", ref).code).toBe(0);
-    expect(access(dir).allowFrom).toEqual(["61403911675@s.whatsapp.net"]);
-  });
-
-  test("the same ref is stable across a second state run", () => {
-    const dir = freshStateDir();
-    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
-    const first = JSON.parse(run(dir, "state").out).dms.candidates.items[0].ref;
-    const second = JSON.parse(run(dir, "state").out).dms.candidates.items[0]
-      .ref;
-    expect(second).toBe(first);
-  });
-
-  test("remove --ref on a contact allowlisted under their @lid form removes that exact string, not the phone form", () => {
-    const dir = freshStateDir();
-    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
-    run(dir, "allow", "184710990000999@lid");
-    run(dir, "allow", "61403911675@s.whatsapp.net");
-    const items = JSON.parse(run(dir, "configured").out).dms.items;
-    const lidItem = items.find(
-      (c: { ref: string }) => c.ref === refFor("184710990000999@lid"),
+    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Akash" } });
+    const launcher = writeFakeLauncher(
+      dir,
+      [
+        `writeFileSync(`,
+        `  join(dir, "access.json"),`,
+        `  JSON.stringify({`,
+        `    dmPolicy: "pairing",`,
+        `    allowFrom: ["61403911675@s.whatsapp.net"],`,
+        `    groups: { "1@g.us": { requireMention: false, allowFrom: [], roster: false } },`,
+        `    pending: {},`,
+        `  }, null, 2),`,
+        `);`,
+      ].join("\n"),
     );
-    expect(run(dir, "remove", "--ref", lidItem.ref).code).toBe(0);
-    expect(access(dir).allowFrom).toEqual(["61403911675@s.whatsapp.net"]);
+    const res = runEnv(dir, { WHATSAPP_PICKER_LAUNCH: launcher }, "review");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("bun");
+    expect(res.out).toContain(CLI);
+    expect(res.out).toContain("wizard");
+    // Proves the launcher itself was run under process.execPath with its own
+    // (space-containing) path as a single argv element, not split by a shell.
+    expect(res.out).toContain(`SELF=${launcher}`);
+    expect(res.out).toContain(
+      "Opening the access screen in a new terminal window. Pick there; I only see what changed.",
+    );
+    expect(res.out).toContain("+ Akash");
+    expect(res.out).toContain("(+ = access this grants");
+    expect(res.out).not.toContain("61403911675");
+    expect(existsSync(join(dir, ".picker-done"))).toBe(false);
   });
 
-  test("group add --ref and group rm --ref act on the right group", () => {
+  test("pre-touched marker + a launcher that changes nothing -> Nothing changed, exit 0", () => {
     const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "a@g.us": { name: "Team", memberCount: 2, archived: false, updatedAt: 0 },
-    });
-    const ref = JSON.parse(run(dir, "state").out).groups.candidates.items[0]
-      .ref;
-    expect(run(dir, "group", "add", "--ref", ref).code).toBe(0);
-    expect(access(dir).groups["a@g.us"]).toBeDefined();
-    expect(run(dir, "group", "rm", "--ref", ref).code).toBe(0);
-    expect(access(dir).groups["a@g.us"]).toBeUndefined();
+    writeFileSync(join(dir, ".picker-done"), "stale");
+    const launcher = writeFakeLauncher(dir, "");
+    const res = runEnv(dir, { WHATSAPP_PICKER_LAUNCH: launcher }, "review");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain(
+      "Nothing changed - the access screen was closed without applying anything.",
+    );
+    expect(existsSync(join(dir, ".picker-done"))).toBe(false);
   });
 
-  test("allow --ref on a group ref exits 1 and writes nothing", () => {
+  test("missing launcher -> exit 2 + D2, and the stale marker was removed first", () => {
     const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "a@g.us": { name: "Team", memberCount: 2, archived: false, updatedAt: 0 },
-    });
-    const ref = JSON.parse(run(dir, "state").out).groups.candidates.items[0]
-      .ref;
-    const res = run(dir, "allow", "--ref", ref);
-    expect(res.code).toBe(1);
-    expect(res.out).toContain("is a group, not a contact");
+    writeFileSync(join(dir, ".picker-done"), "stale");
+    const res = runEnv(
+      dir,
+      { WHATSAPP_PICKER_LAUNCH: "whatsapp-no-such-launcher-xyz" },
+      "review",
+    );
+    expect(res.code).toBe(2);
+    expect(res.out).toContain("Could not open a terminal window");
+    expect(res.out).toContain("Run this in your own terminal, then come back:");
+    // The exact D2 command: absolute, quoted, forward slashes even on
+    // Windows (see wizard-cmd.ts) - not just "access.ts" and "wizard"
+    // appearing somewhere.
+    const expectedPath = CLI.replace(/\\/g, "/");
+    expect(
+      expectedPath.startsWith("/") || /^[A-Za-z]:\//.test(expectedPath),
+    ).toBe(true);
+    expect(res.out).toContain(`bun "${expectedPath}" wizard`);
+    expect(res.out).toContain("Nothing was changed.");
+    // Nothing recreated it, so the removal must have happened before the
+    // launch attempt.
+    expect(existsSync(join(dir, ".picker-done"))).toBe(false);
     expect(existsSync(join(dir, "access.json"))).toBe(false);
   });
 
-  test("remove --ref on an unknown ref exits 1", () => {
+  test("takes no arguments", () => {
     const dir = freshStateDir();
-    expect(run(dir, "remove", "--ref", "deadbeef0000").code).toBe(1);
+    const withJid = run(dir, "review", "somebody@s.whatsapp.net");
+    expect(withJid.code).toBe(1);
+    expect(existsSync(join(dir, ".picker-done"))).toBe(false);
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
+
+    const withFlag = run(dir, "review", "--include-archived");
+    expect(withFlag.code).toBe(1);
+    expect(existsSync(join(dir, ".picker-done"))).toBe(false);
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
   });
 
-  test("a ref matching more than one allowlisted entry dies as ambiguous and writes nothing", () => {
-    // Two distinct allowFrom strings that normalizeJid collapses to the same
-    // JID (bare vs. device-suffixed) hash to the SAME ref, since refFor
-    // normalizes internally - the one realistic way two different pool
-    // entries can share a ref without forging a hash collision.
-    const dir = freshStateDir();
-    run(dir, "allow", "61403911675@s.whatsapp.net");
-    run(dir, "allow", "61403911675:5@s.whatsapp.net");
-    const ref = refFor("61403911675@s.whatsapp.net");
-    const before = access(dir);
-    const res = run(dir, "remove", "--ref", ref);
-    expect(res.code).toBe(1);
-    expect(res.out).toContain("ambiguous");
-    expect(access(dir)).toEqual(before);
-  });
-
-  test("passing both a positional JID and --ref exits 1", () => {
-    const dir = freshStateDir();
-    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
-    const ref = JSON.parse(run(dir, "state").out).dms.candidates.items[0].ref;
-    expect(run(dir, "allow", "1@s.whatsapp.net", "--ref", ref).code).toBe(1);
-  });
-});
-
-// A ref exists so a raw JID never has to reach the model - the confirmation
-// line of the command it drives must hold to that too, not just the JSON.
-describe("--ref confirmations never print a raw number", () => {
-  test("allow --ref prints the masked form, not the raw JID", () => {
-    const dir = freshStateDir();
-    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
-    const ref = JSON.parse(run(dir, "state").out).dms.candidates.items[0].ref;
-    const res = run(dir, "allow", "--ref", ref);
-    expect(res.code).toBe(0);
-    expect(res.out).not.toContain("@s.whatsapp.net");
-    expect(res.out).not.toContain("61403911675");
-  });
-
-  test("remove --ref prints the masked form, not the raw JID", () => {
-    const dir = freshStateDir();
-    run(dir, "allow", "61403911675@s.whatsapp.net");
-    const ref = JSON.parse(run(dir, "configured").out).dms.items[0].ref;
-    const res = run(dir, "remove", "--ref", ref);
-    expect(res.code).toBe(0);
-    expect(res.out).not.toContain("@s.whatsapp.net");
-    expect(res.out).not.toContain("61403911675");
-  });
-
-  test("a positional JID (typed by a human) still prints unmasked, as before", () => {
-    const dir = freshStateDir();
-    const res = run(dir, "allow", "61403911675@s.whatsapp.net");
-    expect(res.out).toContain("Allowed 61403911675@s.whatsapp.net.");
-  });
-
-  test("group add --ref / group rm --ref print the group JID (not personal for a modern group), never a raw contact number", () => {
-    const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "a@g.us": { name: "Team", memberCount: 2, archived: false, updatedAt: 0 },
-    });
-    const ref = JSON.parse(run(dir, "state").out).groups.candidates.items[0]
-      .ref;
-    const added = run(dir, "group", "add", "--ref", ref);
-    expect(added.code).toBe(0);
-    const removed = run(dir, "group", "rm", "--ref", ref);
-    expect(removed.code).toBe(0);
-    expect(added.out).not.toContain("@s.whatsapp.net");
-    expect(removed.out).not.toContain("@s.whatsapp.net");
-  });
+  // Skipped, not implemented: PICKER_WAIT_MS (30 * 60_000) and POLL_MS are
+  // local consts inside review() (access.ts ~L821-822), not read from an env
+  // var or a parameter, and nothing in the spec (T18 §2.2 step 7, §7 "no new
+  // dependency... no user-facing knob") offers a way to shrink the cap for a
+  // test. Adding one would mean changing review()'s production code beyond
+  // what this task authorized a test session to touch. Not run: a real
+  // 30-minute wait is not something to eat in a test suite either way.
+  // Flagging for the reviewer/coder rather than guessing at a hook.
+  test.skip("a launcher that never touches the marker hits the 30-minute cap", () => {});
 });
 
 describe("--backup", () => {
@@ -947,24 +835,6 @@ describe("undo", () => {
     const res = run(dir, "undo", "--dryrun");
     expect(res.code).not.toBe(0);
     expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
-  });
-
-  test("group add --ref on a legacy <phone>-<ts>@g.us group masks the number in the config path line too", () => {
-    const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "61403911675-1610000000@g.us": {
-        name: "Legacy",
-        memberCount: 3,
-        archived: false,
-        updatedAt: 1,
-      },
-    });
-    const cand = JSON.parse(run(dir, "candidates").out);
-    const ref = cand.groups.items[0].ref;
-    const res = run(dir, "group", "add", "--ref", ref, "--mention");
-    expect(res.code).toBe(0);
-    expect(res.out).not.toContain("61403911675");
-    expect(res.out).toContain("config.md");
   });
 
   test("--dry-run after a backed-up change prints a +/- line per changed entry, no raw number, modifies neither file", () => {
