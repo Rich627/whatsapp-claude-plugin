@@ -436,6 +436,11 @@ export function reducePicker(
     }
 
     case "space": {
+      // Mid-search, a space is part of the name being typed ("John Smith"),
+      // never a tick - a tick from the search line is Enter.
+      if (state.focus === "search" && state.search.length > 0) {
+        return reducePicker(state, { type: "char", ch: " " });
+      }
       const item = highlighted(state);
       if (!item) return state;
       return toggleTick(state, item.jid);
@@ -825,7 +830,8 @@ function renderChips(
       plain,
       colored: c.struck ? strike(plain, color) : plain,
       width: displayWidth(plain),
-      xCol: displayWidth(plain.slice(0, plain.indexOf("×"))),
+      // lastIndexOf: a self-reported name may itself contain "×".
+      xCol: displayWidth(plain.slice(0, plain.lastIndexOf("×"))),
     };
   });
   const chosen: Piece[] = [];

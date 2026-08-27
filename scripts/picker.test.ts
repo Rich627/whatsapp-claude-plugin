@@ -147,6 +147,24 @@ describe("reducePicker", () => {
     expect(visibleItems(s, "dms")).toEqual([priya]);
   });
 
+  test("Space inside a non-empty search is a filter character, not a tick", () => {
+    const smith = item({ jid: "1@s.whatsapp.net", label: "John Smith" });
+    const doe = item({ jid: "2@s.whatsapp.net", label: "John Doe" });
+    let s = initPicker(model({ dms: [smith, doe] }), 100, 24);
+    s = press(
+      s,
+      { type: "char", ch: "J" },
+      { type: "char", ch: "o" },
+      { type: "char", ch: "h" },
+      { type: "char", ch: "n" },
+      { type: "space" },
+      { type: "char", ch: "S" },
+    );
+    expect(s.search).toBe("John S");
+    expect(s.ticked.size).toBe(0);
+    expect(visibleItems(s, "dms").map((i) => i.jid)).toEqual([smith.jid]);
+  });
+
   test("Enter with an empty search sets done='submit'", () => {
     let s = initPicker(model(), 100, 24);
     s = press(s, { type: "enter" });

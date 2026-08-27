@@ -660,6 +660,17 @@ async function wizard(args: string[]): Promise<void> {
       // Writing back a pre-prompt snapshot would silently revert that.
       const fresh = load();
       const next = applySelection(fresh, res, shown);
+      // What the owner just confirmed was computed against `before`. If the
+      // server changed access.json while the screen was open (a pairing
+      // approval, a removal from another terminal), the delta that would be
+      // written is not the one on screen - refuse rather than guess.
+      const dFresh = diffAccess(fresh, next);
+      if (JSON.stringify(dFresh) !== JSON.stringify(d)) {
+        process.stdout.write(
+          "\nAccess changed while this screen was open - nothing was written. Run it again to see the current state.\n",
+        );
+        return;
+      }
       for (const jid of d.added.groups) provisionGroupFiles(jid);
       // Read before save() overwrites it: whether this run actually took a
       // .bak, so a first-ever run doesn't point UNDO_HINT at a command that
