@@ -106,22 +106,40 @@ A group with roster access also has its member list (JIDs only, no names) cached
 
 ## Guided bulk setup (wizard)
 
-`bun scripts/access.ts wizard` shows one checkbox screen per kind - groups, then
-contacts. **Everything Claude can already reach is pre-ticked**, so the screen shows
-you the current state instead of an empty list: untick to take access away, tick to
-grant. Below the ticked entries sit your **5 most recently active groups** and **10
-most recently active DM contacts** that are not configured yet - the same recency
-signal the WhatsApp app itself sorts its own chat list by. Navigate with the arrow
-keys, toggle with space, submit with enter.
+`bun scripts/access.ts wizard` draws **one screen**: a search line, a `Picked:` chip
+line, then **CONTACTS** on the left and **GROUPS** on the right - everything Claude
+can already reach comes pre-ticked, so the screen shows you the current state instead
+of an empty list. Untick to take access away, tick to grant, in the same pass.
+
+Keys: type to filter both columns, `↑↓` move, `Tab` (or `←→`) switches column,
+`Space` toggles, `Enter` in the search box ticks the highlighted row and clears the
+search, `Enter` on an empty search box submits, `Backspace` on an empty search box
+removes the last chip, `r` flags a group you are granting for roster access, `Ctrl+Z`
+undoes one step, `Ctrl+R` restores the access list from before the last run, `Esc`
+clears the search or quits, `Ctrl+C` quits. Mouse is best effort: click a row to
+toggle it, click a chip's `×` to remove it.
+
+A chip with `-` and struck through is a grant you are taking away; a chip with `+` is
+a new grant.
+
+**It needs a real terminal.** Run it through a pipe or from inside an AI session and
+it says so and exits, rather than hanging.
+
+No caps any more: both columns list everything on record and scroll - the search line
+is how you reach a long list without paging through it.
 
 The in-session `/whatsapp-channel:access review` covers the same ground without leaving the session: it shows groups and contacts three at a time, searches the whole cached pool when you type part of a name, folds removals into the same pass, and shows you the complete list of additions and removals to approve before it writes anything. If you change your mind, `bun scripts/access.ts undo` (or `wizard --undo`) restores the access list from just before that run — one step back, access list only, caches not restored.
 
-- **Groups**: pick which ones Claude can reply in, then (only for the ones you just picked) a second checkbox for which also get roster access. The roster question is asked only about groups you are granting in this run; a group that was already configured keeps the roster flag it has (change it with `group add --roster` / `--no-roster`).
-- **Contacts**: pick which ones can message Claude — added straight to the allowlist, no second question.
-- Each screen shows only the most recent 5 groups / 10 contacts and says so when there are more (`Only showing 5 of 23 (most recent)`). Already-configured entries are never capped and never hidden - a revoke you cannot reach would be worse than a long screen. In the search round a hit is marked `[on]`/`[off]` and picking it toggles it, so search can take access away as well as grant it — each entry toggles once per search round, so answer `n` at the confirm and re-run the wizard to correct a mis-toggle. Archived groups are skipped by default and the wizard says how many it hid — pass `--include-archived` to include them.
+- Roster is still asked only for groups you are granting in this run - flag one with
+  `r` while it is ticked. An already-granted group keeps whatever roster flag it has
+  (change it with `group add --roster` / `--no-roster`).
+- Archived groups are still skipped by default and the wizard says how many it hid —
+  pass `--include-archived` to include them.
 - Nothing is written until you have seen the full `+`/`-` list and answered **Apply these changes?**. Answer `n`, or press Ctrl-C at any point, and nothing is written at all.
 - After a write, `bun scripts/access.ts wizard --undo` (or plain `undo`) puts the access list back to just before that run - run it with `--dry-run` first. Cached names are not restored, only the access list.
 - A group the wizard adds gets `requireMention: true` (only reply when addressed) — a more cautious default than `group add`'s own CLI default of `false` (reply to everything), deliberately: the wizard is the guided path for a less technical setup, the CLI is for someone already comfortable with explicit flags. Change it after the fact with `group add --mention` or `--no-mention`.
+- Narrow terminal (under 70 columns)? The two columns stack instead of sitting side
+  by side. `NO_COLOR` is respected.
 
 ### Taking access back (`wizard --revoke`)
 
@@ -133,15 +151,15 @@ habit or an old note does not break.
   read as "leave everything as it is" - it can neither remove nor grant.
 - Revoking a group keeps its `config.md` and `memory.md`, same as `group rm`, in case
   you add it back.
-- Revoking a contact also forgets their cached name and recency - unless another
-  allowlist entry still resolves to the same person (someone allowlisted under both
-  their `@lid` and phone form), in which case the cache is kept, because the surviving
-  grant still needs it.
+- Revoking a contact **keeps their cached name and recency** - only the allowlist
+  entry goes. `remove <jid>` still forgets a cached name (unchanged), and
+  `forget <jid>` still clears one deliberately - see "Removing someone already
+  granted access" below.
 - Ctrl-C cancels cleanly, and nothing is written until you approve the `+`/`-` list.
 
 It reads the same two functions the in-session `/whatsapp-channel:access manage` screen reads, so the terminal and the chat path cannot disagree about what is configured or what a revoke cleans up.
 
-Group/contact names and recency come from caches (`~/.whatsapp-channel/groups-meta.json`, `dm-activity.json`, `contacts.json`) that only the running server writes — automatically, as WhatsApp reports chat activity, no manual step needed once the account has connected at least once. If it's never connected yet, the wizard has nothing to show; pair it first. `groups-meta.json` is always written; `dm-activity.json` and `contacts.json` follow `WHATSAPP_CACHE_CONTACTS`, which is on unless you set it to `0` (see "Names and privacy" above) — with it off, the DM screen has nothing to rank. The wizard says so on screen instead of silently leaving the contacts screen out: one line when no DM activity is on record at all, another when there is a record but nothing new in it. Its search prompt runs over the whole cached pool, so every contact on record is reachable in one pass, not just the ten most recent.
+Group/contact names and recency come from caches (`~/.whatsapp-channel/groups-meta.json`, `dm-activity.json`, `contacts.json`) that only the running server writes — automatically, as WhatsApp reports chat activity, no manual step needed once the account has connected at least once. If it's never connected yet, the wizard has nothing to show; pair it first. `groups-meta.json` is always written; `dm-activity.json` and `contacts.json` follow `WHATSAPP_CACHE_CONTACTS`, which is on unless you set it to `0` (see "Names and privacy" above) — with it off, the CONTACTS column has nothing to rank. The wizard says so on screen instead of silently leaving the column empty: one line when no DM activity is on record at all, another when there is a record but nothing new in it. Its search line runs over the whole cached pool, so every contact on record is reachable without paging.
 
 It's a terminal command, deliberately not a Claude Code skill: running it yourself, outside any chat, is what makes this true —
 

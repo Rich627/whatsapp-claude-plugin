@@ -28,16 +28,22 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { checkbox, confirm, search } from "@inquirer/prompts";
-import { forgetContact, type ContactsMap } from "./contacts";
+import { confirm } from "@inquirer/prompts";
+import { forgetContact, hasSavedName, type ContactsMap } from "./contacts";
 import { groupAnchor, maskNumber } from "./mask";
+import {
+  applySelection,
+  formatLabel,
+  runPicker,
+  type PickerItem,
+  type PickerModel,
+} from "./picker";
 import {
   contactKeyFor,
   diffAccess,
   filterCandidates,
   listConfiguredDms,
   listConfiguredGroups,
-  mergePools,
   publicCandidates,
   rankDms,
   rankGroups,
@@ -155,13 +161,12 @@ const USAGE = `Usage: bun scripts/access.ts <command>
   policy <${POLICIES.join("|")}>   set the DM policy
   group add <groupJid> | --ref <ref> [--mention|--no-mention] [--allow a,b] [--roster|--no-roster]
   group rm <groupJid>             stop responding in a group (files kept)
-  wizard [--include-archived]     guided access screen, one per kind: what
-                                   Claude can reach today is PRE-TICKED -
-                                   untick to take access away, tick to grant,
-                                   search reaches anything past the cap. Shows
-                                   the +/- list and asks before it writes.
-  wizard --revoke                 an alias for the same screen (revoking is
-                                   unticking there)
+  wizard [--include-archived]     one screen: contacts and groups side by side,
+                                   what Claude can reach today PRE-TICKED. Type to
+                                   filter, space/enter to tick, Submit shows the +/-
+                                   list before anything is written. Needs a real
+                                   terminal.
+  wizard --revoke                 accepted, same screen (revoking is unticking)
   wizard --undo                   put back the access.json from before the
                                    last wizard run (same as "undo")
   state [--include-archived]      JSON: candidates + configured, both pools
@@ -426,104 +431,29 @@ function highlight(text: string): string {
   return `\x1b[1;38;5;208m${text}\x1b[0m`;
 }
 
-const GROUP_CANDIDATE_LIMIT = 5;
-const DM_CANDIDATE_LIMIT = 10;
-
-// `search` resolves to ONE value and has no built-in "done", so the loop is
-// what makes more than one pick possible and Done is a choice like any other.
-// Sentinel value rather than "": a JID always contains "@" and never a NUL
-// byte, so this cannot collide with a real pick even if a cache file holds a
-// junk key.
-const SEARCH_DONE = " done";
-
-function capLine(shown: number, total: number): string {
-  return `Only showing ${shown} of ${total} (most recent) - use the search below to reach the rest.`;
-}
-
 const CACHE_OFF_NOTE =
   'No contacts to review - no DM activity is on record yet. The server records it by default, so let it run and the record builds (never in static mode, and not if you set WHATSAPP_CACHE_CONTACTS=0 - see "Names and privacy" in ACCESS.md).';
 
 const NO_DM_CANDIDATES_NOTE =
   "No contacts to review - nothing new in the cached DM activity: everyone who has messaged recently is already on the allowlist, or nobody has messaged yet.";
 
-// One pick per round, repeated until Done, over the FULL pool for a screen -
-// the checkbox above it only ever shows the configured entries plus the first
-// 5/10 candidates. Two-way since #14's terminal half: a hit that is currently
-// ticked turns OFF, one that is not turns ON, so a configured entry the first
-// screen could not fit is still revokable in the same run.
-//
-// Mutates `selected` in place and acts on each jid at most once per round, so
-// the loop always terminates. `source` reads `selected` live (it re-runs on
-// every keystroke), which is what makes the [on]/[off] marker current. The
-// marker is built HERE and never stored on the candidate: labels stay exactly
-// what ranking.ts produced, everywhere else.
-async function searchToggle(
-  pool: readonly Candidate[],
-  selected: Set<string>,
-  message: string,
-): Promise<void> {
-  const acted = new Set<string>();
-  for (;;) {
-    const remaining = pool.filter((c) => !acted.has(c.jid));
-    if (remaining.length === 0) return;
-    const jid = await search<string>({
-      message,
-      source: (term) => {
-        const done = {
-          name: "Done - nothing more from here",
-          value: SEARCH_DONE,
-        };
-        const hits = filterCandidates(remaining, term).map((c) => ({
-          name: `${selected.has(c.jid) ? "[on]  " : "[off] "}${c.label}`,
-          value: c.jid,
-          description: c.description,
-        }));
-        return term?.trim() ? [...hits, done] : [done, ...hits];
-      },
-    });
-    if (jid === SEARCH_DONE) return;
-    acted.add(jid);
-    if (selected.has(jid)) selected.delete(jid);
-    else selected.add(jid);
-  }
-}
+const NO_GROUPS_NOTE =
+  "No groups on record yet - the server caches group names when it connects, so let it connect at least once.";
 
-// One kind's screen: the cap disclosure, the pre-ticked checkbox, and the
-// search round when (and only when) the candidate pool did not fit. Returns
-// the jids ticked at the end, NOT deltas - the caller knows which of them were
-// already configured.
-async function reviewScreen(
-  candidates: readonly Candidate[],
-  configured: readonly Candidate[],
-  cap: number,
-  message: string,
-  searchMessage: string,
-): Promise<Set<string>> {
-  const capped = candidates.length > cap;
-  if (capped) process.stdout.write(capLine(cap, candidates.length) + "\n");
-  const selected = new Set(
-    await checkbox({
-      message,
-      choices: mergePools(candidates, configured, cap),
-    }),
-  );
-  // Only when something is off-screen: everything configured is always shown,
-  // so with the candidate pool inside the cap there is nothing search reaches
-  // that the checkbox did not.
-  if (capped) {
-    await searchToggle([...configured, ...candidates], selected, searchMessage);
-  }
-  return selected;
-}
+const NO_SAVED_NAMES_NOTE =
+  "No saved contact names have arrived from WhatsApp yet either - the server asks for your address book once on connect, so they fill in by themselves.";
 
-// Guided setup for the account's groups and contacts: one screen per kind.
-// What Claude can already reach comes pre-ticked - so the screen shows
-// current state, and unticking IS the revoke - then the most recently active
-// groups/contacts not yet configured, top 5 / top 10 by recency, the same
-// way WhatsApp's own app orders its chat list, so review stays to one screen
-// instead of every group/contact ever seen. Anything beyond that is
-// reachable one at a time through a two-way search round after each screen,
-// over the full eligible pool - or later via `group add`/`allow`.
+const NEEDS_TERMINAL =
+  "The access screen needs a real terminal - stdin here is not one.\n" +
+  "Run it directly in your own terminal window (not through a pipe, a script or an AI session), " +
+  'or change one entry at a time with "allow", "remove", "group add" or "group rm".';
+
+// One screen: a search line, a `Picked:` chip line, then CONTACTS left and
+// GROUPS right, everything Claude can already reach pre-ticked. Untick to
+// take access away, tick to grant, in the same pass. What Claude can already
+// reach comes pre-ticked - so the screen shows current state, and unticking
+// IS the revoke. Nothing is written until the whole +/- list is shown and
+// answered.
 //
 // Terminal, not chat: this is what makes "no data went to an AI" literally
 // true (no model runs during the decision), and it works for any client
@@ -533,218 +463,226 @@ async function reviewScreen(
 // them, since only it holds the live WhatsApp connection.
 async function wizard(args: string[]): Promise<void> {
   const includeArchived = args.includes("--include-archived");
-  const a = load();
-  const lidMap = loadLidMap();
-  const meta = loadGroupsMeta();
-  const contacts = loadContacts();
-  const configuredGroupJids = new Set(Object.keys(a.groups));
-
-  // Ranked uncapped, capped inside reviewScreen: the pool length is what the
-  // cap line discloses and what the search round searches.
-  const groupCandidates = rankGroups(
-    meta,
-    configuredGroupJids,
-    includeArchived,
-  );
-  const configuredGroups = listConfiguredGroups(a.groups, meta);
-  const dmCandidates = rankDms(loadDmActivity(), contacts, a.allowFrom, lidMap);
-  const configuredDms = listConfiguredDms(a.allowFrom, contacts, lidMap);
-  const configuredDmJids = new Set(configuredDms.map((c) => c.jid));
-
-  // Eligible-but-archived, counted the same way rankGroups filters: a group
-  // already configured was never a candidate, archived or not.
-  const hiddenArchived = includeArchived
-    ? 0
-    : Object.entries(meta).filter(
-        ([jid, g]) => g.archived && !configuredGroupJids.has(jid),
-      ).length;
-
-  if (
-    groupCandidates.length === 0 &&
-    configuredGroups.length === 0 &&
-    dmCandidates.length === 0 &&
-    configuredDms.length === 0
-  ) {
-    die(NOTHING_TO_REVIEW);
-  }
-
+  // `--revoke` is accepted and does nothing: one screen already grants and
+  // revokes, so the old name only has to keep working (USAGE + skills still
+  // name it).
   const disclose = () =>
     process.stdout.write(`\n${highlight(PRIVACY_DISCLOSURE)}\n`);
 
-  let groupSel = new Set<string>();
-  let dmSel = new Set<string>();
-  let rosterGroups: string[] = [];
+  for (;;) {
+    // Model build, from disk every pass - identical data calls to before,
+    // ranking arguments unchanged.
+    const a = load();
+    const lidMap = loadLidMap();
+    const meta = loadGroupsMeta();
+    const contacts = loadContacts();
+    const configuredGroupJids = new Set(Object.keys(a.groups));
+    const groupCandidates = rankGroups(
+      meta,
+      configuredGroupJids,
+      includeArchived,
+    );
+    const configuredGroups = listConfiguredGroups(a.groups, meta);
+    const dmCandidates = rankDms(
+      loadDmActivity(),
+      contacts,
+      a.allowFrom,
+      lidMap,
+    );
+    const configuredDms = listConfiguredDms(a.allowFrom, contacts, lidMap);
+    const configuredDmJids = new Set(configuredDms.map((c) => c.jid));
 
-  try {
+    // Eligible-but-archived, counted the same way rankGroups filters: a group
+    // already configured was never a candidate, archived or not.
+    const hiddenArchived = includeArchived
+      ? 0
+      : Object.entries(meta).filter(
+          ([jid, g]) => g.archived && !configuredGroupJids.has(jid),
+        ).length;
+
+    // Order of these three exits is load-bearing (see access.test.ts): (1)
+    // truly nothing to review, whether or not there is a terminal - the
+    // cheaper truth; (2) the archived-hidden note, printed before the screen
+    // so it survives a piped/redirected run; (3) only then the terminal
+    // guard, since the screen itself needs raw mode.
+    if (
+      groupCandidates.length === 0 &&
+      configuredGroups.length === 0 &&
+      dmCandidates.length === 0 &&
+      configuredDms.length === 0
+    ) {
+      die(NOTHING_TO_REVIEW);
+    }
+
     if (hiddenArchived > 0) {
       process.stdout.write(
         `${hiddenArchived} archived group(s) are hidden - re-run with --include-archived to include them.\n`,
       );
     }
 
-    if (groupCandidates.length > 0 || configuredGroups.length > 0) {
-      groupSel = await reviewScreen(
-        groupCandidates,
-        configuredGroups,
-        GROUP_CANDIDATE_LIMIT,
-        "Which groups can Claude reply in? (already ticked = it can today - untick to take that away)",
-        "Search for a group to add or remove (or pick Done):",
-      );
-      // Roster is asked only about groups being granted in THIS run - see
-      // diffAccess's own comment in ranking.ts. A group that was already
-      // configured keeps whatever roster flag it has.
-      const newGroups = [...groupSel].filter(
-        (jid) => !configuredGroupJids.has(jid),
-      );
-      if (newGroups.length > 0) {
-        rosterGroups = await checkbox({
-          message:
-            'Of those, which can Claude also see member names in (for "all" mentions)?',
-          choices: groupCandidates
-            .filter((c) => newGroups.includes(c.jid))
-            .map((c) => ({ name: c.label, value: c.jid })),
-        });
-      }
-    }
+    if (!process.stdin.isTTY) die(NEEDS_TERMINAL);
 
-    if (dmCandidates.length > 0 || configuredDms.length > 0) {
-      dmSel = await reviewScreen(
-        dmCandidates,
-        configuredDms,
-        DM_CANDIDATE_LIMIT,
-        "Which contacts can message Claude? (already ticked = they can today - untick to take that away)",
-        "Search for a contact to add or remove (or pick Done):",
-      );
-    } else {
-      // unchanged: two different observations, one line for whichever applies
-      process.stdout.write(
-        (existsSync(DM_ACTIVITY_FILE)
-          ? NO_DM_CANDIDATES_NOTE
-          : CACHE_OFF_NOTE) + "\n",
-      );
-    }
+    const dmsEmpty = dmCandidates.length === 0 && configuredDms.length === 0;
+    const groupsEmpty =
+      groupCandidates.length === 0 && configuredGroups.length === 0;
 
-    // The decision, applied to whatever access.json says at the moment of the
-    // call - used twice: once against a snapshot to render the delta, once
-    // against a fresh read to write. Never rewrites an entry it is keeping.
-    const applyTo = (base: Access): Access => {
-      const groups = { ...base.groups };
-      for (const jid of configuredGroupJids) {
-        if (!groupSel.has(jid)) delete groups[jid];
-      }
-      for (const jid of groupSel) {
-        if (groups[jid]) continue; // kept, not re-granted: flags survive
-        groups[jid] = {
-          requireMention: true,
-          allowFrom: [],
-          roster: rosterGroups.includes(jid),
-        };
-      }
-      // Drop ONLY an entry this screen showed and the user unticked. An
-      // allowFrom entry the SERVER added while the prompts were open (a
-      // pairing approval) was never on screen, so it is kept.
-      const allowFrom = base.allowFrom.filter(
-        (j) => !configuredDmJids.has(j) || dmSel.has(j),
-      );
-      for (const jid of dmSel) {
-        if (!allowFrom.includes(jid)) allowFrom.push(jid);
-      }
-      return { ...base, groups, allowFrom };
+    const buildItem = (
+      c: Candidate,
+      kind: "group" | "dm",
+      granted: boolean,
+    ): PickerItem => ({
+      jid: c.jid,
+      label: formatLabel(c.label),
+      kind,
+      granted,
+      roster: kind === "group" && granted ? !!a.groups[c.jid]?.roster : false,
+    });
+    // `hasSavedName` (T16) is what makes the empty-contacts message honest
+    // when the address-book sync has not delivered yet - a cache full of
+    // .notify-only entries is indistinguishable from a healthy one by size.
+    const model: PickerModel = {
+      dms: [
+        ...configuredDms.map((c) => buildItem(c, "dm", true)),
+        ...dmCandidates.map((c) => buildItem(c, "dm", false)),
+      ],
+      groups: [
+        ...configuredGroups.map((c) => buildItem(c, "group", true)),
+        ...groupCandidates.map((c) => buildItem(c, "group", false)),
+      ],
+      dmNote: dmsEmpty
+        ? (existsSync(DM_ACTIVITY_FILE)
+            ? NO_DM_CANDIDATES_NOTE
+            : CACHE_OFF_NOTE) +
+          (hasSavedName(contacts) ? "" : " " + NO_SAVED_NAMES_NOTE)
+        : "",
+      groupNote: groupsEmpty ? NO_GROUPS_NOTE : "",
+      hasBackup: existsSync(ACCESS_BAK_FILE),
+      color: !!process.stdout.isTTY && !process.env.NO_COLOR,
     };
 
-    const before = load();
-    const d = diffAccess(before, applyTo(before));
-    const nothing =
-      d.added.groups.length === 0 &&
-      d.added.dms.length === 0 &&
-      d.removed.groups.length === 0 &&
-      d.removed.dms.length === 0;
-    if (nothing) {
-      process.stdout.write(
-        "\nNothing changed - your ticks match what was already set up.\n",
-      );
-      disclose();
-      return;
-    }
-
-    // Labels from the lists that were on screen; masked fallback otherwise -
-    // same rule undo() uses, and the reason a raw number never reaches this
-    // output.
-    const labels = new Map(
-      [
-        ...configuredGroups,
-        ...groupCandidates,
-        ...configuredDms,
-        ...dmCandidates,
-      ].map((c) => [c.jid, c]),
-    );
-    const shown = (jid: string): string => {
-      const c = labels.get(jid);
-      if (c) return `${c.label}  [${c.description}]`;
-      return jid.endsWith("@g.us") ? groupAnchor(jid) : maskNumber(jid);
-    };
-    const lines = [
-      ...d.added.groups.map((j) => `+ ${shown(j)}`),
-      ...d.added.dms.map((j) => `+ ${shown(j)}`),
-      ...d.removed.groups.map((j) => `- ${shown(j)}`),
-      ...d.removed.dms.map((j) => `- ${shown(j)}`),
-      "(+ = access this grants, - = access this takes away)",
-    ];
-    process.stdout.write(`\n${lines.join("\n")}\n`);
-
-    if (!(await confirm({ message: "Apply these changes?", default: true }))) {
-      process.stdout.write("\nCancelled - nothing was changed.\n");
-      disclose();
-      return;
-    }
-
-    // Re-load AFTER the confirm, for the reason the old code re-loaded after
-    // the checkboxes: every prompt blocks on the user for an unbounded time
-    // and the server can write access.json in that window (a pairing approval
-    // appended to allowFrom, a pending code created or pruned). Writing back a
-    // pre-prompt snapshot would silently revert that.
-    const fresh = load();
-    const next = applyTo(fresh);
-    for (const jid of d.added.groups) provisionGroupFiles(jid);
-    // Read before save() overwrites it: whether this run actually took a
-    // .bak, so a first-ever run doesn't point UNDO_HINT at a command that
-    // only answers "no previous access file - nothing to undo".
-    const tookBackup = existsSync(ACCESS_FILE);
-    // backup: true on the one and only write of the run, so a single `undo`
-    // reverses the whole run.
-    save(next, { backup: true });
-
-    process.stdout.write(
-      `\nApplied: ${d.added.groups.length} group(s) and ${d.added.dms.length} contact(s) granted, ` +
-        `${d.removed.groups.length} group(s) and ${d.removed.dms.length} contact(s) revoked.\n`,
-    );
-    if (d.removed.groups.length > 0) {
-      process.stdout.write(
-        "Revoked groups keep their config.md and memory.md, in case you add them back.\n",
-      );
-    }
-    // Cache cleanup runs AFTER the write and against the POST-write allowFrom -
-    // revokeCachedIdentity's "another entry still resolves to this contact"
-    // check depends on it (see its comment).
-    for (const jid of d.removed.dms) {
-      const label = labels.get(jid)?.label ?? maskNumber(jid);
-      process.stdout.write(
-        `- ${label}: DM access removed.${CACHE_NOTE[revokeCachedIdentity(next.allowFrom, jid)]}\n`,
-      );
-    }
-    if (tookBackup) process.stdout.write(`${UNDO_HINT}\n`);
-  } catch (err) {
-    // @inquirer/prompts throws this on Ctrl-C/Ctrl-D. Every prompt in this
-    // function runs before save(), so there is still nothing to roll back -
-    // just a clean message instead of a raw stack trace. No disclosure line
-    // here: nothing was decided, same as today.
-    if (err instanceof Error && err.name === "ExitPromptError") {
+    const res = await runPicker(model);
+    if (res === null) {
+      // No disclosure line: nothing was decided.
       process.stdout.write("\nCancelled - nothing was changed.\n");
       return;
     }
-    throw err;
+
+    try {
+      if (res.action === "restore") {
+        if (
+          await confirm({
+            message: "Put back the access.json from before the last run?",
+            default: false,
+          })
+        ) {
+          undo([]); // existing function, existing semantics, prints its own +/- lines
+        }
+        continue; // rebuild the model from disk and redraw
+      }
+
+      const shown = { groups: configuredGroupJids, dms: configuredDmJids };
+      const before = load();
+      const d = diffAccess(before, applySelection(before, res, shown));
+      const nothing =
+        d.added.groups.length === 0 &&
+        d.added.dms.length === 0 &&
+        d.removed.groups.length === 0 &&
+        d.removed.dms.length === 0;
+      if (nothing) {
+        process.stdout.write(
+          "\nNothing changed - your ticks match what was already set up.\n",
+        );
+        disclose();
+        return;
+      }
+
+      // Labels from the lists that were on screen; masked fallback otherwise -
+      // same rule undo() uses, and the reason a raw number never reaches this
+      // output.
+      const labels = new Map(
+        [
+          ...configuredGroups,
+          ...groupCandidates,
+          ...configuredDms,
+          ...dmCandidates,
+        ].map((c) => [c.jid, c]),
+      );
+      // formatLabel, not raw c.label: this is what the operator reads right
+      // above "Apply these changes?" - the same security rule that sanitises
+      // a drawn row/chip (self-reported names are attacker-chosen) applies
+      // to this consent list too (review finding 3).
+      const labelShown = (jid: string): string => {
+        const c = labels.get(jid);
+        if (c) return `${formatLabel(c.label)}  [${c.description}]`;
+        return jid.endsWith("@g.us") ? groupAnchor(jid) : maskNumber(jid);
+      };
+      const lines = [
+        ...d.added.groups.map((j) => `+ ${labelShown(j)}`),
+        ...d.added.dms.map((j) => `+ ${labelShown(j)}`),
+        ...d.removed.groups.map((j) => `- ${labelShown(j)}`),
+        ...d.removed.dms.map((j) => `- ${labelShown(j)}`),
+        "(+ = access this grants, - = access this takes away)",
+      ];
+      process.stdout.write(`\n${lines.join("\n")}\n`);
+
+      if (
+        !(await confirm({ message: "Apply these changes?", default: true }))
+      ) {
+        process.stdout.write("\nCancelled - nothing was changed.\n");
+        disclose();
+        return;
+      }
+
+      // Re-load AFTER the confirm, for the reason the old code re-loaded after
+      // the checkboxes: every prompt blocks on the user for an unbounded time
+      // and the server can write access.json in that window (a pairing
+      // approval appended to allowFrom, a pending code created or pruned).
+      // Writing back a pre-prompt snapshot would silently revert that.
+      const fresh = load();
+      const next = applySelection(fresh, res, shown);
+      for (const jid of d.added.groups) provisionGroupFiles(jid);
+      // Read before save() overwrites it: whether this run actually took a
+      // .bak, so a first-ever run doesn't point UNDO_HINT at a command that
+      // only answers "no previous access file - nothing to undo".
+      const tookBackup = existsSync(ACCESS_FILE);
+      // backup: true on the one and only write of the run, so a single
+      // `undo` reverses the whole run.
+      save(next, { backup: true });
+
+      process.stdout.write(
+        `\nApplied: ${d.added.groups.length} group(s) and ${d.added.dms.length} contact(s) granted, ` +
+          `${d.removed.groups.length} group(s) and ${d.removed.dms.length} contact(s) revoked.\n`,
+      );
+      if (d.removed.groups.length > 0) {
+        process.stdout.write(
+          "Revoked groups keep their config.md and memory.md, in case you add them back.\n",
+        );
+      }
+      // Owner decision (artifact Q2): revoking DM access here keeps the
+      // cached name - nothing that forgets it is called. `forget <jid>`
+      // stays the deliberate way to clear one.
+      if (d.removed.dms.length > 0) {
+        process.stdout.write(
+          'Revoked contacts keep their cached name - "forget <jid>" clears one.\n',
+        );
+      }
+      if (tookBackup) process.stdout.write(`${UNDO_HINT}\n`);
+      disclose();
+      return;
+    } catch (err) {
+      // @inquirer/prompts throws this on Ctrl-C/Ctrl-D from `confirm` - still
+      // used here for "Apply these changes?" and the Restore prompt. Every
+      // confirm() in this function runs before save(), so there is still
+      // nothing to roll back - just a clean message instead of a raw stack
+      // trace. `runPicker` returning null is the picker's own cancel path
+      // and never reaches this catch.
+      if (err instanceof Error && err.name === "ExitPromptError") {
+        process.stdout.write("\nCancelled - nothing was changed.\n");
+        return;
+      }
+      throw err;
+    }
   }
-  disclose();
 }
 
 // Read-only JSON for the in-session `review` and `manage` screens in
