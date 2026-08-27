@@ -57,6 +57,7 @@ import {
 } from "./lib/mentions";
 import { logContainsId } from "./lib/message-log-probe";
 import { RECENT_LIMIT, recentWindow, renderLogEntry } from "./lib/message-view";
+import { formatSentLine, parseSentLog } from "./lib/sent-log";
 import {
   contactName,
   mergeContact,
@@ -95,6 +96,10 @@ const CONTACTS_FILE = join(STATE_DIR, "contacts.json");
 const GROUPS_META_FILE = join(STATE_DIR, "groups-meta.json");
 const DM_ACTIVITY_FILE = join(STATE_DIR, "dm-activity.json");
 const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
+// Durable half of trackSent: every message id THIS server sent, so a restart
+// or a >5 min drop cannot make a replayed own send look like the owner typing
+// on their phone (see isOwnerHandReply). Never contains an inbound id.
+const SENT_LOG = join(STATE_DIR, "sent.jsonl");
 const TASKS_FILE = join(STATE_DIR, "tasks.md");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
 const IPC_TOKEN_FILE = join(STATE_DIR, ".ipc-token");
@@ -989,6 +994,10 @@ async function becomePrimary(): Promise<void> {
   // stopped: there is no primary → secondary transition to stop them for.
   if (!STATIC) setInterval(checkApprovals, 5000).unref();
   setInterval(pruneMessageLog, 60 * 60 * 1000).unref();
+  // A promoted secondary loaded sent.jsonl at ITS boot; the primary it is
+  // replacing kept appending since. Re-read before the socket opens, or its
+  // replayed sends read as hand replies (the bug this file exists to close).
+  pruneSentLog();
   await startIpcListener();
   await connectWhatsApp();
 }
@@ -1907,8 +1916,35 @@ function chunk(
 
 const sentMessages = new Map<string, number>();
 
+// Same 24h window messages.jsonl uses, so both logs age out together.
+const SENT_TTL_MS = 24 * 60 * 60 * 1000;
+
+function readSentLog(): string {
+  try {
+    return existsSync(SENT_LOG) ? readFileSync(SENT_LOG, "utf8") : "";
+  } catch {
+    return "";
+  }
+}
+
+// Boot: everything this server sent in the last 24h, across restarts.
+// `let` because pruneSentLog rebuilds it from what survives the rewrite.
+let durableSentIds = parseSentLog(readSentLog(), Date.now() - SENT_TTL_MS).ids;
+
 function trackSent(key: WAMessageKey): void {
-  if (key.id) sentMessages.set(key.id, Date.now());
+  if (!key.id) return;
+  const now = Date.now();
+  sentMessages.set(key.id, now);
+  durableSentIds.add(key.id);
+  // Never throws into a send: a failure here degrades to today's behaviour
+  // (in-memory only), it must not turn a delivered message into an error.
+  try {
+    appendFileSync(SENT_LOG, formatSentLine(key.id, now) + "\n", {
+      mode: 0o600,
+    });
+  } catch (err) {
+    logDiag(`${LOG_PREFIX}: failed to persist sent id: ${err}\n`);
+  }
 }
 
 // Every send this server makes has to be tracked, not just the reply tool's:
@@ -1926,18 +1962,25 @@ async function sendTracked(
   return sent;
 }
 
+// The Map is the fast in-memory path (5 min); durableSentIds is the same fact read
+// back from sent.jsonl and therefore survives a restart. Either one is proof
+// this server sent it.
+function wasSentByServer(id: string | null | undefined): boolean {
+  return !!id && (sentMessages.has(id) || durableSentIds.has(id));
+}
+
 function isEcho(key: WAMessageKey): boolean {
   if (key.fromMe) return true;
-  return key.id ? sentMessages.has(key.id) : false;
+  return wasSentByServer(key.id);
 }
 
 // isEcho's `fromMe` clause treats every message from this account as our own
-// echo — including the ones the owner types on their phone. `sentMessages` is
+// echo — including the ones the owner types on their phone. wasSentByServer is
 // the only real test of "this server sent it" (see trackSent), so a fromMe
-// message that is NOT in it is the owner replying by hand.
+// message that is NOT recorded there is the owner replying by hand.
 function isOwnerHandReply(key: WAMessageKey): boolean {
   if (!key.fromMe) return false;
-  return !(key.id && sentMessages.has(key.id));
+  return !wasSentByServer(key.id);
 }
 
 // Fork default (owner, 2026-08-26): the owner's own display name, never the
@@ -2132,8 +2175,29 @@ function getRecentByChat(
   return byChat;
 }
 
+/** Drop sent ids older than 24h and rebuild the in-memory set from what is
+ *  left. Rides pruneMessageLog's hourly tick (registered in becomePrimary, which also calls this once on promotion)
+ *  rather than adding a second timer. */
+function pruneSentLog(): void {
+  try {
+    if (!existsSync(SENT_LOG)) return;
+    const { ids, lines } = parseSentLog(
+      readSentLog(),
+      Date.now() - SENT_TTL_MS,
+    );
+    durableSentIds = ids;
+    writeFileSync(SENT_LOG, lines.length ? lines.join("\n") + "\n" : "", {
+      mode: 0o600,
+    });
+  } catch {}
+}
+
 /** Prune entries older than 24h to keep the log small */
 function pruneMessageLog(): void {
+  // First: pruneMessageLog returns early when messages.jsonl does not exist
+  // yet, and sent.jsonl can exist without it (pairing notices go to chats
+  // that are never logged).
+  pruneSentLog();
   try {
     if (!existsSync(MESSAGE_LOG)) return;
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
@@ -3334,13 +3398,12 @@ async function logOwnerHandReply(msg: WAMessage): Promise<void> {
   // it would silently leave `unreplied`. Our sends persist under their real
   // message id, so an id already in the log means replay.
   //
-  // ponytail: this covers only sends whose id we PERSIST, which is chunk 1 of
-  // a reply (:2681 writes sentIds[0] alone). Still misclassifiable after a
-  // restart: chunks 2..N of a long reply, the `/new` ack (:3430) and the two
-  // pairing notices (:1669, :3419) - none of those reach messages.jsonl. The
-  // `/new` one is reachable on demand: any allowlisted contact can type it.
-  // The real fix is making trackSent durable (one choke point, all 12 sends);
-  // left for the owner because it adds a state file. See HANDOFF.md.
+  // Since 0.22.0 the primary defence is durable: trackSent records every id
+  // this server sends in sent.jsonl (24h), so wasSentByServer catches a
+  // replayed own send before it ever reaches here — chunks 2..N of a long
+  // reply, the `/new` ack and the pairing notices included, none of which
+  // reach messages.jsonl. This check stays as the second line: it also makes
+  // logOwnerHandReply idempotent for an id we genuinely did log.
   if (msg.key.id && isAlreadyLogged(msg.key.id)) return;
 
   const tsSec =

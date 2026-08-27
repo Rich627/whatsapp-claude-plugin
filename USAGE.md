@@ -152,6 +152,12 @@ removes it, the same as every other message there. Messages Claude sent and mess
 received keep the existing 24-hour window in full. There is **no backfill**: the plugin only sees messages
 while it is running, so anything you typed while it was stopped is gone for good.
 
+Separately, `~/.whatsapp-channel/sent.jsonl` records only the **id and timestamp** of messages the
+plugin itself has sent — never the text, phone number, or chat. It exists because WhatsApp can
+re-deliver the plugin's own recent messages after a restart, and without this record they would
+look like replies you typed yourself, wrongly clearing a chat's unreplied list. It is pruned to
+the same 24 hours as `messages.jsonl` and created with owner-only permissions.
+
 ## Photos & Media
 
 Inbound **photos** are downloaded eagerly to `~/.whatsapp-channel/inbox/` and the local path is included in the notification so the assistant can read it.
