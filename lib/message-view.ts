@@ -30,6 +30,15 @@ export function awaitingReply(entry: {
   );
 }
 
+/** The ONE drop the log keeps for context: a configured group's message
+ *  that simply did not mention the agent. Every other drop stores nothing. */
+export function keepDroppedForContext(
+  isGroup: boolean,
+  reason: string | undefined,
+): boolean {
+  return isGroup && reason === "no-mention";
+}
+
 /** Suffix on the sender of an entry that was never addressed to the agent. */
 export const NOT_ADDRESSED = " (not addressed to Claude)";
 

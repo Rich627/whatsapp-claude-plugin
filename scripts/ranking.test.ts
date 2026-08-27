@@ -427,6 +427,16 @@ describe("rankDms", () => {
     expect(result[0].jid).toBe("61403911675@s.whatsapp.net");
   });
 
+  test("lid-keyed activity and a phone-keyed saved name for the same person are one row", () => {
+    const activity = { "123456@lid": 100 };
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Thilian" },
+    };
+    const lidMap = { "123456@lid": "61403911675@s.whatsapp.net" };
+    const result = rankDms(activity, contacts, [], lidMap, 10);
+    expect(result).toHaveLength(1);
+  });
+
   test("the limit slices the combined pool, activity first", () => {
     const activity = { "61403911675@s.whatsapp.net": 100 };
     const contacts: ContactsMap = {

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   awaitingReply,
+  keepDroppedForContext,
   NOT_ADDRESSED,
   recentWindow,
   renderLogEntry,
@@ -151,6 +152,15 @@ describe("awaitingReply", () => {
   test("outbound or replied: not waiting", () => {
     expect(awaitingReply({ replied: false, direction: "out" })).toBe(false);
     expect(awaitingReply({ replied: true, direction: "in" })).toBe(false);
+  });
+});
+
+describe("keepDroppedForContext", () => {
+  test("only a group's no-mention drop is kept", () => {
+    expect(keepDroppedForContext(true, "no-mention")).toBe(true);
+    expect(keepDroppedForContext(false, "no-mention")).toBe(false);
+    expect(keepDroppedForContext(true, undefined)).toBe(false);
+    expect(keepDroppedForContext(true, "not-allowed")).toBe(false);
   });
 });
 

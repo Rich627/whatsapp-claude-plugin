@@ -328,7 +328,11 @@ function enterTarget(state: PickerState): "dms" | "groups" | null {
 }
 
 function highlighted(state: PickerState): PickerItem | null {
-  const column = focusedColumn(state);
+  // The SAME target the marker is drawn on: with the caret in the search
+  // line and a filter typed, that is enterTarget's column, not the column
+  // that was focused before typing - otherwise Space could tick a row the
+  // screen never marked (review finding on aab1036).
+  const column = enterTarget(state) ?? focusedColumn(state);
   const visible = visibleItems(state, column);
   const idx = state.cursor[column];
   return visible[idx] ?? null;

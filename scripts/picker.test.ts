@@ -188,6 +188,20 @@ describe("reducePicker", () => {
     expect(s.ticked.has(family.jid)).toBe(true); // untouched
   });
 
+  test("Space with the caret in the search line ticks the MARKED row, not the previously focused column", () => {
+    const alice = item({ jid: "1@s.whatsapp.net", label: "Alice", kind: "dm" });
+    const zeta = item({ jid: "g1@g.us", label: "Zeta Group", kind: "group" });
+    let s = initPicker(model({ dms: [alice], groups: [zeta] }), 100, 24);
+    s = press(s, { type: "tab" }); // groups focused
+    s = press(s, { type: "char", ch: "a" }); // snaps to search; both match
+    const marked = layout(s, 100, 24)
+      .map(stripAnsi)
+      .find((l) => l.startsWith(">"));
+    expect(marked).toContain("Alice");
+    s = press(s, { type: "space" });
+    expect([...s.ticked]).toEqual([alice.jid]);
+  });
+
   test("Tab cycles dms -> groups -> search -> dms; up/down move and clamp at both ends; empty column is a no-op", () => {
     let s = initPicker(model({ dms: [rohan, priya], groups: [] }), 100, 24);
     s = press(s, { type: "tab" });

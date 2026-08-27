@@ -58,6 +58,7 @@ import {
 import { logContainsId } from "./lib/message-log-probe";
 import {
   awaitingReply,
+  keepDroppedForContext,
   RECENT_LIMIT,
   recentWindow,
   renderLogEntry,
@@ -3578,8 +3579,12 @@ async function handleMessage(msg: WAMessage): Promise<void> {
     // room when the owner wants to write to it. It is never routed, notified
     // or counted as unreplied - `routed: false` is what getUnreplied and the
     // catch_up counter key on. Every other drop reason stores nothing.
-    if (isGroup && result.reason === "no-mention") {
-      const kept = text || (msg.message ? "(media)" : "");
+    if (keepDroppedForContext(isGroup, result.reason)) {
+      // Same content rule as the delivered path: real media becomes
+      // "(image)" etc.; reactions, edits, revokes and poll updates carry no
+      // content and are not kept.
+      const dropMedia = classifyMedia(msg.message);
+      const kept = text || (dropMedia ? `(${dropMedia.kind})` : "");
       if (kept) {
         const groupName = await resolveGroupName(remoteJid);
         persistMessage({

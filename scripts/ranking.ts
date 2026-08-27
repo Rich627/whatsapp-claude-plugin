@@ -218,10 +218,12 @@ export function rankDms(
   );
   const seen = new Set<string>();
   const activityRows = Object.entries(activity)
-    .filter(([jid]) => !alreadyAllowed.has(jid))
+    .filter(([jid]) => !alreadyAllowed.has(contactKeyFor(lidMap, jid)))
     .sort(([aj, a], [bj, b]) => b - a || aj.localeCompare(bj))
     .map(([jid]) => {
-      seen.add(jid);
+      // Same key the address-book loop de-dupes on, so one person cached
+      // under @lid activity and a phone-keyed saved name is one row.
+      seen.add(contactKeyFor(lidMap, jid));
       return {
         jid,
         label: dmLabel(contacts, jid),
