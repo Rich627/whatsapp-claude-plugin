@@ -26,7 +26,8 @@
  * If neither finds anything, one last check: is one of our own ancestors a
  * Claude Code CLI launched with this channel on its command line? Then a
  * server is on its way and we print a dim "WA:…" instead of nothing. Claude
- * Code does not re-render the statusline while the session is idle, so a
+ * Code does not re-render the statusline while the session is idle (unless
+ * the statusLine has a `refreshInterval`, which USAGE.md recommends), so a
  * blank first paint stays blank until the user types - 16-22 s of "is this
  * thing on?". The marker means requested, not confirmed; a real role always
  * wins over it, and the server writing "starting" before it knows its role

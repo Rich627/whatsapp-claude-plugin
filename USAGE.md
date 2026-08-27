@@ -252,10 +252,17 @@ holds the real connection:
 {
   "statusLine": {
     "type": "command",
+    "refreshInterval": 5,
     "command": "your-existing-statusline-command && bun <plugin-dir>/scripts/statusline-role.ts"
   }
 }
 ```
+
+`refreshInterval` matters: without it Claude Code only re-runs the command
+when you type, so the segment can sit on the dim `WA:…` marker (or a stale
+role) until your next message. With it, the real `primary`/`secondary` shows
+within a few seconds of the server settling, whether or not you touch the
+keyboard.
 
 Each server records which Claude Code session owns it, so the segment reads
 ownership rather than guessing at it: the script climbs its own parent chain
