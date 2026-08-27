@@ -144,7 +144,7 @@ since that is what makes an outage diagnosable, with the creator's number masked
 legacy `<number>-<timestamp>` style. Baileys' own library logging, at `info` and above or `debug`
 under `WHATSAPP_DIAG_DEBUG=1`, is the library's own and is not masked by us.)
 
-`catch_up` replays the last **5** messages per chat, both directions. In a mention-gated group it also shows what members said without addressing Claude (tagged "not addressed to Claude") - kept for context only, never routed or counted as unreplied. Your own hand-typed text is
+`catch_up` replays the last **5** messages from the other side and the last **5** of your own per chat, merged in time order, so your own texts never crowd out what the room said. In a mention-gated group it also shows what members said without addressing Claude (tagged "not addressed to Claude") - kept for context only, never routed or counted as unreplied. Your own hand-typed text is
 readable for **1 hour**; after that the line collapses to `<your name> replied (text expired)` —
 the fact that you answered is still shown, the words are not. That is a display rule: the raw
 line stays in `~/.whatsapp-channel/messages.jsonl` until the log's existing 24-hour prune

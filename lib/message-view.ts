@@ -59,6 +59,22 @@ export function recentWindow<T extends { ts: string }>(
   return [...entries].sort((a, b) => a.ts.localeCompare(b.ts)).slice(-limit);
 }
 
+/** The catch_up window per chat: the last `limit` lines from OTHERS and the
+ *  last `limit` of the owner's/agent's own, merged oldest-first. One window
+ *  over both directions let four of the owner's own texts crowd out what the
+ *  room actually said (owner, 2026-08-27). The owner's-text privacy limit
+ *  (see OWNER_TEXT_TTL_MS) is unchanged - still at most `limit` of theirs. */
+export function recentBothSides<
+  T extends { ts: string; direction?: "in" | "out" },
+>(entries: T[], limit: number = RECENT_LIMIT): T[] {
+  const theirs = entries.filter((e) => (e.direction ?? "in") === "in");
+  const ours = entries.filter((e) => (e.direction ?? "in") === "out");
+  return recentWindow(
+    [...recentWindow(theirs, limit), ...recentWindow(ours, limit)],
+    limit * 2,
+  );
+}
+
 /** How one entry renders at time `now`. The ONLY place the expiry rule and
  *  the owner label exist. */
 export function renderLogEntry(

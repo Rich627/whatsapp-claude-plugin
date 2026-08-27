@@ -60,7 +60,7 @@ import {
   awaitingReply,
   keepDroppedForContext,
   RECENT_LIMIT,
-  recentWindow,
+  recentBothSides,
   renderLogEntry,
 } from "./lib/message-view";
 import { formatSentLine, parseSentLog } from "./lib/sent-log";
@@ -2265,7 +2265,7 @@ function getRecentByChat(
       } catch {}
     }
     for (const bucket of byChat.values()) {
-      bucket.entries = recentWindow(bucket.entries, limit);
+      bucket.entries = recentBothSides(bucket.entries, limit);
     }
   } catch {}
   return byChat;

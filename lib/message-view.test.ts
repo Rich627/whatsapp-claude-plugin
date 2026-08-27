@@ -3,6 +3,7 @@ import {
   awaitingReply,
   keepDroppedForContext,
   NOT_ADDRESSED,
+  recentBothSides,
   recentWindow,
   renderLogEntry,
   type ViewableEntry,
@@ -161,6 +162,38 @@ describe("keepDroppedForContext", () => {
     expect(keepDroppedForContext(false, "no-mention")).toBe(false);
     expect(keepDroppedForContext(true, undefined)).toBe(false);
     expect(keepDroppedForContext(true, "not-allowed")).toBe(false);
+  });
+});
+
+describe("recentBothSides", () => {
+  test("4 own texts no longer crowd out the one thing the room said", () => {
+    const entries = [
+      { ts: hoursAgo(9), direction: "in" as const, n: "them-old" },
+      { ts: hoursAgo(8), direction: "out" as const, n: "me1" },
+      { ts: hoursAgo(7), direction: "out" as const, n: "me2" },
+      { ts: hoursAgo(6), direction: "out" as const, n: "me3" },
+      { ts: hoursAgo(5), direction: "out" as const, n: "me4" },
+      { ts: hoursAgo(4), direction: "out" as const, n: "me5" },
+    ];
+    // Plain window of 5 would drop "them-old"; both-sides keeps it.
+    expect(recentWindow(entries, 5).map((e) => e.n)).not.toContain("them-old");
+    expect(recentBothSides(entries, 5).map((e) => e.n)).toEqual([
+      "them-old",
+      "me1",
+      "me2",
+      "me3",
+      "me4",
+      "me5",
+    ]);
+  });
+
+  test("each side is capped at limit, merged oldest-first, legacy lines count as theirs", () => {
+    const entries: { ts: string; direction?: "in" | "out"; n: number }[] = [];
+    for (let i = 1; i <= 8; i++) entries.push({ ts: hoursAgo(20 - i), n: i }); // theirs
+    for (let i = 1; i <= 8; i++)
+      entries.push({ ts: hoursAgo(10 - i), direction: "out", n: 100 + i });
+    const got = recentBothSides(entries, 5).map((e) => e.n);
+    expect(got).toEqual([4, 5, 6, 7, 8, 104, 105, 106, 107, 108]);
   });
 });
 
