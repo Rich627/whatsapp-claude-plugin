@@ -135,17 +135,20 @@ try {
 
 const PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER;
 const STATIC = process.env.WHATSAPP_ACCESS_MODE === "static";
-// Off by default: contacts.json/dm-activity.json cache the display name and
-// last-activity time of EVERYONE the account has ever seen, including a
-// sender the access gate rejected (contacts.upsert/chats.upsert fire from
-// Baileys before any allowlist check runs) - so unlike access.json (which
-// only ever holds jids the owner explicitly allowed), this is plaintext
-// persistence the owner may not expect for someone they never approved.
+// On by default: contacts.json/dm-activity.json cache the display name and
+// last-activity time of everyone the account has seen, so saved names,
+// mention lookups and the wizard's contact list survive a restart instead
+// of starting blank every run. Opt out with WHATSAPP_CACHE_CONTACTS=0 -
+// the reason someone might is that the cache also holds a sender the
+// access gate rejected (contacts.upsert/chats.upsert fire from Baileys
+// before any allowlist check runs), so unlike access.json (which only ever
+// holds jids the owner explicitly allowed) this is plaintext persistence
+// for someone they never approved.
 // STATIC mode already disables all local config writes (see saveAccess) -
-// this cache follows the same rule, never just WHATSAPP_CACHE_CONTACTS
-// alone, so a static deployment can't be made to write local state by
-// setting one env var but not the other.
-const CACHE_CONTACTS = !STATIC && process.env.WHATSAPP_CACHE_CONTACTS === "1";
+// this cache follows the same rule and STATIC is checked first, so a
+// static deployment still never writes these two files whatever
+// WHATSAPP_CACHE_CONTACTS is set to.
+const CACHE_CONTACTS = !STATIC && process.env.WHATSAPP_CACHE_CONTACTS !== "0";
 // The client process that spawned us, when it identifies itself. Claude Code
 // sets CLAUDE_PID; other MCP clients set nothing, which reads as "unknown"
 // and is reported as such rather than guessed at.

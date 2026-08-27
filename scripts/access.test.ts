@@ -704,7 +704,7 @@ describe("wizard", () => {
   });
 
   test.skipIf(!!process.env.CI)(
-    "no DM activity on record: says so and names the cache flag, not silently",
+    "no DM activity on record: says so and names the opt-out flag, not silently",
     () => {
       const dir = freshStateDir();
       writeGroupsMeta(dir, {
@@ -717,7 +717,7 @@ describe("wizard", () => {
       });
       const res = runWithInput(dir, "\n", "wizard");
       expect(res.out).toContain("no DM activity is on record");
-      expect(res.out).toContain("WHATSAPP_CACHE_CONTACTS=1");
+      expect(res.out).toContain("WHATSAPP_CACHE_CONTACTS=0");
       expect(existsSync(join(dir, "access.json"))).toBe(false);
     },
   );

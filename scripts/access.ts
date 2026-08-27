@@ -384,7 +384,7 @@ function capLine(shown: number, total: number): string {
 }
 
 const CACHE_OFF_NOTE =
-  'No contacts to review - no DM activity is on record. The server only records it with WHATSAPP_CACHE_CONTACTS=1 (off by default, and never in static mode); with that set, let it run so the record builds (see "Names and privacy" in ACCESS.md).';
+  'No contacts to review - no DM activity is on record yet. The server records it by default, so let it run and the record builds (never in static mode, and not if you set WHATSAPP_CACHE_CONTACTS=0 - see "Names and privacy" in ACCESS.md).';
 
 const NO_DM_CANDIDATES_NOTE =
   "No contacts to review - nothing new in the cached DM activity: everyone who has messaged recently is already on the allowlist, or nobody has messaged yet.";
@@ -531,10 +531,11 @@ async function wizard(args: string[]): Promise<void> {
       }
     } else {
       // Two different observations, one line for whichever applies. The file
-      // is only ever written under WHATSAPP_CACHE_CONTACTS=1 and never in
-      // static mode (server.ts:131-141), so "absent" means no record exists -
-      // this script cannot see the server's env, so it names the precondition
-      // rather than asserting which of the three causes it was.
+      // is written by default, never in static mode and never under
+      // WHATSAPP_CACHE_CONTACTS=0 (see CACHE_CONTACTS in server.ts), so
+      // "absent" means no record exists - this script cannot see the
+      // server's env, so it names the precondition rather than asserting
+      // which of the three causes it was.
       process.stdout.write(
         (existsSync(DM_ACTIVITY_FILE)
           ? NO_DM_CANDIDATES_NOTE
