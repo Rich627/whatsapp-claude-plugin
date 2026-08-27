@@ -32,7 +32,8 @@ export type UndoEntry = { kind: "tick" | "roster"; jid: string };
 export type PickerState = {
   model: PickerModel;
   search: string;
-  focus: "dms" | "groups";
+  focus: "dms" | "groups" | "search";
+  lastColumn: "dms" | "groups"; // where ↓ from the search line returns
   cursor: { dms: number; groups: number }; // index into the FILTERED list of that column
   ticked: Set<string>; // jids ticked right now
   roster: Set<string>; // group jids flagged [r] (this run's NEW flags only)
@@ -57,6 +58,7 @@ export type PickerEvent =
   | { type: "submit" }
   | { type: "cancel" }
   | { type: "focus"; column: "dms" | "groups"; index: number } // mouse: move cursor to an exact row
+  | { type: "focusSearch" } // mouse only: a click on the search line
   | { type: "unchip"; jid: string } // mouse: click a chip's ×
   | { type: "click"; row: number; col: number } // 0-based, screen coords
   | { type: "resize"; cols: number; rows: number };
@@ -85,22 +87,86 @@ export function formatLabel(raw: string): string {
   return raw.replace(UNSAFE, "").replace(/\s+/g, " ").trim();
 }
 
-// Truncation everywhere in this file iterates code points, never `slice`, so
-// a surrogate pair (emoji in a group name) is never split. Ellipsis is "…",
-// matching ranking.ts's clip().
-//
-// ponytail: no wcwidth table - a CJK/emoji label can overflow its column by a
-// cell. Upgrade path: an east-asian-width lookup here if it ever matters.
-function truncate(s: string, w: number): string {
+// Module level - constructing a Segmenter per call is the slow path.
+const SEGMENTER =
+  typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+    : null;
+
+function graphemes(s: string): string[] {
+  if (SEGMENTER) return [...SEGMENTER.segment(s)].map((seg) => seg.segment);
+  return [...s];
+}
+
+// East-Asian Wide/Fullwidth ranges, decided on the grapheme's first code
+// point.
+const WIDE: [number, number][] = [
+  [0x1100, 0x115f],
+  [0x2e80, 0x303e],
+  [0x3041, 0x33ff],
+  [0x3400, 0x4dbf],
+  [0x4e00, 0x9fff],
+  [0xa000, 0xa4cf],
+  [0xac00, 0xd7a3],
+  [0xf900, 0xfaff],
+  [0xfe30, 0xfe4f],
+  [0xff00, 0xff60],
+  [0xffe0, 0xffe6],
+  [0x1f300, 0x1f64f],
+  [0x1f900, 0x1f9ff],
+  [0x20000, 0x3fffd],
+];
+const ZERO_WIDTH = /\p{M}/u;
+function cellWidth(g: string): number {
+  const cp = g.codePointAt(0)!;
+  if (
+    ZERO_WIDTH.test(String.fromCodePoint(cp)) ||
+    (cp >= 0x200b && cp <= 0x200d) ||
+    (cp >= 0xfe00 && cp <= 0xfe0f) ||
+    (cp >= 0xe0100 && cp <= 0xe01ef)
+  ) {
+    return 0;
+  }
+  if (WIDE.some(([lo, hi]) => cp >= lo && cp <= hi)) return 2;
+  return 1;
+}
+
+// The number of terminal cells `s` occupies - graphemes via Intl.Segmenter
+// (Bun has it), falling back to Array.from (code points) when it does not.
+// ponytail: first-code-point width table; flags/regional indicators count 1,
+// add 1F1E6-1F1FF if a real terminal ever overlaps on one.
+export function displayWidth(s: string): number {
+  return graphemes(s).reduce((sum, g) => sum + cellWidth(g), 0);
+}
+
+// Longest grapheme prefix of `s` whose total cell width is <= w. Stops
+// BEFORE a grapheme that would straddle the budget, so it can return a
+// string one cell short of `w`; returns "" when the first grapheme alone is
+// wider than `w`.
+function takeWidth(s: string, w: number): string {
+  let used = 0;
+  let out = "";
+  for (const g of graphemes(s)) {
+    const cw = cellWidth(g);
+    if (used + cw > w) break;
+    out += g;
+    used += cw;
+  }
+  return out;
+}
+
+// Truncation everywhere in this file measures display cells, never
+// `.length`, so a wide grapheme (CJK, emoji) is never split and never
+// overflows its column. Ellipsis is "…", matching ranking.ts's clip().
+export function truncate(s: string, w: number): string {
   if (w <= 0) return "";
-  const chars = [...s];
-  if (chars.length <= w) return s;
+  if (displayWidth(s) <= w) return s;
   if (w === 1) return "…";
-  return chars.slice(0, w - 1).join("") + "…";
+  return takeWidth(s, w - 1) + "…";
 }
 
 // Split on spaces, never mid-word unless a single word is longer than `w`
-// (in which case it's broken, code-point safe).
+// (in which case it's broken, cell-width safe).
 function wrap(text: string, w: number): string[] {
   if (w <= 0) return [text];
   const words = text.split(" ").filter((w2) => w2.length > 0);
@@ -108,19 +174,22 @@ function wrap(text: string, w: number): string[] {
   const lines: string[] = [];
   let cur = "";
   for (const word of words) {
-    if (word.length > w) {
+    if (displayWidth(word) > w) {
       if (cur) {
         lines.push(cur);
         cur = "";
       }
-      const chars = [...word];
-      for (let i = 0; i < chars.length; i += w) {
-        lines.push(chars.slice(i, i + w).join(""));
+      let rest = word;
+      while (rest.length > 0) {
+        let piece = takeWidth(rest, w);
+        if (piece === "") piece = graphemes(rest)[0]; // wide grapheme, narrow column
+        lines.push(piece);
+        rest = rest.slice(piece.length);
       }
       continue;
     }
     const candidate = cur ? `${cur} ${word}` : word;
-    if (candidate.length > w) {
+    if (displayWidth(candidate) > w) {
       lines.push(cur);
       cur = word;
     } else {
@@ -170,6 +239,7 @@ export function initPicker(
     model,
     search: "",
     focus: "dms",
+    lastColumn: "dms",
     cursor: { dms: 0, groups: 0 },
     ticked,
     roster: new Set(),
@@ -239,9 +309,28 @@ function forceTick(state: PickerState, jid: string): PickerState {
   return toggleTick(state, jid);
 }
 
+// The column the cursor lives in. While the caret is on the search line the
+// cursor still belongs to the column ↓ will return to.
+function focusedColumn(state: PickerState): "dms" | "groups" {
+  return state.focus === "search" ? state.lastColumn : state.focus;
+}
+
+// The row Enter ticks while the caret is on the search line: the first
+// visible Contacts row, else the first visible Groups row, else nothing.
+// Null unless the caret is on the search line with a non-empty filter (an
+// empty search submits). One function feeds BOTH the reducer and the marker
+// in render(), so the screen can never promise one row and tick another.
+function enterTarget(state: PickerState): "dms" | "groups" | null {
+  if (state.focus !== "search" || state.search === "") return null;
+  if (visibleItems(state, "dms").length > 0) return "dms";
+  if (visibleItems(state, "groups").length > 0) return "groups";
+  return null;
+}
+
 function highlighted(state: PickerState): PickerItem | null {
-  const visible = visibleItems(state, state.focus);
-  const idx = state.cursor[state.focus];
+  const column = focusedColumn(state);
+  const visible = visibleItems(state, column);
+  const idx = state.cursor[column];
   return visible[idx] ?? null;
 }
 
@@ -264,7 +353,7 @@ export function reducePicker(
 ): PickerState {
   switch (event.type) {
     case "char": {
-      if (event.ch === "r" && state.search === "") {
+      if (event.ch === "r" && state.search === "" && state.focus !== "search") {
         const item = highlighted(state);
         if (
           !item ||
@@ -283,7 +372,13 @@ export function reducePicker(
           undo: [...state.undo, { kind: "roster", jid: item.jid }],
         };
       }
-      return resetSearch(state, state.search + event.ch);
+      // Typing always snaps the caret to the search line, whether it
+      // started there or on a column - the roster shortcut above is the
+      // only case where a column-focused keystroke isn't a filter char.
+      return {
+        ...resetSearch(state, state.search + event.ch),
+        focus: "search",
+      };
     }
 
     case "backspace": {
@@ -296,21 +391,42 @@ export function reducePicker(
       return toggleTick(state, last);
     }
 
-    case "up":
-    case "down": {
-      const visible = visibleItems(state, state.focus);
-      if (visible.length === 0) return state;
-      const delta = event.type === "up" ? -1 : 1;
-      const next = clampCursor(
-        state.cursor[state.focus] + delta,
-        visible.length,
-      );
-      if (next === state.cursor[state.focus]) return state;
-      return { ...state, cursor: { ...state.cursor, [state.focus]: next } };
+    case "up": {
+      if (state.focus === "search") return state;
+      const column = state.focus;
+      const visible = visibleItems(state, column);
+      const c = state.cursor[column];
+      if (visible.length === 0 || c === 0) {
+        return { ...state, focus: "search", lastColumn: column };
+      }
+      return { ...state, cursor: { ...state.cursor, [column]: c - 1 } };
     }
 
-    case "tab":
-      return { ...state, focus: state.focus === "dms" ? "groups" : "dms" };
+    case "down": {
+      if (state.focus === "search") {
+        return {
+          ...state,
+          focus: state.lastColumn,
+          cursor: { ...state.cursor, [state.lastColumn]: 0 },
+        };
+      }
+      const column = state.focus;
+      const visible = visibleItems(state, column);
+      if (visible.length === 0) return state;
+      const next = clampCursor(state.cursor[column] + 1, visible.length);
+      if (next === state.cursor[column]) return state;
+      return { ...state, cursor: { ...state.cursor, [column]: next } };
+    }
+
+    case "tab": {
+      if (state.focus === "search") {
+        return { ...state, focus: "dms", lastColumn: "dms" };
+      }
+      if (state.focus === "dms") {
+        return { ...state, focus: "groups", lastColumn: "groups" };
+      }
+      return { ...state, focus: "search" }; // lastColumn stays "groups"
+    }
 
     case "space": {
       const item = highlighted(state);
@@ -320,6 +436,13 @@ export function reducePicker(
 
     case "enter": {
       if (state.search !== "") {
+        if (state.focus === "search") {
+          const target = enterTarget(state);
+          const next = target
+            ? forceTick(state, visibleItems(state, target)[0].jid)
+            : state;
+          return resetSearch(next, "");
+        }
         const item = highlighted(state);
         const next = item ? forceTick(state, item.jid) : state;
         return resetSearch(next, "");
@@ -372,9 +495,13 @@ export function reducePicker(
       return {
         ...state,
         focus: event.column,
+        lastColumn: event.column,
         cursor: { ...state.cursor, [event.column]: index },
       };
     }
+
+    case "focusSearch":
+      return { ...state, focus: "search" };
 
     case "unchip": {
       if (!state.chips.includes(event.jid)) return state;
@@ -544,9 +671,12 @@ function strike(s: string, color: boolean): string {
 function green(s: string, color: boolean): string {
   return color ? `\x1b[32m${s}\x1b[0m` : s;
 }
+function accent(s: string, color: boolean): string {
+  return color ? `\x1b[1;32m${s}\x1b[0m` : s;
+}
 
 function padVisible(s: string, width: number): string {
-  const visLen = stripAnsi(s).length;
+  const visLen = displayWidth(stripAnsi(s));
   return visLen >= width ? s : s + " ".repeat(width - visLen);
 }
 
@@ -554,10 +684,11 @@ function padVisible(s: string, width: number): string {
 // risk cutting an escape sequence in half. Applied once, at the very end of
 // render(), as the hard backstop for the "never wider than cols" guarantee -
 // every section above is already built to fit, this only catches a miss.
+// No ellipsis - it is the backstop, not a truncation.
 function capLine(line: string, cols: number): string {
   const plain = stripAnsi(line);
-  if (plain.length <= cols) return line;
-  return [...plain].slice(0, Math.max(0, cols)).join("");
+  if (displayWidth(plain) <= cols) return line;
+  return takeWidth(plain, Math.max(0, cols));
 }
 
 // startCol/endCol carry the column's screen x-range so hitTest can tell
@@ -582,6 +713,7 @@ type Geometry = {
   itemRows: ItemRow[];
   chipRanges: ChipRange[];
   footerRanges: FooterRange[];
+  searchRow: number;
 };
 
 function renderColumn(
@@ -633,7 +765,7 @@ function renderColumn(
     }
     const displayedTag =
       plainTag && item.granted ? dim(plainTag, color) : plainTag;
-    const labelW = Math.max(0, w - 5 - plainTag.length);
+    const labelW = Math.max(0, w - 5 - displayWidth(plainTag));
     const label = truncate(formatLabel(item.label), labelW);
     lines.push(`${marker}${coloredBox} ${label}${displayedTag}`);
     rowIndex.push(idx);
@@ -669,7 +801,13 @@ function renderChips(
   if (chips.length === 0) {
     return { text: dim("nothing picked yet", color), ranges: [] };
   }
-  type Piece = { jid: string; plain: string; colored: string };
+  type Piece = {
+    jid: string;
+    plain: string;
+    colored: string;
+    width: number;
+    xCol: number;
+  };
   const all: Piece[] = chips.map((c) => {
     const sign = c.struck ? "-" : "+";
     const labelCap = Math.max(1, Math.min(CHIP_LABEL_CAP, maxWidth - 6));
@@ -679,6 +817,8 @@ function renderChips(
       jid: c.jid,
       plain,
       colored: c.struck ? strike(plain, color) : plain,
+      width: displayWidth(plain),
+      xCol: displayWidth(plain.slice(0, plain.indexOf("×"))),
     };
   });
   const chosen: Piece[] = [];
@@ -686,7 +826,7 @@ function renderChips(
   let droppedCount = 0;
   for (let i = all.length - 1; i >= 0; i--) {
     const p = all[i];
-    const addWidth = p.plain.length + (chosen.length > 0 ? 1 : 0);
+    const addWidth = p.width + (chosen.length > 0 ? 1 : 0);
     if (used + addWidth > maxWidth && chosen.length > 0) {
       droppedCount = i + 1;
       break;
@@ -696,35 +836,78 @@ function renderChips(
   }
   const prefixPlain = droppedCount > 0 ? `+${droppedCount} more ` : "";
   const prefixColored = droppedCount > 0 ? dim(prefixPlain, color) : "";
-  let col = prefixPlain.length;
+  let col = displayWidth(prefixPlain);
   const ranges: { col: number; jid: string }[] = [];
   const coloredParts: string[] = [];
   for (let i = 0; i < chosen.length; i++) {
     if (i > 0) col += 1;
     const p = chosen[i];
-    const xPos = p.plain.indexOf("×");
-    ranges.push({ col: col + xPos, jid: p.jid });
+    ranges.push({ col: col + p.xCol, jid: p.jid });
     coloredParts.push(p.colored);
-    col += p.plain.length;
+    col += p.width;
   }
   return { text: prefixColored + coloredParts.join(" "), ranges };
 }
 
-function footerParts(
-  narrow: boolean,
-): { action: "submit" | "undo" | "restore"; label: string }[] {
-  return narrow
-    ? [
-        { action: "submit", label: "Submit" },
-        { action: "undo", label: "Undo" },
-        { action: "restore", label: "Restore" },
-      ]
-    : [
-        { action: "submit", label: "Submit (enter)" },
-        { action: "undo", label: "Undo (ctrl-z)" },
-        { action: "restore", label: "Restore (ctrl-r)" },
-      ];
+type FooterAction = "submit" | "undo" | "restore";
+const FOOTER_SPEC: {
+  action: FooterAction | "quit";
+  verb: string;
+  key: string;
+}[] = [
+  { action: "submit", verb: "Submit", key: "enter" },
+  { action: "undo", verb: "Undo", key: "ctrl-z" },
+  { action: "restore", verb: "Restore", key: "ctrl-r" },
+  { action: "quit", verb: "Quit", key: "esc" },
+];
+
+// Builds the footer's plain and coloured forms in parallel, the renderChips
+// pattern - so a FooterRange (measured on `plain`) always lands inside the
+// segment a click is meant to fire. `full` picks the "verb: key" form and its
+// 3-space separator; the short form is verb-only with a 2-space separator.
+// Quit is drawn but never gets a FooterRange - `esc quit` was never
+// clickable.
+function buildFooter(
+  full: boolean,
+  color: boolean,
+  hasBackup: boolean,
+): {
+  plain: string;
+  colored: string;
+  ranges: { action: FooterAction; start: number; end: number }[];
+} {
+  const sep = full ? "   " : "  ";
+  let plain = "";
+  let colored = "";
+  const ranges: { action: FooterAction; start: number; end: number }[] = [];
+  for (const part of FOOTER_SPEC) {
+    if (plain) {
+      plain += sep;
+      colored += sep;
+    }
+    const start = plain.length;
+    const segmentPlain = full ? `${part.verb}: ${part.key}` : part.verb;
+    const segmentColored =
+      part.action === "restore" && !hasBackup
+        ? dim(segmentPlain, color)
+        : full
+          ? `${accent(part.verb, color)}: ${dim(part.key, color)}`
+          : accent(part.verb, color);
+    plain += segmentPlain;
+    colored += segmentColored;
+    if (part.action !== "quit") {
+      ranges.push({ action: part.action, start, end: plain.length });
+    }
+  }
+  return { plain, colored, ranges };
 }
+
+// Width, not layout, decides the form: the full footer is 58 cells and would
+// be chopped mid-word in a narrow stacked screen, and its FooterRanges would
+// then point at columns no longer drawn - a click firing an action whose
+// word is invisible. So a 60-column stacked screen gets the full footer and
+// only a genuinely narrow one falls back to the short form.
+const FULL_FOOTER_PLAIN = buildFooter(true, false, true).plain;
 
 function render(
   state: PickerState,
@@ -739,10 +922,14 @@ function render(
   const footerRanges: FooterRange[] = [];
 
   // --- search line ---
+  const searchRow = lines.length;
   const searchCap = Math.max(0, cols - 9);
-  const searchLine = state.search
-    ? `Search: ${truncate(state.search, searchCap)}▏`
-    : `Search: ${dim("type to filter", color)}`;
+  const searchLine =
+    state.focus === "search"
+      ? `Search: ${truncate(state.search, searchCap)}▏`
+      : state.search !== ""
+        ? `Search: ${truncate(state.search, searchCap)}`
+        : `Search: ${dim("type to filter", color)}`;
   lines.push(searchLine);
 
   // --- picked line ---
@@ -761,31 +948,22 @@ function render(
   const dmsVisible = visibleItems(state, "dms");
   const groupsVisible = visibleItems(state, "groups");
 
+  // Which column draws the `>` marker: the focused column, or the row
+  // Enter would tick while the caret is on the search line. Computed once,
+  // shared by both layout branches, so the screen can never promise one row
+  // and tick another (see enterTarget's own comment).
+  const target = enterTarget(state);
+  const dmsFocused = state.focus === "dms" || target === "dms";
+  const groupsFocused = state.focus === "groups" || target === "groups";
+  const dmsCursorIdx = target === "dms" ? 0 : state.cursor.dms;
+  const groupsCursorIdx = target === "groups" ? 0 : state.cursor.groups;
+
   // --- footer (built once, appended last, but its width is fixed and
   //     independent of body geometry so we can compute it up front) ---
-  const parts = footerParts(stacked);
-  let plainFooter = "";
-  const footerWordRanges: {
-    action: "submit" | "undo" | "restore";
-    start: number;
-    end: number;
-  }[] = [];
-  for (const p of parts) {
-    if (plainFooter) plainFooter += "  ";
-    const start = plainFooter.length;
-    plainFooter += p.label;
-    footerWordRanges.push({ action: p.action, start, end: plainFooter.length });
-  }
-  plainFooter += "  esc quit";
-  let coloredFooter = plainFooter;
-  const restoreRange = footerWordRanges.find((r) => r.action === "restore")!;
-  if (!state.model.hasBackup) {
-    const restoreText = plainFooter.slice(restoreRange.start, restoreRange.end);
-    coloredFooter =
-      plainFooter.slice(0, restoreRange.start) +
-      dim(restoreText, color) +
-      plainFooter.slice(restoreRange.end);
-  }
+  const full = cols >= displayWidth(FULL_FOOTER_PLAIN);
+  const footer = buildFooter(full, color, state.model.hasBackup);
+  const coloredFooter = footer.colored;
+  const footerWordRanges = footer.ranges;
 
   let lineArr: string[];
   if (!stacked) {
@@ -808,8 +986,8 @@ function render(
 
     const left = renderColumn(
       dmsVisible,
-      state.cursor.dms,
-      state.focus === "dms",
+      dmsCursorIdx,
+      dmsFocused,
       state.ticked,
       state.roster,
       state.model.dmNote,
@@ -819,8 +997,8 @@ function render(
     );
     const right = renderColumn(
       groupsVisible,
-      state.cursor.groups,
-      state.focus === "groups",
+      groupsCursorIdx,
+      groupsFocused,
       state.ticked,
       state.roster,
       state.model.groupNote,
@@ -883,8 +1061,8 @@ function render(
     lines.push("CONTACTS");
     const left = renderColumn(
       dmsVisible,
-      state.cursor.dms,
-      state.focus === "dms",
+      dmsCursorIdx,
+      dmsFocused,
       state.ticked,
       state.roster,
       state.model.dmNote,
@@ -909,8 +1087,8 @@ function render(
     lines.push("GROUPS");
     const right = renderColumn(
       groupsVisible,
-      state.cursor.groups,
-      state.focus === "groups",
+      groupsCursorIdx,
+      groupsFocused,
       state.ticked,
       state.roster,
       state.model.groupNote,
@@ -946,7 +1124,10 @@ function render(
   }
 
   const capped = lineArr.map((l) => capLine(l, cols)).slice(0, rows);
-  return { lines: capped, geometry: { itemRows, chipRanges, footerRanges } };
+  return {
+    lines: capped,
+    geometry: { itemRows, chipRanges, footerRanges, searchRow },
+  };
 }
 
 export function layout(
@@ -965,6 +1146,7 @@ export function hitTest(
   col: number,
 ): PickerEvent | null {
   const { geometry } = render(state, cols, rows);
+  if (row === geometry.searchRow) return { type: "focusSearch" };
   for (const r of geometry.itemRows) {
     if (r.row === row && col >= r.startCol && col < r.endCol) {
       return { type: "focus", column: r.column, index: r.index };

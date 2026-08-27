@@ -523,6 +523,15 @@ describe("wizard", () => {
     expect(existsSync(join(dir, "access.json"))).toBe(false);
   });
 
+  test("a synced address book with no activity is enough to open the screen", () => {
+    const dir = freshStateDir();
+    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Thilian" } });
+    const res = run(dir, "wizard");
+    expect(res.code).toBe(1);
+    expect(res.out.toLowerCase()).toContain("needs a real terminal");
+    expect(res.out).not.toContain("Nothing to review");
+  });
+
   test("--revoke opens the same screen as plain wizard", () => {
     const dir = freshStateDir();
     writeGroupsMeta(dir, {

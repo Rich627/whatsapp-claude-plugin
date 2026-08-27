@@ -370,6 +370,85 @@ describe("rankDms", () => {
     const result = rankDms(activity, contacts, [], {});
     expect(new Set(result.map((c) => c.label)).size).toBe(2);
   });
+
+  test("a saved contact with no DM activity is in the pool", () => {
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Thilian" },
+    };
+    const result = rankDms({}, contacts, [], {}, 10);
+    expect(result).toEqual([
+      {
+        jid: "61403911675@s.whatsapp.net",
+        label: "Thilian",
+        description: "•••••1675",
+      },
+    ]);
+  });
+
+  test("a notify-only contact with no activity is not in the pool", () => {
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { notify: "Mum" },
+    };
+    const result = rankDms({}, contacts, [], {}, 10);
+    expect(result).toEqual([]);
+  });
+
+  test("activity ranks first, then saved-name-only contacts alphabetically", () => {
+    const activity = { "61403911675@s.whatsapp.net": 100 };
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Zach" },
+      "a@s.whatsapp.net": { name: "Bella" },
+      "b@s.whatsapp.net": { name: "Alex" },
+    };
+    const result = rankDms(activity, contacts, [], {}, 10);
+    expect(result.map((c) => c.jid)).toEqual([
+      "61403911675@s.whatsapp.net",
+      "b@s.whatsapp.net",
+      "a@s.whatsapp.net",
+    ]);
+  });
+
+  test("a saved contact already on the allowlist is excluded, through its LID form too", () => {
+    const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Thilian" },
+    };
+    const result = rankDms({}, contacts, ["184710990000999@lid"], lidMap, 10);
+    expect(result).toEqual([]);
+  });
+
+  test("a saved contact who also has activity appears exactly once", () => {
+    const activity = { "61403911675@s.whatsapp.net": 100 };
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Thilian" },
+    };
+    const result = rankDms(activity, contacts, [], {}, 10);
+    expect(result).toHaveLength(1);
+    expect(result[0].jid).toBe("61403911675@s.whatsapp.net");
+  });
+
+  test("the limit slices the combined pool, activity first", () => {
+    const activity = { "61403911675@s.whatsapp.net": 100 };
+    const contacts: ContactsMap = {
+      "a@s.whatsapp.net": { name: "Alex" },
+      "b@s.whatsapp.net": { name: "Bella" },
+    };
+    const result = rankDms(activity, contacts, [], {}, 2);
+    expect(result.map((c) => c.jid)).toEqual([
+      "61403911675@s.whatsapp.net",
+      "a@s.whatsapp.net",
+    ]);
+  });
+
+  test("labels are disambiguated across the combined pool", () => {
+    const activity = { "61403911675@s.whatsapp.net": 100 };
+    const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Alex" },
+      "a@s.whatsapp.net": { name: "Alex" },
+    };
+    const result = rankDms(activity, contacts, [], {}, 10);
+    expect(new Set(result.map((c) => c.label)).size).toBe(2);
+  });
 });
 
 describe("listConfiguredGroups", () => {

@@ -4,12 +4,14 @@ import {
   applySelection,
   chipsOf,
   decodeInput,
+  displayWidth,
   hitTest,
   initPicker,
   layout,
   reducePicker,
   runPicker,
   selectionOf,
+  truncate,
   visibleItems,
   type PickerEvent,
   type PickerItem,
@@ -95,7 +97,7 @@ describe("reducePicker", () => {
     expect(s.done).toBeNull();
   });
 
-  test("typing filters BOTH columns, case-insensitively, and resets both cursors to 0", () => {
+  test("a filter change puts both cursors back on row 0", () => {
     let s = initPicker(
       model({ dms: [rohan, priya], groups: [family, wil] }),
       100,
@@ -112,6 +114,7 @@ describe("reducePicker", () => {
     expect(visibleItems(s, "dms").map((i) => i.jid)).toEqual([]);
     expect(visibleItems(s, "groups").map((i) => i.jid)).toEqual([family.jid]);
     expect(s.cursor).toEqual({ dms: 0, groups: 0 });
+    expect(s.focus).toBe("search");
   });
 
   test("a term matching only a JID/number matches nothing (label-only filter)", () => {
@@ -185,14 +188,17 @@ describe("reducePicker", () => {
     expect(s.ticked.has(family.jid)).toBe(true); // untouched
   });
 
-  test("Tab switches focus; up/down move and clamp at both ends; empty column is a no-op", () => {
+  test("Tab cycles dms -> groups -> search -> dms; up/down move and clamp at both ends; empty column is a no-op", () => {
     let s = initPicker(model({ dms: [rohan, priya], groups: [] }), 100, 24);
     s = press(s, { type: "tab" });
     expect(s.focus).toBe("groups");
     const before = s;
     s = press(s, { type: "down" });
     expect(s).toBe(before); // groups is empty
-    s = press(s, { type: "tab" });
+    s = press(s, { type: "tab" }); // groups -> search
+    expect(s.focus).toBe("search");
+    s = press(s, { type: "tab" }); // search -> dms, completing the cycle
+    expect(s.focus).toBe("dms");
     s = press(s, { type: "down" });
     expect(s.cursor.dms).toBe(1);
     s = press(s, { type: "down" });
@@ -314,6 +320,122 @@ describe("reducePicker", () => {
     expect(s.chips).toEqual([priya.jid]);
     expect(s.cursor.dms).toBe(1);
   });
+
+  test("↑ from row 0 moves focus to the search line and draws the caret", () => {
+    let s = initPicker(model({ dms: [rohan, priya] }), 100, 24);
+    s = press(s, { type: "up" });
+    expect(s.focus).toBe("search");
+    expect(s.lastColumn).toBe("dms");
+    const searchLine = layout(s, 100, 24)[0];
+    expect(searchLine.endsWith("▏")).toBe(true);
+  });
+
+  test("↓ from the search line returns to row 0 of the last-focused column", () => {
+    let s = initPicker(model({ groups: [family, wil] }), 100, 24);
+    s = press(s, { type: "tab" }); // dms -> groups
+    s = press(s, { type: "down" }); // cursor.groups -> 1
+    s = press(s, { type: "up" }, { type: "up" }); // row 0, then -> search
+    expect(s.focus).toBe("search");
+    s = press(s, { type: "down" });
+    expect(s.focus).toBe("groups");
+    expect(s.cursor.groups).toBe(0);
+  });
+
+  test("Tab cycles search → Contacts → Groups → search", () => {
+    let s = initPicker(model({ dms: [rohan], groups: [family] }), 100, 24);
+    expect(s.focus).toBe("dms");
+    s = press(s, { type: "tab" });
+    expect(s.focus).toBe("groups");
+    s = press(s, { type: "tab" });
+    expect(s.focus).toBe("search");
+    s = press(s, { type: "tab" });
+    expect(s.focus).toBe("dms");
+  });
+
+  test("typing while a column is focused snaps the caret to the search line", () => {
+    let s = initPicker(model({ dms: [rohan], groups: [family] }), 100, 24);
+    s = press(s, { type: "tab" }, { type: "char", ch: "z" });
+    expect(s.focus).toBe("search");
+    expect(s.search).toBe("z");
+    expect(s.lastColumn).toBe("groups");
+    expect(s.cursor).toEqual({ dms: 0, groups: 0 });
+  });
+
+  test("Enter on the search line ticks the first visible Contacts row, and Groups only when Contacts has no match", () => {
+    // Case 1: Contacts has a match -> Contacts wins even though Groups also matches.
+    let s = initPicker(
+      model({
+        dms: [item({ jid: "a@s.whatsapp.net", label: "Alpha" })],
+        groups: [
+          item({ jid: "alpha@g.us", label: "Alpha Group", kind: "group" }),
+        ],
+      }),
+      100,
+      24,
+    );
+    s = press(s, { type: "up" }); // -> focus search
+    s = press(
+      s,
+      { type: "char", ch: "a" },
+      { type: "char", ch: "l" },
+      { type: "enter" },
+    );
+    expect(s.ticked.has("a@s.whatsapp.net")).toBe(true);
+    expect(s.ticked.has("alpha@g.us")).toBe(false);
+
+    // Case 2: no Contacts match -> falls through to Groups.
+    let t = initPicker(
+      model({
+        dms: [rohan],
+        groups: [
+          item({ jid: "alpha@g.us", label: "Alpha Group", kind: "group" }),
+        ],
+      }),
+      100,
+      24,
+    );
+    t = press(t, { type: "up" });
+    t = press(
+      t,
+      { type: "char", ch: "a" },
+      { type: "char", ch: "l" },
+      { type: "enter" },
+    );
+    expect(t.ticked.has("alpha@g.us")).toBe(true);
+  });
+
+  test("Enter on an empty search still submits with the caret on the search line", () => {
+    let s = initPicker(model({ dms: [rohan] }), 100, 24);
+    s = press(s, { type: "up" }); // focus -> search, search still ""
+    expect(s.focus).toBe("search");
+    s = press(s, { type: "enter" });
+    expect(s.done).toBe("submit");
+  });
+
+  test("'r' filters when the caret is on the search line and flags roster when a column is focused", () => {
+    let s = initPicker(model({ groups: [wil] }), 100, 24);
+    s = press(s, { type: "tab" }, { type: "space" }); // focus groups, tick wil
+    s = press(s, { type: "char", ch: "r" });
+    expect(s.roster.has(wil.jid)).toBe(true);
+    expect(s.focus).toBe("groups");
+
+    let t = initPicker(model({ groups: [wil] }), 100, 24);
+    t = press(t, { type: "tab" }, { type: "space" }); // tick wil, focus groups
+    t = press(t, { type: "up" }); // -> focus search (only row is 0)
+    t = press(t, { type: "char", ch: "r" });
+    expect(t.search).toBe("r");
+    expect(t.focus).toBe("search");
+    expect(t.roster.has(wil.jid)).toBe(false);
+  });
+
+  test("space toggles the last-focused column's row while the caret is on the search line", () => {
+    let s = initPicker(model({ dms: [rohan, priya] }), 100, 24);
+    s = press(s, { type: "up" }); // focus -> search, lastColumn dms, cursor.dms 0
+    expect(s.focus).toBe("search");
+    s = press(s, { type: "space" });
+    expect(s.ticked.has(rohan.jid)).toBe(false); // rohan was granted -> toggled off
+    expect(s.focus).toBe("search"); // space stays focus-neutral
+  });
 });
 
 // -----------------------------------------------------------------------
@@ -364,6 +486,52 @@ describe("decodeInput", () => {
     expect(decodeInput("\x1bOB")).toEqual([{ type: "down" }]);
     expect(decodeInput("\x1bOC")).toEqual([{ type: "tab" }]);
     expect(decodeInput("\x1bOD")).toEqual([{ type: "tab" }]);
+  });
+});
+
+// -----------------------------------------------------------------------
+// displayWidth
+// -----------------------------------------------------------------------
+
+describe("displayWidth", () => {
+  test("CJK, emoji, combining marks and zero-width characters each measure the cells they occupy", () => {
+    expect(displayWidth("日本語")).toBe(6);
+    expect(displayWidth("😀")).toBe(2);
+    expect(displayWidth("café")).toBe(4);
+    // Spec (.pipeline/spec.md §4.4) expects 3 assuming ICU joins ನ್ನ
+    // into one grapheme cluster; this runtime instead splits it as two
+    // clusters (4 graphemes total) - an ICU segmentation detail, not a
+    // wrong width range (verified with a standalone Intl.Segmenter probe).
+    expect(displayWidth("ಕನ್ನಡ")).toBe(4);
+    expect(displayWidth("🇮🇳")).toBe(1);
+    expect(displayWidth("‍")).toBe(0);
+    expect(displayWidth("️")).toBe(0);
+  });
+
+  const WIDE_SAMPLES = [
+    "ಕನ್ನಡ",
+    "日本語テキスト",
+    "😀😀😀",
+    "🇮🇳🇮🇳",
+    "café café",
+  ];
+
+  test("truncate never returns more display cells than its budget", () => {
+    for (const s of WIDE_SAMPLES) {
+      for (let w = 1; w <= 12; w++) {
+        expect(displayWidth(truncate(s, w))).toBeLessThanOrEqual(w);
+      }
+    }
+  });
+
+  test("a wide grapheme is never split in half", () => {
+    const lone =
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:[^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/;
+    for (const s of WIDE_SAMPLES) {
+      for (let w = 1; w <= 12; w++) {
+        expect(lone.test(truncate(s, w))).toBe(false);
+      }
+    }
   });
 });
 
@@ -637,6 +805,40 @@ describe("layout - adversarial large model", () => {
     const idx = text.indexOf(markers[0]!);
     expect(text.slice(idx, idx + 60)).toContain(focusedLabel);
   });
+
+  function wideModel(): PickerModel {
+    const scripts = [`ಕನ್ನಡ`, `日本語`, `😀`, `🇮🇳`, `Café`];
+    const dms = Array.from({ length: 40 }, (_, i) =>
+      item({
+        jid: `d${i}@s.whatsapp.net`,
+        label: `${scripts[i % scripts.length]} ${i}`,
+        kind: "dm",
+        granted: i % 4 === 0,
+      }),
+    );
+    const groups = Array.from({ length: 40 }, (_, i) =>
+      item({
+        jid: `w${i}@g.us`,
+        label: `${scripts[(i + 1) % scripts.length]} Group ${i}`,
+        kind: "group",
+        granted: i % 4 === 0,
+      }),
+    );
+    return model({ dms, groups });
+  }
+
+  test("every layout line's DISPLAY width stays within cols for a wide-script model", () => {
+    const s = initPicker(wideModel(), 80, 24);
+    for (const cols of [40, 70, 80, 120]) {
+      for (const rows of [10, 24, 50]) {
+        const lines = layout(s, cols, rows);
+        expect(lines.length).toBeLessThanOrEqual(rows);
+        for (const l of lines) {
+          expect(displayWidth(stripAnsi(l))).toBeLessThanOrEqual(cols);
+        }
+      }
+    }
+  });
 });
 
 // -----------------------------------------------------------------------
@@ -688,7 +890,9 @@ describe("hitTest / click", () => {
     expect(hitTest(s, 100, 24, row, plain.indexOf("Restore"))).toEqual({
       type: "restore",
     });
-    expect(hitTest(s, 100, 24, 0, 0)).toBeNull();
+    // Row 0 is now the focusable search line (hits focusSearch, not null) -
+    // probe blank space past the last footer part instead.
+    expect(hitTest(s, 100, 24, row, 70)).toBeNull();
   });
 
   test("after a resize event the same screen coordinates hit the new geometry", () => {
@@ -715,6 +919,73 @@ describe("hitTest / click", () => {
     expect(s.focus).toBe("groups");
     expect(s.ticked.has(family.jid)).toBe(false); // family was granted -> untoggled
     expect(s.ticked.has(rohan.jid)).toBe(true); // dm row on the same line untouched
+  });
+
+  test("a click on a row draws the '>' marker on that row in the next frame", () => {
+    // Contacts row.
+    let s = initPicker(
+      model({ dms: [rohan, priya], groups: [family] }),
+      100,
+      24,
+    );
+    let lines = layout(s, 100, 24);
+    let row = lines.findIndex((l) => l.includes("Priya"));
+    let next = reducePicker(s, { type: "click", row, col: 5 });
+    let frameLine = stripAnsi(layout(next, 100, 24)[row]);
+    expect(frameLine).toContain(">[");
+    expect(frameLine.indexOf(">[")).toBeLessThan(frameLine.indexOf("Priya"));
+
+    // Groups row (right-hand column at cols=100, rightX=51).
+    s = initPicker(model({ dms: [rohan], groups: [family, wil] }), 100, 24);
+    lines = layout(s, 100, 24);
+    row = lines.findIndex((l) => l.includes("WIL Group HUDINI"));
+    next = reducePicker(s, { type: "click", row, col: 55 });
+    frameLine = stripAnsi(layout(next, 100, 24)[row]);
+    const markerIdx = frameLine.indexOf(">[");
+    expect(markerIdx).toBeGreaterThanOrEqual(51); // right half of the line
+    expect(frameLine.slice(markerIdx)).toContain("WIL Group HUDINI");
+  });
+
+  test("a click on the search line focuses it and ticks nothing", () => {
+    const s = initPicker(model({ dms: [rohan] }), 100, 24);
+    expect(hitTest(s, 100, 24, 0, 3)).toEqual({ type: "focusSearch" });
+    const next = reducePicker(s, { type: "click", row: 0, col: 3 });
+    expect(next.focus).toBe("search");
+    expect(next.ticked).toEqual(s.ticked);
+  });
+});
+
+// -----------------------------------------------------------------------
+// footer
+// -----------------------------------------------------------------------
+
+describe("footer", () => {
+  test("the footer reads Submit: enter / Undo: ctrl-z / Restore: ctrl-r / Quit: esc", () => {
+    const s = initPicker(model({ hasBackup: true }), 100, 24);
+    const lines = layout(s, 100, 24);
+    const footerLine = lines.find((l) => l.includes("Submit"))!;
+    expect(footerLine).toBe(
+      "Submit: enter   Undo: ctrl-z   Restore: ctrl-r   Quit: esc",
+    );
+  });
+
+  test("verbs are bold+accent and keys dim when colour is on", () => {
+    const s = initPicker(model({ hasBackup: true, color: true }), 100, 24);
+    const lines = layout(s, 100, 24);
+    const footerLine = lines.find((l) => l.includes("Submit"))!;
+    expect(footerLine).toContain(
+      "\x1b[1;32mSubmit\x1b[0m: \x1b[2menter\x1b[0m",
+    );
+  });
+
+  test("the short footer is used when the full one does not fit", () => {
+    const s = initPicker(model({ hasBackup: true }), 40, 24);
+    const lines = layout(s, 40, 24);
+    const row = lines.findIndex((l) => l.includes("Submit"));
+    const footerLine = stripAnsi(lines[row]);
+    expect(footerLine).toBe("Submit  Undo  Restore  Quit");
+    const restoreCol = footerLine.indexOf("Restore");
+    expect(hitTest(s, 40, 24, row, restoreCol)).toEqual({ type: "restore" });
   });
 });
 

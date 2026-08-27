@@ -160,10 +160,22 @@ export function listConfiguredGroups(
   return disambiguate(listed);
 }
 
-// A candidate is only ever a chat with real activity (dmActivity is only
-// ever written for a chat that's actually exchanged a message) - never the
-// whole phone contact list, which is exactly what keeps this from ever
-// asking about hundreds of never-messaged contacts.
+// The pool is DM activity PLUS the saved names WhatsApp's contact sync
+// delivered (contacts.json `.name` only). That is the owner's own address
+// book, synced by the server, never sent anywhere - so a contact who has
+// never DM'd this number is still findable by name (fork #17: `Search:
+// Thilian` -> `(none)`).
+//
+// A `.notify`-only entry is still OUT of the pool. `.notify` is
+// self-reported by anyone who has ever messaged the account, so admitting
+// it would let a stranger put themselves on a grant screen just by
+// choosing a display name. Saved names cannot be set by the contact.
+//
+// Order: activity first (recency, the signal WhatsApp's own chat list
+// uses), then the address book alphabetically - a never-messaged contact
+// is a search target, not a ranked suggestion.
+//
+// LID collapsing: one person under @lid and phone forms is one row.
 //
 // Deliberately does NOT use contacts.ts's contactName() (its name-or-notify
 // fallback is fine for passive display elsewhere, see mask.ts's own
@@ -204,17 +216,34 @@ export function rankDms(
   const alreadyAllowed = new Set(
     allowFrom.map((jid) => contactKeyFor(lidMap, jid)),
   );
-  const entries = Object.entries(activity);
-  const ranked = entries
+  const seen = new Set<string>();
+  const activityRows = Object.entries(activity)
     .filter(([jid]) => !alreadyAllowed.has(jid))
     .sort(([aj, a], [bj, b]) => b - a || aj.localeCompare(bj))
-    .slice(0, limit)
-    .map(([jid]) => ({
-      jid,
-      label: dmLabel(contacts, jid),
-      description: maskNumber(jid),
-    }));
-  return disambiguate(ranked);
+    .map(([jid]) => {
+      seen.add(jid);
+      return {
+        jid,
+        label: dmLabel(contacts, jid),
+        description: maskNumber(jid),
+      };
+    });
+  const addressBookRows: Candidate[] = [];
+  for (const [raw, entry] of Object.entries(contacts)) {
+    if (!entry?.name) continue;
+    const resolved = contactKeyFor(lidMap, raw);
+    if (alreadyAllowed.has(resolved) || seen.has(resolved)) continue;
+    seen.add(resolved);
+    addressBookRows.push({
+      jid: resolved,
+      label: dmLabel(contacts, contacts[resolved] ? resolved : raw),
+      description: maskNumber(resolved),
+    });
+  }
+  addressBookRows.sort(
+    (a, b) => a.label.localeCompare(b.label) || a.jid.localeCompare(b.jid),
+  );
+  return disambiguate([...activityRows, ...addressBookRows].slice(0, limit));
 }
 
 // Every DM contact already in allowFrom, not just the top N new ones - the
