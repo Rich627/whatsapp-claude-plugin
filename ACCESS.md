@@ -51,7 +51,7 @@ Groups are off by default. Opt each one in individually.
 
 Group JIDs end in `@g.us`. To find one, add the linked device to the group — the server logs the group JID when it receives a message from an unenabled group.
 
-With the default `requireMention: false`, the server responds to every message. Pass `--mention` to require @mention, or `--allow jid1,jid2` to restrict which members can trigger it. Pass `--roster` to also grant roster access (see below) — off by default, same as everything else.
+With the default `requireMention: false`, the server responds to every message. Pass `--mention` to require @mention, or `--allow jid1,jid2` to restrict which members can trigger it. Pass `--roster` to also grant roster access (see below) — off by default, same as everything else. Pass `--no-context` to keep a mention-gated group's unaddressed messages out of the local log entirely (see "Mention detection" below).
 
 Running `group add` again on an already-configured group **merges**, it doesn't start over: any flag you don't pass this time keeps whatever was already set. Adding `--roster` to a group that already has `--mention` on doesn't reset `--mention` back off — only the flags you actually pass change anything. To explicitly turn `--mention` or `--roster` back off (rather than just never setting them), pass `--no-mention` / `--no-roster` — passing both a flag and its negation at once is refused, not silently resolved one way.
 
@@ -85,7 +85,9 @@ Baileys 7 uses LID (Local Identifier) format alongside phone JIDs. The same pers
 
 With it off, name resolution and masking still work for the lifetime of the running server (built fresh each run from WhatsApp's own contact sync), it just isn't written to disk — so a restart starts blank again and the wizard's contact screen has nothing to rank. Either way, `WHATSAPP_ACCESS_MODE=static` disables this cache regardless of `WHATSAPP_CACHE_CONTACTS` — a static deployment can't be made to write local state by an env var. The recency cache the wizard ranks by (`dm-activity.json`) follows the same switch, since it's the same kind of per-sender data — including for a sender the access gate rejected, which is exactly what the opt-out is there for.
 
-Saved names sync on connect only when the cache holds no saved name at all (WhatsApp otherwise sends them just once, at linking); the server asks for the contact list again, logs a count (`address book synced: 3 saved name(s)` — never a name or number), and stops asking once one is cached. It never asks more than once every five minutes, and never runs with `WHATSAPP_CACHE_CONTACTS=0` or in static mode. After it, `contacts.json` holds the names of everyone saved on your phone, on your disk only. Chat-list order cannot be re-fetched, so the wizard ranks by the DM activity it has seen since.
+Saved names sync on connect only when the cache holds no saved name at all (WhatsApp otherwise sends them just once, at linking); the server asks for the contact list again, logs a count (`address book synced: 3 saved name(s)` — never a name or number), and stops asking once one is cached. It never asks more than once a day (tracked in `~/.whatsapp-channel/.addressbook-sync`, so a restart doesn't reset the clock), and never runs with `WHATSAPP_CACHE_CONTACTS=0` or in static mode. After it, `contacts.json` holds the names of everyone saved on your phone, on your disk only. Chat-list order cannot be re-fetched, so the wizard ranks by the DM activity it has seen since.
+
+Someone who merely messaged the account and was never approved doesn't sit in these caches forever: on the server's hourly prune, a `dm-activity.json` entry older than **90 days** is dropped unless its number is allowlisted (for a DM or any group), and a `contacts.json` entry with no saved name is dropped once it has neither an allowlist entry nor any activity younger than that. Saved names — your own phone's address book — never age out this way.
 
 **Names may reach the AI model; raw phone numbers should not.** When you ask Claude to reply and mention someone, it can use a saved name (`"Akash"`) instead of a number — that name is what appears in Claude's context. Anywhere a number would otherwise be shown to a human (an ambiguous-name error, `group_roster` for someone with no saved name) it's masked to the last 4 digits (`•••••5122`) before it's built into any string, not filtered afterward.
 
@@ -169,7 +171,7 @@ The `/whatsapp-channel:access` skill will point you at it if you ask for guided 
 
 ## Mention detection
 
-A message that does **not** trigger the server in such a group is still kept, text only, in `~/.whatsapp-channel/messages.jsonl` with `routed: false`, so `catch_up` can show you the room; it is never routed, notified or counted as unreplied (retention rules: [USAGE.md, "Your own replies"](./USAGE.md#your-own-replies)). Nothing is kept for a group that is not allowlisted or for a sender the group's own `allowFrom` rejects.
+A message that does **not** trigger the server in such a group is still kept, text only, in `~/.whatsapp-channel/messages.jsonl` with `routed: false`, so `catch_up` can show you the room; it is never routed, notified or counted as unreplied (retention rules: [USAGE.md, "Your own replies"](./USAGE.md#your-own-replies)). Nothing is kept for a group that is not allowlisted or for a sender the group's own `allowFrom` rejects. If you'd rather mention gating keep its stricter pre-0.22 meaning for a group — _nothing_ about the room is stored unless Claude was addressed — opt that group out with `group add <jid> --no-context` (`--context` turns it back on; a group that never set it keeps context, the 0.22.0 default). This is per group, because the trade is per group: context is what lets Claude draft a message that fits the conversation, and the people it stores are the group's other members.
 
 In groups with `requireMention: true`, any of the following triggers the server:
 
@@ -213,17 +215,17 @@ Two different notices, from the same script (`scripts/update-notice.ts`):
 
 ## Skill reference
 
-| Command                                                       | Effect                                                                                                                            |
-| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `/whatsapp-channel:access`                                    | Print current state: policy, allowlist, pending pairings, enabled groups.                                                         |
-| `/whatsapp-channel:access pair a4f91c`                        | Approve pairing code `a4f91c`. Adds the sender to `allowFrom` and sends a confirmation on WhatsApp.                               |
-| `/whatsapp-channel:access deny a4f91c`                        | Discard a pending code. The sender is not notified.                                                                               |
-| `/whatsapp-channel:access allow 886912345678@s.whatsapp.net`  | Add a JID directly.                                                                                                               |
-| `/whatsapp-channel:access remove 886912345678@s.whatsapp.net` | Remove from the allowlist.                                                                                                        |
-| `/whatsapp-channel:access policy allowlist`                   | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`.                                                                       |
-| `/whatsapp-channel:access group add 120363424405607157@g.us`  | Enable a group (merges into an existing entry). Flags: `--mention`/`--no-mention`, `--allow jid1,jid2`, `--roster`/`--no-roster`. |
-| `/whatsapp-channel:access group rm 120363424405607157@g.us`   | Disable a group.                                                                                                                  |
-| `/whatsapp-channel:access set ackReaction 👀`                 | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`.                                 |
+| Command                                                       | Effect                                                                                                                                                        |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/whatsapp-channel:access`                                    | Print current state: policy, allowlist, pending pairings, enabled groups.                                                                                     |
+| `/whatsapp-channel:access pair a4f91c`                        | Approve pairing code `a4f91c`. Adds the sender to `allowFrom` and sends a confirmation on WhatsApp.                                                           |
+| `/whatsapp-channel:access deny a4f91c`                        | Discard a pending code. The sender is not notified.                                                                                                           |
+| `/whatsapp-channel:access allow 886912345678@s.whatsapp.net`  | Add a JID directly.                                                                                                                                           |
+| `/whatsapp-channel:access remove 886912345678@s.whatsapp.net` | Remove from the allowlist.                                                                                                                                    |
+| `/whatsapp-channel:access policy allowlist`                   | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`.                                                                                                   |
+| `/whatsapp-channel:access group add 120363424405607157@g.us`  | Enable a group (merges into an existing entry). Flags: `--mention`/`--no-mention`, `--allow jid1,jid2`, `--roster`/`--no-roster`, `--context`/`--no-context`. |
+| `/whatsapp-channel:access group rm 120363424405607157@g.us`   | Disable a group.                                                                                                                                              |
+| `/whatsapp-channel:access set ackReaction 👀`                 | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`.                                                             |
 
 ## Config file
 

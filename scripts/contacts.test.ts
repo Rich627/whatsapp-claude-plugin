@@ -5,7 +5,9 @@ import {
   hasSavedName,
   mergeContact,
   migrateContactKey,
+  pruneStrangers,
   resolveByName,
+  STRANGER_TTL_MS,
   type ContactsMap,
 } from "./contacts";
 
@@ -257,5 +259,68 @@ describe("hasSavedName", () => {
         "b@s.whatsapp.net": { name: "Akash", notify: "aki_98" },
       }),
     ).toBe(true);
+  });
+});
+
+describe("pruneStrangers", () => {
+  const NOW = 1_756_000_000_000;
+  const OLD = NOW - STRANGER_TTL_MS - 1;
+  const FRESH = NOW - 1000;
+  const J = (n: string) => `${n}@s.whatsapp.net`;
+
+  test("a gate-rejected stranger ages out of both maps", () => {
+    const contacts: ContactsMap = { [J("1")]: { notify: "spam bot" } };
+    const dm = { [J("1")]: OLD };
+    const changed = pruneStrangers(contacts, dm, new Set(), NOW);
+    expect(changed).toEqual({ contacts: true, dms: true });
+    expect(contacts).toEqual({});
+    expect(dm).toEqual({});
+  });
+
+  test("a saved name never ages out, even with stale activity", () => {
+    const contacts: ContactsMap = { [J("2")]: { name: "Mum" } };
+    const dm = { [J("2")]: OLD };
+    pruneStrangers(contacts, dm, new Set(), NOW);
+    expect(contacts[J("2")]).toEqual({ name: "Mum" });
+    // ...but the stale activity timestamp itself still goes: it only ranks
+    // the wizard, and a saved name earns its row without it.
+    expect(dm[J("2")]).toBeUndefined();
+  });
+
+  test("an allowlisted key is kept in both maps whatever its age", () => {
+    const contacts: ContactsMap = { [J("3")]: { notify: "aki_98" } };
+    const dm = { [J("3")]: OLD };
+    const changed = pruneStrangers(contacts, dm, new Set([J("3")]), NOW);
+    expect(changed).toEqual({ contacts: false, dms: false });
+    expect(contacts[J("3")]).toBeDefined();
+    expect(dm[J("3")]).toBe(OLD);
+  });
+
+  test("fresh activity keeps a notify-only contact", () => {
+    const contacts: ContactsMap = { [J("4")]: { notify: "new friend" } };
+    const dm = { [J("4")]: FRESH };
+    const changed = pruneStrangers(contacts, dm, new Set(), NOW);
+    expect(changed).toEqual({ contacts: false, dms: false });
+  });
+
+  test("a notify-only contact with no activity record at all is dropped", () => {
+    const contacts: ContactsMap = { [J("5")]: { notify: "group lurker" } };
+    const changed = pruneStrangers(contacts, {}, new Set(), NOW);
+    expect(changed).toEqual({ contacts: true, dms: false });
+    expect(contacts).toEqual({});
+  });
+
+  test("a malformed activity timestamp is kept, not treated as old", () => {
+    const dm = { [J("6")]: Number.NaN };
+    const changed = pruneStrangers({}, dm, new Set(), NOW);
+    expect(changed.dms).toBe(false);
+    expect(J("6") in dm).toBe(true);
+  });
+
+  test("empty maps report no change", () => {
+    expect(pruneStrangers({}, {}, new Set(), NOW)).toEqual({
+      contacts: false,
+      dms: false,
+    });
   });
 });
