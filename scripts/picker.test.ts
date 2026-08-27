@@ -206,7 +206,7 @@ describe("reducePicker", () => {
     expect(s.ticked.has(family.jid)).toBe(true); // untouched
   });
 
-  test("Space with the caret in the search line ticks the MARKED row, not the previously focused column", () => {
+  test("Enter with the caret in the search line ticks the MARKED row, not the previously focused column", () => {
     const alice = item({ jid: "1@s.whatsapp.net", label: "Alice", kind: "dm" });
     const zeta = item({ jid: "g1@g.us", label: "Zeta Group", kind: "group" });
     let s = initPicker(model({ dms: [alice], groups: [zeta] }), 100, 24);
@@ -226,7 +226,8 @@ describe("reducePicker", () => {
       .map(stripAnsi)
       .find((l) => l.startsWith(">"));
     expect(marked).toContain("Alice");
-    s = press(s, { type: "space" });
+    // From the search line a space is a filter character; Enter is the tick.
+    s = press(s, { type: "enter" });
     expect([...s.ticked]).toEqual([alice.jid]);
   });
 
