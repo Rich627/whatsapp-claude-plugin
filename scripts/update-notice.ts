@@ -66,6 +66,7 @@ if (!isStaticMode()) {
         'Replies you type on your phone are no longer invisible to Claude. For chats already on your allowlist, the message is logged the moment you send it, so the unreplied list clears and `catch_up` shows both sides of the conversation instead of only Claude\'s half. Your own words stay readable for an hour and then collapse to a "replied (text expired)" line, and `catch_up` now replays the last 5 messages per chat rather than 15.',
         'Fixed: a message you sent to yourself (the "Me" chat) was silently dropped. WhatsApp delivers your own self-chat under your own @lid and never tells the linked device how that @lid maps to your number, so the allowlist match failed. The server now records that mapping itself the moment it connects.',
         "Fixed: the connection's diagnostic log recorded full phone numbers - including for a message it then refused, whose sender was never on your allowlist. Every number this plugin writes to that log is now masked to its last four digits, and a group keeps its identifying form so an outage is still diagnosable. Baileys' own library logging is deliberately left alone and still carries full JIDs at its default level, so the log is not a place to keep secrets.",
+        "Fixed: the session-start hook failed with `No such file or directory` when the plugin's install path contained a space (a home folder like `C:\Users\Jane Doe`), so the onboarding check and this notice never ran. The path is now quoted.",
       ],
     },
     {
