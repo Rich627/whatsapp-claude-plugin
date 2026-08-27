@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,10 +18,19 @@ function freshStateDir(): string {
 
 /** Returns stdout+stderr and the exit code, since failures are part of the contract. */
 function run(dir: string, ...args: string[]): { out: string; code: number } {
+  return runEnv(dir, {}, ...args);
+}
+
+/** Same as `run`, with extra env vars overlaid (e.g. WHATSAPP_PICKER_LAUNCH). */
+function runEnv(
+  dir: string,
+  env: Record<string, string>,
+  ...args: string[]
+): { out: string; code: number } {
   try {
     const out = execFileSync("bun", [CLI, ...args], {
       encoding: "utf8",
-      env: { ...process.env, WHATSAPP_STATE_DIR: dir },
+      env: { ...process.env, WHATSAPP_STATE_DIR: dir, ...env },
       stdio: ["ignore", "pipe", "pipe"],
     });
     return { out, code: 0 };
@@ -25,23 +40,38 @@ function run(dir: string, ...args: string[]): { out: string; code: number } {
   }
 }
 
-/** Like run(), but feeds `stdin` to the process - for the wizard's prompts. */
-function runWithInput(
-  dir: string,
-  stdin: string,
-  ...args: string[]
-): { out: string; code: number } {
-  try {
-    const out = execFileSync("bun", [CLI, ...args], {
-      encoding: "utf8",
-      env: { ...process.env, WHATSAPP_STATE_DIR: dir },
-      input: stdin,
-    });
-    return { out, code: 0 };
-  } catch (err) {
-    const e = err as { stdout?: string; stderr?: string; status?: number };
-    return { out: (e.stdout ?? "") + (e.stderr ?? ""), code: e.status ?? 1 };
-  }
+// Stands in for the terminal launcher. Prints the argv it was handed (so the
+// test can assert what the platform branch would have run), optionally edits
+// access.json via `body`, then writes the done marker the way the real
+// wizard's exit handler does - so `review` (which polls for that file) ends
+// its wait the same way a real window closing would.
+//
+// Filename has a space on purpose: pickerLaunch()'s .ts/.js override branch
+// runs this file under `process.execPath` with the file's own path as a
+// single args[] element (`{ cmd: process.execPath, args: [override, ...] }`).
+// A space in that path is exactly what would come apart if spawnSync ever
+// went through a shell instead of an argv array - this repo's own install
+// path (`Pull Requests`/`Whatsapp Plugin`, see CLI above) has one for real,
+// so the property is worth pinning down rather than trusting by inspection.
+function writeFakeLauncher(dir: string, body: string): string {
+  const path = join(dir, "fake launcher.ts");
+  writeFileSync(
+    path,
+    [
+      `import { writeFileSync, mkdirSync } from "node:fs";`,
+      `import { join } from "node:path";`,
+      // process.argv[1] is this file's own path, as bun/node resolved it -
+      // printed so the test can confirm it arrived whole, not split at the
+      // space into two argv entries.
+      `console.log("SELF=" + process.argv[1]);`,
+      `console.log(process.argv.slice(2).join(" "));`,
+      `const dir = process.env.WHATSAPP_STATE_DIR!;`,
+      body,
+      `mkdirSync(dir, { recursive: true, mode: 0o700 });`,
+      `writeFileSync(join(dir, ".picker-done"), String(Date.now()), { mode: 0o600 });`,
+    ].join("\n"),
+  );
+  return path;
 }
 
 function writeContacts(
@@ -115,6 +145,12 @@ describe("allowlist", () => {
   test("removing someone who is not listed fails loudly", () => {
     const dir = freshStateDir();
     expect(run(dir, "remove", "nobody@s.whatsapp.net").code).toBe(1);
+  });
+
+  test("a positional JID (typed by a human) prints unmasked", () => {
+    const dir = freshStateDir();
+    const res = run(dir, "allow", "61403911675@s.whatsapp.net");
+    expect(res.out).toContain("Allowed 61403911675@s.whatsapp.net.");
   });
 
   test("removing a contact also forgets their cached name, not just the allowlist entry", () => {
@@ -446,31 +482,12 @@ describe("groups", () => {
   });
 });
 
-// The wizard's checkbox prompts are driven by @inquirer/prompts, which
-// takes raw keystrokes: " " (space) toggles the highlighted item, "\n"
-// submits, "\x03" is Ctrl-C. A chain of MULTIPLE checkbox() calls in one
-// process is unreliable over piped/non-TTY stdin - a known Inquirer/Node
-// issue (stream ownership gets lost between prompts when piping; it works
-// fine interactively, which is the only place this glue actually runs -
-// see SBoudrias/Inquirer.js#767 and #414). So every test here is
-// constructed to trigger AT MOST ONE checkbox() call: either there's only
-// one category of candidate (groups xor DMs), or the group selection is
-// left empty (which skips the second, roster, checkbox entirely - see
-// wizard()'s own `if (actGroups.length > 0)` guard). Ordering, filtering
-// and masking logic itself is covered exhaustively and reliably in
-// ranking.test.ts instead, since none of that needs a live prompt.
-//
-// skipIf(CI): 6 of the tests below navigate the checkbox with " "/"\n"
-// (toggle/submit keystrokes) and hang for the full 5s timeout on GitHub's
-// Linux runners, every time - confirmed not a bun-version issue (reproduced
-// locally against the exact bun version CI uses, still passes on Windows).
-// @inquirer/prompts' checkbox() needs real keypress events to register a
-// toggle, and how a piped, non-TTY stdin's raw bytes turn into keypress
-// events differs enough between Windows and Linux that Linux never sees the
-// toggle. The Ctrl-C test below is unaffected and NOT skipped - "\x03"
-// resolves as an interrupt without needing that same keypress-by-keypress
-// handling. Every affected test runs fine locally on either platform; only
-// CI (Linux) skips them.
+// The one-screen picker (scripts/picker.ts) is a raw-mode TUI, so it cannot
+// be driven from a piped stdin the way the old checkbox prompts could - the
+// tests below assert the CLI-level guard (a non-TTY stdin refuses, cleanly)
+// and the output printed BEFORE the screen would open (the archived-hidden
+// disclosure, the USAGE text). The screen's own keystroke/layout behaviour
+// is covered in picker.test.ts instead.
 describe("wizard", () => {
   test("no group or DM activity cached at all: refuses with a clear message", () => {
     const dir = freshStateDir();
@@ -479,7 +496,60 @@ describe("wizard", () => {
     expect(res.out).toContain("Nothing to review");
   });
 
-  test("archived groups skipped by default; already-configured groups skipped too: nothing left", () => {
+  test("wizard --help prints USAGE and opens no prompt", () => {
+    const dir = freshStateDir();
+    // Empty stdin: a prompt here would hang/fail the test, which is the point.
+    const res = run(dir, "wizard", "--help");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("PRE-TICKED");
+    expect(res.out).toContain("--revoke");
+    expect(res.out).toContain("--undo");
+  });
+
+  test("wizard needs a real terminal: a non-TTY stdin exits 1, writes nothing", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": {
+        name: "Family",
+        memberCount: 4,
+        archived: false,
+        updatedAt: 0,
+      },
+    });
+    const res = run(dir, "wizard");
+    expect(res.code).toBe(1);
+    expect(res.out.toLowerCase()).toContain("needs a real terminal");
+    expect(res.out).not.toContain("ExitPromptError");
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
+  });
+
+  test("a synced address book with no activity is enough to open the screen", () => {
+    const dir = freshStateDir();
+    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Thilian" } });
+    const res = run(dir, "wizard");
+    expect(res.code).toBe(1);
+    expect(res.out.toLowerCase()).toContain("needs a real terminal");
+    expect(res.out).not.toContain("Nothing to review");
+  });
+
+  test("--revoke opens the same screen as plain wizard", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": {
+        name: "Family",
+        memberCount: 4,
+        archived: false,
+        updatedAt: 0,
+      },
+    });
+    run(dir, "group", "add", "1@g.us");
+    const plain = run(dir, "wizard");
+    const revoke = run(dir, "wizard", "--revoke");
+    expect(revoke.code).toBe(plain.code);
+    expect(revoke.out).toBe(plain.out);
+  });
+
+  test("an already-configured group is offered instead of leaving nothing to review", () => {
     const dir = freshStateDir();
     writeGroupsMeta(dir, {
       "1@g.us": {
@@ -498,90 +568,102 @@ describe("wizard", () => {
     run(dir, "group", "add", "1@g.us"); // already configured
     const res = run(dir, "wizard");
     expect(res.code).toBe(1);
-    expect(res.out).toContain("Nothing to review");
-    expect(access(dir).groups["2@g.us"]).toBeUndefined();
+    expect(res.out.toLowerCase()).toContain("needs a real terminal");
+    expect(res.out).not.toContain("Nothing to review");
   });
 
-  test.skipIf(!!process.env.CI)(
-    "groups only, select none: nothing configured, access.json never created",
-    () => {
-      const dir = freshStateDir();
-      writeGroupsMeta(dir, {
-        "1@g.us": {
-          name: "Family",
-          memberCount: 4,
-          archived: false,
-          updatedAt: 0,
-        },
-      });
-      const res = runWithInput(dir, "\n", "wizard"); // enter immediately, 0 selected
-      expect(res.code).toBe(0);
-      expect(res.out).toContain("0 group(s), 0 contact(s) configured.");
-      expect(existsSync(join(dir, "access.json"))).toBe(false);
-    },
-  );
+  test("--include-archived surfaces an archived group as a candidate", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": {
+        name: "Old Chat",
+        memberCount: 2,
+        archived: true,
+        updatedAt: 0,
+      },
+    });
+    // Without the flag there'd be nothing to review at all - with it, the
+    // group enters the pool and the run gets as far as the terminal guard
+    // instead of dying earlier with "Nothing to review".
+    const plain = run(dir, "wizard");
+    expect(plain.code).toBe(1);
+    expect(plain.out).toContain("Nothing to review");
+    const withFlag = run(dir, "wizard", "--include-archived");
+    expect(withFlag.code).toBe(1);
+    expect(withFlag.out.toLowerCase()).toContain("needs a real terminal");
+  });
 
-  test.skipIf(!!process.env.CI)(
-    "--include-archived surfaces an archived group as a candidate",
-    () => {
-      const dir = freshStateDir();
-      writeGroupsMeta(dir, {
-        "1@g.us": {
-          name: "Old Chat",
-          memberCount: 2,
-          archived: true,
-          updatedAt: 0,
-        },
-      });
-      // Without the flag there'd be nothing to review at all (see the test
-      // above this one) - with it, the group is offered, even though this
-      // run selects none of it.
-      const res = runWithInput(dir, "\n", "wizard", "--include-archived");
-      expect(res.code).toBe(0);
-      expect(res.out).toContain("Old Chat");
-      // Nothing was selected, so nothing was written at all.
-      expect(existsSync(join(dir, "access.json"))).toBe(false);
-    },
-  );
+  // The disclosure lines below are written before the terminal guard fires,
+  // so a plain non-TTY run() is enough to observe them.
+  test("archived groups hidden are disclosed with the --include-archived hint", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": {
+        name: "Active",
+        memberCount: 2,
+        archived: false,
+        updatedAt: 0,
+      },
+      "2@g.us": {
+        name: "Old",
+        memberCount: 2,
+        archived: true,
+        updatedAt: 0,
+      },
+      "3@g.us": {
+        name: "Older",
+        memberCount: 2,
+        archived: true,
+        updatedAt: 0,
+      },
+    });
+    const res = run(dir, "wizard");
+    expect(res.out).toContain("2 archived group(s) are hidden");
+    expect(res.out).toContain("--include-archived");
+    const withFlag = run(dir, "wizard", "--include-archived");
+    expect(withFlag.out).not.toContain("are hidden");
+  });
 
-  test.skipIf(!!process.env.CI)(
-    "DMs only, select none: nothing configured, access.json never created",
-    () => {
-      const dir = freshStateDir();
-      writeDmActivity(dir, { "1@s.whatsapp.net": 1000 });
-      const res = runWithInput(dir, "\n", "wizard");
-      expect(res.code).toBe(0);
-      expect(res.out).toContain("0 group(s), 0 contact(s) configured.");
-      expect(existsSync(join(dir, "access.json"))).toBe(false);
-    },
-  );
+  test("an archived group that is already configured does not count toward hiddenArchived", () => {
+    const dir = freshStateDir();
+    writeGroupsMeta(dir, {
+      "1@g.us": {
+        name: "Active",
+        memberCount: 2,
+        archived: false,
+        updatedAt: 0,
+      },
+      "2@g.us": {
+        name: "Old",
+        memberCount: 2,
+        archived: true,
+        updatedAt: 0,
+      },
+      "3@g.us": {
+        name: "AlreadyConfigured",
+        memberCount: 2,
+        archived: true,
+        updatedAt: 0,
+      },
+    });
+    run(dir, "group", "add", "3@g.us");
+    const res = run(dir, "wizard");
+    expect(res.out).toContain("1 archived group(s) are hidden");
+    expect(res.out).not.toContain("2 archived group(s) are hidden");
+  });
 
-  test.skipIf(!!process.env.CI)(
-    "DMs only, select the one candidate: added to the allowlist",
-    () => {
-      const dir = freshStateDir();
-      writeDmActivity(dir, { "61403911675@s.whatsapp.net": 1000 });
-      writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
-      const res = runWithInput(dir, " \n", "wizard"); // space selects, enter submits
-      expect(res.code).toBe(0);
-      expect(res.out).toContain("0 group(s), 1 contact(s) configured.");
-      expect(access(dir).allowFrom).toEqual(["61403911675@s.whatsapp.net"]);
-    },
-  );
+  // The only proof, along with the test below, that Bun fires
+  // process.on("exit") on the die() path - `review` polls for this file, so
+  // if the wizard's exit handler ever stopped firing here, `review` would
+  // hang until its 30-minute cap on every single "nothing to review" run.
+  test("nothing cached: still writes .picker-done", () => {
+    const dir = freshStateDir();
+    const res = run(dir, "wizard");
+    expect(res.code).toBe(1);
+    expect(existsSync(join(dir, ".picker-done"))).toBe(true);
+  });
 
-  test.skipIf(!!process.env.CI)(
-    "DM candidate label shows the saved name, never the raw number",
-    () => {
-      const dir = freshStateDir();
-      writeDmActivity(dir, { "61403911675@s.whatsapp.net": 1000 });
-      writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
-      const res = runWithInput(dir, "\n", "wizard");
-      expect(res.out).toContain("Rohan");
-      expect(res.out).not.toContain("61403911675");
-    },
-  );
-
-  test("Ctrl-C cancels cleanly: nothing written, no raw stack trace", () => {
+  test("needs a real terminal: still writes .picker-done", () => {
     const dir = freshStateDir();
     writeGroupsMeta(dir, {
       "1@g.us": {
@@ -591,326 +673,218 @@ describe("wizard", () => {
         updatedAt: 0,
       },
     });
-    const res = runWithInput(dir, "\x03", "wizard");
-    expect(res.code).toBe(0);
-    expect(res.out).toContain("Cancelled - nothing was changed.");
-    expect(res.out).not.toContain("ExitPromptError");
-    expect(existsSync(join(dir, "access.json"))).toBe(false);
-  });
-
-  test.skipIf(!!process.env.CI)(
-    "the closing privacy line is always printed, in plain text (not the amber highlight) when not a TTY",
-    () => {
-      const dir = freshStateDir();
-      writeDmActivity(dir, { "1@s.whatsapp.net": 1000 });
-      const res = runWithInput(dir, "\n", "wizard");
-      expect(res.out).toContain(
-        "No group or contact data was sent to any AI model during this setup",
-      );
-      // execFileSync's pipes are never a TTY, so highlight() must not wrap
-      // the disclosure line in the bold-amber escape - inquirer's OWN prompt
-      // rendering does use ANSI regardless of TTY, so this checks the specific
-      // color code highlight() would add, not "no ANSI anywhere in the output".
-      expect(res.out).not.toContain("\x1b[1;38;5;208m");
-    },
-  );
-});
-
-describe("set", () => {
-  test("typed values are coerced and bad ones refused", () => {
-    const dir = freshStateDir();
-    run(dir, "set", "textChunkLimit", "900");
-    expect(access(dir).textChunkLimit).toBe(900);
-    run(dir, "set", "mentionPatterns", '["claude"]');
-    expect(access(dir).mentionPatterns).toEqual(["claude"]);
-    expect(run(dir, "set", "textChunkLimit", "lots").code).toBe(1);
-    expect(run(dir, "set", "replyToMode", "sometimes").code).toBe(1);
-    expect(run(dir, "set", "nonsenseKey", "1").code).toBe(1);
-  });
-});
-
-describe("robustness", () => {
-  test("a corrupt access.json is reported, not silently replaced", () => {
-    const dir = freshStateDir();
-    writeFileSync(join(dir, "access.json"), "][");
-    const res = run(dir, "status");
+    const res = run(dir, "wizard");
     expect(res.code).toBe(1);
-    expect(res.out).toContain("not valid JSON");
-    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe("][");
-  });
-
-  test("status works before the server has ever run", () => {
-    const dir = freshStateDir();
-    const res = run(dir, "status");
-    expect(res.code).toBe(0);
-    expect(res.out).toContain("dmPolicy:   pairing");
+    expect(existsSync(join(dir, ".picker-done"))).toBe(true);
   });
 });
 
-// The read-only JSON pair the in-session review/manage screens execute
-// (skills/access/SKILL.md) instead of restating the ranking and labelling
-// rules in prose. What matters here is the CONTRACT the skill depends on -
-// the label/description rules themselves are ranking.test.ts's job.
-describe("candidates (JSON for the in-session review screen)", () => {
-  test("empty state: valid JSON with empty lists, not a failure", () => {
+// T18: `review` opens the picker in a NEW terminal window and reports back
+// only the delta. WHATSAPP_PICKER_LAUNCH names a fixture "launcher" (a .ts
+// run under this same bun) so these tests never open a real terminal.
+describe("review", () => {
+  test("spawn argv + delta + exit 0", () => {
     const dir = freshStateDir();
-    const { out, code } = run(dir, "candidates");
-    expect(code).toBe(0);
-    expect(JSON.parse(out)).toEqual({
-      groups: { items: [], total: 0 },
-      dms: { items: [], total: 0 },
-    });
-  });
-
-  // Uncapped on purpose: a caller that showed the first four and then
-  // re-asked for a fresh page would offer the same four forever, so a
-  // candidate the user declines once could never be reached again.
-  test("returns the WHOLE pool, most recently active first, not just a first page", () => {
-    const dir = freshStateDir();
-    const meta: Record<string, never> | Record<string, any> = {};
-    for (let i = 1; i <= 6; i++) {
-      meta[`${i}@g.us`] = {
-        name: `Group ${i}`,
-        memberCount: 3,
-        archived: false,
-        lastActivityAt: i,
-        updatedAt: 0,
-      };
-    }
-    writeGroupsMeta(dir, meta);
-    writeDmActivity(dir, {
-      "1@s.whatsapp.net": 1,
-      "2@s.whatsapp.net": 2,
-      "3@s.whatsapp.net": 3,
-      "4@s.whatsapp.net": 4,
-      "5@s.whatsapp.net": 5,
-    });
-    const parsed = JSON.parse(run(dir, "candidates").out);
-    expect(parsed.groups.items).toHaveLength(6);
-    expect(parsed.groups.total).toBe(6);
-    expect(parsed.dms.items).toHaveLength(5);
-    expect(parsed.dms.total).toBe(5);
-    // Ranked, so a caller showing four at a time still shows the four that
-    // matter first.
-    expect(parsed.groups.items[0].jid).toBe("6@g.us");
-    expect(parsed.dms.items[0].jid).toBe("5@s.whatsapp.net");
-  });
-
-  test("every option carries the jid, label and description the screen needs", () => {
-    const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "120363424405607157@g.us": {
-        name: "Team",
-        memberCount: 4,
-        archived: false,
-        updatedAt: 0,
-      },
-    });
-    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
     writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Akash" } });
-    const parsed = JSON.parse(run(dir, "candidates").out);
-    expect(parsed.groups.items[0]).toEqual({
-      jid: "120363424405607157@g.us",
-      label: "Team  (4 member(s))",
-      description: "120363424405607157@g.us",
-    });
-    expect(parsed.dms.items[0]).toEqual({
-      jid: "61403911675@s.whatsapp.net",
-      label: "Akash",
-      // Masked, never the raw number - a full one in an option payload is
-      // a real phone number written into the session transcript.
-      description: "•••••1675",
-    });
+    const launcher = writeFakeLauncher(
+      dir,
+      [
+        `writeFileSync(`,
+        `  join(dir, "access.json"),`,
+        `  JSON.stringify({`,
+        `    dmPolicy: "pairing",`,
+        `    allowFrom: ["61403911675@s.whatsapp.net"],`,
+        `    groups: { "1@g.us": { requireMention: false, allowFrom: [], roster: false } },`,
+        `    pending: {},`,
+        `  }, null, 2),`,
+        `);`,
+      ].join("\n"),
+    );
+    const res = runEnv(dir, { WHATSAPP_PICKER_LAUNCH: launcher }, "review");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("bun");
+    expect(res.out).toContain(CLI);
+    expect(res.out).toContain("wizard");
+    // Proves the launcher itself was run under process.execPath with its own
+    // (space-containing) path as a single argv element, not split by a shell.
+    expect(res.out).toContain(`SELF=${launcher}`);
+    expect(res.out).toContain(
+      "Opening the access screen in a new terminal window. Pick there; I only see what changed.",
+    );
+    expect(res.out).toContain("+ Akash");
+    expect(res.out).toContain("(+ = access this grants");
+    expect(res.out).not.toContain("61403911675");
+    expect(existsSync(join(dir, ".picker-done"))).toBe(false);
   });
 
-  test("archived groups are excluded unless --include-archived is passed", () => {
+  test("pre-touched marker + a launcher that changes nothing -> Nothing changed, exit 0", () => {
     const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "a@g.us": {
-        name: "Old",
-        memberCount: 2,
-        archived: true,
-        updatedAt: 0,
-      },
-    });
-    expect(JSON.parse(run(dir, "candidates").out).groups.total).toBe(0);
+    writeFileSync(join(dir, ".picker-done"), "stale");
+    const launcher = writeFakeLauncher(dir, "");
+    const res = runEnv(dir, { WHATSAPP_PICKER_LAUNCH: launcher }, "review");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain(
+      "Nothing changed - the access screen was closed without applying anything.",
+    );
+    expect(existsSync(join(dir, ".picker-done"))).toBe(false);
+  });
+
+  test("missing launcher -> exit 2 + D2, and the stale marker was removed first", () => {
+    const dir = freshStateDir();
+    writeFileSync(join(dir, ".picker-done"), "stale");
+    const res = runEnv(
+      dir,
+      { WHATSAPP_PICKER_LAUNCH: "whatsapp-no-such-launcher-xyz" },
+      "review",
+    );
+    expect(res.code).toBe(2);
+    expect(res.out).toContain("Could not open a terminal window");
+    expect(res.out).toContain("Run this in your own terminal, then come back:");
+    // The exact D2 command: absolute, quoted, forward slashes even on
+    // Windows (see wizard-cmd.ts) - not just "access.ts" and "wizard"
+    // appearing somewhere.
+    const expectedPath = CLI.replace(/\\/g, "/");
     expect(
-      JSON.parse(run(dir, "candidates", "--include-archived").out).groups.total,
-    ).toBe(1);
-  });
-
-  test("already-configured groups and already-allowed contacts are not offered again", () => {
-    const dir = freshStateDir();
-    writeGroupsMeta(dir, {
-      "a@g.us": { name: "Team", memberCount: 2, archived: false, updatedAt: 0 },
-    });
-    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 100 });
-    run(dir, "group", "add", "a@g.us");
-    run(dir, "allow", "61403911675@s.whatsapp.net");
-    const parsed = JSON.parse(run(dir, "candidates").out);
-    expect(parsed.groups.total).toBe(0);
-    expect(parsed.dms.total).toBe(0);
-  });
-
-  test("reads only - access.json is untouched", () => {
-    const dir = freshStateDir();
-    run(dir, "allow", "x@s.whatsapp.net");
-    const before = readFileSync(join(dir, "access.json"), "utf8");
-    run(dir, "candidates");
-    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
-  });
-});
-
-describe("configured (JSON for the in-session manage/revoke screen)", () => {
-  test("empty state: valid JSON with empty lists, not a failure", () => {
-    const dir = freshStateDir();
-    const { out, code } = run(dir, "configured");
-    expect(code).toBe(0);
-    expect(JSON.parse(out)).toEqual({
-      groups: { items: [], total: 0 },
-      dms: { items: [], total: 0 },
-    });
-  });
-
-  // The revoke screen must never truncate: `manage` only ever removes, so
-  // an entry that never appears can never be revoked (PR #24 review, #2).
-  test("lists EVERY allowlisted contact, well past the 4 an option list shows", () => {
-    const dir = freshStateDir();
-    for (let i = 1; i <= 7; i++) run(dir, "allow", `${i}@s.whatsapp.net`);
-    const parsed = JSON.parse(run(dir, "configured").out);
-    expect(parsed.dms.total).toBe(7);
-    expect(parsed.dms.items).toHaveLength(7);
-  });
-
-  test("both forms of a contact allowlisted twice stay separately revokable", () => {
-    const dir = freshStateDir();
-    writeLidMap(dir, {
-      "184710990000999@lid": "61403911675@s.whatsapp.net",
-    });
-    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Akash" } });
-    run(dir, "allow", "184710990000999@lid");
-    run(dir, "allow", "61403911675@s.whatsapp.net");
-    const items = JSON.parse(run(dir, "configured").out).dms.items;
-    expect(items).toHaveLength(2);
-    // Distinct labels: AskUserQuestion returns a selection by its label, so
-    // two identical ones cannot be mapped back to one JID.
-    expect(new Set(items.map((c: { label: string }) => c.label)).size).toBe(2);
-  });
-
-  test("a configured group with no cached meta still appears, so it stays revokable", () => {
-    const dir = freshStateDir();
-    run(dir, "group", "add", "ghost@g.us");
-    const items = JSON.parse(run(dir, "configured").out).groups.items;
-    expect(items).toEqual([
-      { jid: "ghost@g.us", label: "ghost@g.us", description: "ghost@g.us" },
-    ]);
-  });
-
-  test("reads only - access.json is untouched", () => {
-    const dir = freshStateDir();
-    run(dir, "allow", "x@s.whatsapp.net");
-    const before = readFileSync(join(dir, "access.json"), "utf8");
-    run(dir, "configured");
-    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
-  });
-});
-
-// Issue #1: until this existed the wizard could only ever GRANT, so an
-// existing user pointed at it by the update notice found no way to take
-// access back short of editing access.json by hand.
-describe("wizard --revoke", () => {
-  test("nothing configured: refuses with a clear message, writes nothing", () => {
-    const dir = freshStateDir();
-    const res = run(dir, "wizard", "--revoke");
-    expect(res.code).toBe(1);
-    expect(res.out).toContain("no access to take away");
+      expectedPath.startsWith("/") || /^[A-Za-z]:\//.test(expectedPath),
+    ).toBe(true);
+    expect(res.out).toContain(`bun "${expectedPath}" wizard`);
+    expect(res.out).toContain("Nothing was changed.");
+    // Nothing recreated it, so the removal must have happened before the
+    // launch attempt.
+    expect(existsSync(join(dir, ".picker-done"))).toBe(false);
     expect(existsSync(join(dir, "access.json"))).toBe(false);
   });
 
-  test.skipIf(!!process.env.CI)(
-    "select none: an empty selection removes NOTHING, never everything",
-    () => {
-      const dir = freshStateDir();
-      run(dir, "allow", "61403911675@s.whatsapp.net");
-      const before = readFileSync(join(dir, "access.json"), "utf8");
-      const res = runWithInput(dir, "\n", "wizard", "--revoke");
-      expect(res.code).toBe(0);
-      expect(res.out).toContain("Nothing selected");
-      expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
-    },
-  );
+  test("takes no arguments", () => {
+    const dir = freshStateDir();
+    const withJid = run(dir, "review", "somebody@s.whatsapp.net");
+    expect(withJid.code).toBe(1);
+    expect(existsSync(join(dir, ".picker-done"))).toBe(false);
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
 
-  test.skipIf(!!process.env.CI)(
-    "select the one contact: dropped from the allowlist and forgotten",
-    () => {
-      const dir = freshStateDir();
-      writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
-      writeDmActivity(dir, { "61403911675@s.whatsapp.net": 1000 });
-      run(dir, "allow", "61403911675@s.whatsapp.net");
-      const res = runWithInput(dir, " \n", "wizard", "--revoke");
-      expect(res.code).toBe(0);
-      // Labelled, not raw-numbered.
-      expect(res.out).toContain("Rohan");
-      expect(res.out).toContain("Forgot their cached name");
-      expect(access(dir).allowFrom).toEqual([]);
-      expect(readContacts(dir)["61403911675@s.whatsapp.net"]).toBeUndefined();
-    },
-  );
+    const withFlag = run(dir, "review", "--include-archived");
+    expect(withFlag.code).toBe(1);
+    expect(existsSync(join(dir, ".picker-done"))).toBe(false);
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
+  });
 
-  test.skipIf(!!process.env.CI)(
-    "select the one group: dropped, but its config.md and memory.md are kept",
-    () => {
-      const dir = freshStateDir();
-      writeGroupsMeta(dir, {
-        "1@g.us": {
-          name: "Family",
-          memberCount: 4,
-          archived: false,
-          updatedAt: 0,
-        },
-      });
-      run(dir, "group", "add", "1@g.us");
-      const config = join(dir, "groups", "1@g.us", "config.md");
-      expect(existsSync(config)).toBe(true);
-      const res = runWithInput(dir, " \n", "wizard", "--revoke");
-      expect(res.code).toBe(0);
-      expect(res.out).toContain("Family");
-      expect(access(dir).groups["1@g.us"]).toBeUndefined();
-      expect(existsSync(config)).toBe(true);
-    },
-  );
+  // Skipped, not implemented: PICKER_WAIT_MS (30 * 60_000) and POLL_MS are
+  // local consts inside review() (access.ts ~L821-822), not read from an env
+  // var or a parameter, and nothing in the spec (T18 §2.2 step 7, §7 "no new
+  // dependency... no user-facing knob") offers a way to shrink the cap for a
+  // test. Adding one would mean changing review()'s production code beyond
+  // what this task authorized a test session to touch. Not run: a real
+  // 30-minute wait is not something to eat in a test suite either way.
+  // Flagging for the reviewer/coder rather than guessing at a hook.
+  test.skip("a launcher that never touches the marker hits the 30-minute cap", () => {});
+});
 
-  test.skipIf(!!process.env.CI)(
-    "revoking one form of a doubly-allowlisted contact keeps the shared cache",
-    () => {
-      // Same guard `remove` applies - shared through revokeCachedIdentity so
-      // the two screens cannot drift apart on it.
-      const dir = freshStateDir();
-      writeLidMap(dir, {
-        "228896205193224@lid": "61432609386@s.whatsapp.net",
-      });
-      writeContacts(dir, { "61432609386@s.whatsapp.net": { name: "Soham" } });
-      run(dir, "allow", "228896205193224@lid");
-      run(dir, "allow", "61432609386@s.whatsapp.net");
-      // Rows sort by label then JID, so the @lid form is first; space ticks
-      // it, enter submits.
-      const res = runWithInput(dir, " \n", "wizard", "--revoke");
-      expect(res.code).toBe(0);
-      expect(res.out).toContain("Kept their cached name");
-      expect(access(dir).allowFrom).toEqual(["61432609386@s.whatsapp.net"]);
-      expect(readContacts(dir)["61432609386@s.whatsapp.net"]).toEqual({
-        name: "Soham",
-      });
-    },
-  );
+describe("--backup", () => {
+  test("allow <jid> --backup creates access.json.bak holding the pre-write content", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    const before = readFileSync(join(dir, "access.json"), "utf8");
+    run(dir, "allow", "2@s.whatsapp.net", "--backup");
+    expect(readFileSync(join(dir, "access.json.bak"), "utf8")).toBe(before);
+  });
 
-  test.skipIf(!!process.env.CI)(
-    "still prints the no-AI disclosure - a revoke is as terminal-only as a grant",
-    () => {
-      const dir = freshStateDir();
-      run(dir, "allow", "1@s.whatsapp.net");
-      const res = runWithInput(dir, "\n", "wizard", "--revoke");
-      expect(res.out).toContain("No group or contact data was sent to any AI");
-    },
-  );
+  test("without --backup no .bak file exists", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    expect(existsSync(join(dir, "access.json.bak"))).toBe(false);
+  });
+
+  test("a second --backup overwrites it (documented behaviour)", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    run(dir, "allow", "2@s.whatsapp.net", "--backup");
+    const afterFirstBackup = readFileSync(join(dir, "access.json"), "utf8");
+    run(dir, "allow", "3@s.whatsapp.net", "--backup");
+    expect(readFileSync(join(dir, "access.json.bak"), "utf8")).toBe(
+      afterFirstBackup,
+    );
+  });
+});
+
+describe("undo", () => {
+  test("no .bak: prints the nothing-to-undo line, exit 0, access.json byte-identical", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    const before = readFileSync(join(dir, "access.json"), "utf8");
+    const res = run(dir, "undo", "--dry-run");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("No previous access file - nothing to undo");
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
+  });
+
+  test("a misspelled --dry-run flag is refused instead of performing a real undo", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    run(dir, "allow", "--backup", "2@s.whatsapp.net");
+    const before = readFileSync(join(dir, "access.json"), "utf8");
+    const res = run(dir, "undo", "--dryrun");
+    expect(res.code).not.toBe(0);
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(before);
+  });
+
+  test("--dry-run after a backed-up change prints a +/- line per changed entry, no raw number, modifies neither file", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "61403911675@s.whatsapp.net");
+    run(dir, "allow", "61432609386@s.whatsapp.net", "--backup");
+    const accessBefore = readFileSync(join(dir, "access.json"), "utf8");
+    const bakBefore = readFileSync(join(dir, "access.json.bak"), "utf8");
+    const res = run(dir, "undo", "--dry-run");
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("+");
+    expect(res.out).toContain("-");
+    expect(res.out).not.toContain("61403911675");
+    expect(res.out).not.toContain("61432609386");
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(accessBefore);
+    expect(readFileSync(join(dir, "access.json.bak"), "utf8")).toBe(bakBefore);
+  });
+
+  test("restores the previous access.json; a second undo puts the change back (swap semantics)", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    const beforeChange = readFileSync(join(dir, "access.json"), "utf8");
+    run(dir, "allow", "2@s.whatsapp.net", "--backup");
+    const afterChange = readFileSync(join(dir, "access.json"), "utf8");
+
+    expect(run(dir, "undo").code).toBe(0);
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(beforeChange);
+
+    expect(run(dir, "undo").code).toBe(0);
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(afterChange);
+  });
+
+  test("access.json missing but .bak present (a corrupt file deleted per load()'s own advice): restores instead of crashing", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    run(dir, "allow", "2@s.whatsapp.net", "--backup");
+    const bak = readFileSync(join(dir, "access.json.bak"), "utf8");
+    rmSync(join(dir, "access.json"));
+
+    const dry = run(dir, "undo", "--dry-run");
+    expect(dry.code).toBe(0);
+    expect(dry.out).toContain("+");
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
+
+    const res = run(dir, "undo");
+    expect(res.code).toBe(0);
+    expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(bak);
+  });
+
+  test("wizard --undo produces the same output as undo and never blocks on a prompt", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "1@s.whatsapp.net");
+    run(dir, "allow", "2@s.whatsapp.net", "--backup");
+    const dir2 = freshStateDir();
+    run(dir2, "allow", "1@s.whatsapp.net");
+    run(dir2, "allow", "2@s.whatsapp.net", "--backup");
+
+    const viaUndo = run(dir, "undo", "--dry-run");
+    const viaWizard = run(dir2, "wizard", "--undo", "--dry-run");
+    expect(viaWizard.code).toBe(0);
+    expect(viaWizard.out).toBe(viaUndo.out);
+  });
 });

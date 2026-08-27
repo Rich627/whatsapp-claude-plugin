@@ -4,7 +4,7 @@
 // import (same class of problem server.ts has, see its own comments on
 // why mentions.ts/contacts.ts/mask.ts were extracted the same way).
 import { type ContactsMap } from "./contacts";
-import { looksLikeNumber, maskNumber } from "./mask";
+import { groupAnchor, looksLikeNumber, maskNumber } from "./mask";
 
 export type GroupMeta = {
   name: string;
@@ -15,11 +15,11 @@ export type GroupMeta = {
 };
 
 // `description` is the identity anchor rendered under the label on the
-// in-session review/manage screens: the raw JID for a group (a g.us id is
-// not personal data), the MASKED number for a contact (a raw one is
-// exactly what mask.ts exists to keep out of a transcript). Built here,
-// next to the label, so no caller has to re-derive the rule and get it
-// wrong - the old prose spec in skills/access/SKILL.md did.
+// picker screen: the raw JID for a group (a g.us id is not personal data),
+// the MASKED number for a contact (a raw one is exactly what mask.ts exists
+// to keep out of a transcript). Built here, next to the label, so no caller
+// has to re-derive the rule and get it wrong - the old prose spec in
+// skills/access/SKILL.md did.
 export type Candidate = { jid: string; label: string; description: string };
 
 // No live WhatsApp connection here (see access.ts's file header) and
@@ -69,28 +69,14 @@ function groupLabel(g: GroupMeta): string {
   return `${clip(g.name)}  (${g.memberCount} member(s))${g.archived ? "  [archived]" : ""}`;
 }
 
-// A modern group JID is a random `120363…@g.us` and carries nothing
-// personal, which is why a group's anchor shows it in full. A LEGACY one is
-// `<creator-phone>-<created-at>@g.us`, so the same field would put a real
-// phone number on screen and into the transcript - exactly what mask.ts
-// exists to stop. The hyphen is what tells the two apart: mask only the
-// segment before it, leaving the timestamp (and the whole modern form)
-// intact, so the anchor still identifies one group unambiguously.
-export function groupAnchor(jid: string): string {
-  const at = jid.indexOf("@");
-  const user = at < 0 ? jid : jid.slice(0, at);
-  const dash = user.indexOf("-");
-  if (dash < 0) return jid;
-  return maskNumber(user.slice(0, dash)) + user.slice(dash) + jid.slice(at);
-}
-
-// AskUserQuestion - the checkbox UI behind the in-session `review`/`manage`
-// screens - returns a selection BY ITS LABEL, so two candidates that render
-// identically cannot be told apart once ticked: the wrong one gets revoked,
-// or both do. Three real ways they collide: two contacts saved under the
-// same name, two groups sharing a name and member count, and the @lid and
-// phone forms of ONE contact in allowFrom (both resolve to the same key, so
-// dmLabel returns the same string by construction - see listConfiguredDms).
+// The picker screen (scripts/picker.ts) selects by jid, not by label, but a
+// human still has to be able to tell two rows apart on screen to know which
+// one they are ticking or unticking - two candidates that render identically
+// read as one option to look at, even though the tick underneath is correct.
+// Three real ways they collide: two contacts saved under the same name, two
+// groups sharing a name and member count, and the @lid and phone forms of ONE
+// contact in allowFrom (both resolve to the same key, so dmLabel returns the
+// same string by construction - see listConfiguredDms).
 // Appends the masked JID, so a human can see which row is which, plus an
 // ordinal, so the label is unique even when two JIDs share their last four
 // digits. Never the raw JID - that is the whole point of mask.ts. Applied
@@ -115,11 +101,14 @@ function disambiguate(candidates: Candidate[]): Candidate[] {
 // applyChatActivity there). Undefined/never-seen activity sorts last,
 // tie-broken alphabetically so the order is still deterministic rather
 // than depending on object key iteration order.
+//
+// `limit` defaults to uncapped - the wizard ranks the whole pool so it can
+// say how many did not fit, then slices for the screen.
 export function rankGroups(
   meta: Record<string, GroupMeta>,
   alreadyConfigured: ReadonlySet<string>,
   includeArchived: boolean,
-  limit: number,
+  limit: number = Infinity,
 ): Candidate[] {
   const ranked = Object.entries(meta)
     .filter(([jid]) => !alreadyConfigured.has(jid))
@@ -145,8 +134,8 @@ export function rankGroups(
 
 // Every group already in access.json's groups map, not just the top N new
 // ones - this is "what's already on" for a revoke screen, so no recency
-// sort, no archive filter and no limit (see listConfiguredGroups/manage in
-// skills/access/SKILL.md). A configured group with no meta.json entry still
+// sort, no archive filter and no limit (the picker's pre-ticked column). A
+// configured group with no meta.json entry still
 // has to appear (falls back to the raw JID) or it becomes unrevokable.
 export function listConfiguredGroups(
   groups: Readonly<Record<string, unknown>>,
@@ -167,10 +156,22 @@ export function listConfiguredGroups(
   return disambiguate(listed);
 }
 
-// A candidate is only ever a chat with real activity (dmActivity is only
-// ever written for a chat that's actually exchanged a message) - never the
-// whole phone contact list, which is exactly what keeps this from ever
-// asking about hundreds of never-messaged contacts.
+// The pool is DM activity PLUS the saved names WhatsApp's contact sync
+// delivered (contacts.json `.name` only). That is the owner's own address
+// book, synced by the server, never sent anywhere - so a contact who has
+// never DM'd this number is still findable by name (fork #17: `Search:
+// Thilian` -> `(none)`).
+//
+// A `.notify`-only entry is still OUT of the pool. `.notify` is
+// self-reported by anyone who has ever messaged the account, so admitting
+// it would let a stranger put themselves on a grant screen just by
+// choosing a display name. Saved names cannot be set by the contact.
+//
+// Order: activity first (recency, the signal WhatsApp's own chat list
+// uses), then the address book alphabetically - a never-messaged contact
+// is a search target, not a ranked suggestion.
+//
+// LID collapsing: one person under @lid and phone forms is one row.
 //
 // Deliberately does NOT use contacts.ts's contactName() (its name-or-notify
 // fallback is fine for passive display elsewhere, see mask.ts's own
@@ -196,28 +197,83 @@ function dmLabel(contacts: ContactsMap, key: string): string {
   return masked;
 }
 
+// The key whose contacts.json entry carries this person's saved name. A name
+// can sit under the raw @lid key (cached before the mapping was known) or
+// under the resolved phone key (migrated later, or saved from the address
+// book); pick whichever actually has a name, not whichever merely exists,
+// otherwise a notify-only @lid entry shadows the saved name next to it.
+// Falls back to the resolved key so the masked number is the real identity.
+function nameKey(
+  contacts: ContactsMap,
+  lidMap: Record<string, string>,
+  jid: string,
+): string {
+  const key = contactKeyFor(lidMap, jid);
+  const named = (k: string) => {
+    const n = contacts[k]?.name;
+    return Boolean(n && !looksLikeNumber(n));
+  };
+  return named(jid) ? jid : key;
+}
+
 // See dmLabel above for why a `.notify`-only label is marked unverified
 // rather than shown like a saved name.
+//
+// `limit` defaults to uncapped - the wizard ranks the whole pool so it can
+// say how many did not fit, then slices for the screen.
 export function rankDms(
   activity: Record<string, number>,
   contacts: ContactsMap,
   allowFrom: readonly string[],
   lidMap: Record<string, string>,
-  limit: number,
+  limit: number = Infinity,
 ): Candidate[] {
   const alreadyAllowed = new Set(
     allowFrom.map((jid) => contactKeyFor(lidMap, jid)),
   );
-  const ranked = Object.entries(activity)
-    .filter(([jid]) => !alreadyAllowed.has(jid))
+  const seen = new Set<string>();
+  // Owner's rule (2026-08-27): a number with no saved name is not worth a
+  // row - if it was not worth saving on the phone, it is not worth offering
+  // here. Only candidates are filtered; an already-allowed unnamed entry is
+  // still listed by listConfiguredDms so it can be revoked.
+  const hasSavedName = (jid: string) => {
+    const n = contacts[nameKey(contacts, lidMap, jid)]?.name;
+    return Boolean(n && !looksLikeNumber(n));
+  };
+  const activityRows = Object.entries(activity)
+    .filter(([jid]) => !alreadyAllowed.has(contactKeyFor(lidMap, jid)))
+    .filter(([jid]) => hasSavedName(jid))
     .sort(([aj, a], [bj, b]) => b - a || aj.localeCompare(bj))
-    .slice(0, limit)
-    .map(([jid]) => ({
-      jid,
-      label: dmLabel(contacts, jid),
-      description: maskNumber(jid),
-    }));
-  return disambiguate(ranked);
+    .map(([jid]) => {
+      // Same key the address-book loop de-dupes on, so one person cached
+      // under @lid activity and a phone-keyed saved name is one row.
+      const key = contactKeyFor(lidMap, jid);
+      seen.add(key);
+      return {
+        jid,
+        // The saved name may sit under the phone key while the activity is
+        // lid-keyed: look it up where it lives, or the row shows a masked
+        // number and "Search: <name>" finds nothing.
+        label: dmLabel(contacts, nameKey(contacts, lidMap, jid)),
+        description: maskNumber(jid),
+      };
+    });
+  const addressBookRows: Candidate[] = [];
+  for (const [raw, entry] of Object.entries(contacts)) {
+    if (!hasSavedName(raw)) continue;
+    const resolved = contactKeyFor(lidMap, raw);
+    if (alreadyAllowed.has(resolved) || seen.has(resolved)) continue;
+    seen.add(resolved);
+    addressBookRows.push({
+      jid: resolved,
+      label: dmLabel(contacts, nameKey(contacts, lidMap, raw)),
+      description: maskNumber(resolved),
+    });
+  }
+  addressBookRows.sort(
+    (a, b) => a.label.localeCompare(b.label) || a.jid.localeCompare(b.jid),
+  );
+  return disambiguate([...activityRows, ...addressBookRows].slice(0, limit));
 }
 
 // Every DM contact already in allowFrom, not just the top N new ones - the
@@ -242,7 +298,7 @@ export function listConfiguredDms(
       // is what tells the @lid row apart from the phone one.
       return {
         jid,
-        label: dmLabel(contacts, key),
+        label: dmLabel(contacts, nameKey(contacts, lidMap, jid)),
         description: maskNumber(key),
       };
     })
@@ -250,4 +306,40 @@ export function listConfiguredDms(
       (a, b) => a.label.localeCompare(b.label) || a.jid.localeCompare(b.jid),
     );
   return disambiguate(listed);
+}
+
+// The +/- delta the picker shows before it writes anything, and what `review`
+// and `undo` report afterwards. Also the body of `undo --dry-run`. Pure: takes two access.json snapshots, returns the
+// JIDs that differ. A group whose `roster` flag changed is neither added nor
+// removed and is deliberately NOT reported - review only offers roster for
+// groups it is granting in the same run, so a roster-only change cannot arise
+// here; add a `changed` bucket the day it can.
+export type AccessSnapshot = {
+  allowFrom?: readonly string[];
+  groups?: Readonly<Record<string, unknown>>;
+};
+export type AccessDiff = {
+  added: { groups: string[]; dms: string[] };
+  removed: { groups: string[]; dms: string[] };
+};
+export function diffAccess(
+  prev: AccessSnapshot,
+  next: AccessSnapshot,
+): AccessDiff {
+  const prevGroups = new Set(Object.keys(prev.groups ?? {}));
+  const nextGroups = new Set(Object.keys(next.groups ?? {}));
+  const prevDms = new Set(prev.allowFrom ?? []);
+  const nextDms = new Set(next.allowFrom ?? []);
+  const minus = (a: Set<string>, b: Set<string>) =>
+    [...a].filter((x) => !b.has(x)).sort();
+  return {
+    added: {
+      groups: minus(nextGroups, prevGroups),
+      dms: minus(nextDms, prevDms),
+    },
+    removed: {
+      groups: minus(prevGroups, nextGroups),
+      dms: minus(prevDms, nextDms),
+    },
+  };
 }

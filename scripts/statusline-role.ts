@@ -23,6 +23,16 @@
  *    CLI's descendants (matched on the plugin dir name — "server.ts" alone
  *    hits other plugins' servers too), then server.ts under that wrapper.
  *
+ * If neither finds anything, one last check: is one of our own ancestors a
+ * Claude Code CLI launched with this channel on its command line? Then a
+ * server is on its way and we print a dim "WA:…" instead of nothing. Claude
+ * Code does not re-render the statusline while the session is idle (unless
+ * the statusLine has a `refreshInterval`, which USAGE.md recommends), so a
+ * blank first paint stays blank until the user types - 16-22 s of "is this
+ * thing on?". The marker means requested, not confirmed; a real role always
+ * wins over it, and the server writing "starting" before it knows its role
+ * renders identically.
+ *
  * Never throws, never writes: prints nothing and exits 0 on any miss, same
  * contract as the tool it's meant to sit quietly next to.
  */
@@ -42,11 +52,22 @@ const WRAPPER_MATCH =
   process.env.WA_STATUSLINE_WRAPPER_MATCH ?? "whatsapp-channel";
 const SERVER_MATCH = process.env.WA_STATUSLINE_MATCH ?? "server.ts";
 const PARENT_PID = Number(process.env.WA_STATUSLINE_PARENT_PID ?? process.ppid);
+// The Claude Code CLI is launched with the channel it was asked for on its
+// command line: `claude.exe --channels=plugin:whatsapp-channel@whatsapp-claude-plugin`
+// (confirmed live 2026-08-26; the shell above it carries the same string).
+// Match the CHANNEL SPEC, not "whatsapp-channel" alone: the plugin's own
+// directory name is in this script's command line too - the documented
+// statusLine wiring is `... && bun <plugin-dir>/scripts/statusline-role.ts` -
+// so the bare name would call every session pending, including sessions that
+// never asked for WhatsApp. Overridable for tests only, same as the two above.
+const CHANNEL_MATCH =
+  process.env.WA_STATUSLINE_CHANNEL_MATCH ?? "plugin:whatsapp-channel";
 
 const COLOR: Record<string, string> = {
   primary: "\x1b[32m", // green
   secondary: "\x1b[36m", // cyan
   reconnecting: "\x1b[33m", // yellow
+  starting: "\x1b[2m", // dim - asked for, not confirmed yet
 };
 const RESET = "\x1b[0m";
 
@@ -261,9 +282,31 @@ export function findServerPidForTerminal(
   return null;
 }
 
+// Nothing readable exists yet, but did this terminal even ask for WhatsApp?
+// The CLI carries the channel it was launched with on its command line, so if
+// one of OUR OWN ancestors is such a CLI, a server is on its way and the right
+// thing to print is "requested, not confirmed" rather than nothing.
+//
+// Ancestors only, never a scan of the whole table, for the same reason as
+// everything else in this file: a sibling terminal's CLI would otherwise make
+// this one claim a channel it never asked for.
+export function pendingRoleFromAncestors(
+  rows: ProcRow[],
+  ancestors: number[],
+): string | null {
+  const mine = new Set(ancestors);
+  return rows.some((r) => mine.has(r.pid) && r.command.includes(CHANNEL_MATCH))
+    ? "starting"
+    : null;
+}
+
+// "starting" has no role to name yet - it means the server is coming up, or
+// this terminal asked for the channel and nothing has answered. One ellipsis
+// glyph, dim, so the first paint is never blank and never claims a role.
 export function formatSegment(role: string): string {
   const color = COLOR[role];
-  return color ? `${color}WA:${role}${RESET}` : "";
+  const label = role === "starting" ? "…" : role;
+  return color ? `${color}WA:${label}${RESET}` : "";
 }
 
 // Every role file in the state dir whose server is still running. Missing
@@ -331,13 +374,16 @@ function main(): void {
       WRAPPER_MATCH,
       SERVER_MATCH,
     );
-    if (pid === null) return;
-    const roleFile = join(STATE_DIR, `.role-${pid}`);
-    if (!existsSync(roleFile)) return;
+    const roleFile = pid === null ? null : join(STATE_DIR, `.role-${pid}`);
     // Line 1 only: a stamped file has the owner pid on line 2.
-    const segment = formatSegment(
-      readFileSync(roleFile, "utf8").split("\n")[0]!.trim(),
-    );
+    const tree =
+      roleFile !== null && existsSync(roleFile)
+        ? readFileSync(roleFile, "utf8").split("\n")[0]!.trim()
+        : "";
+    // Last: neither path found a role file for this terminal, so fall back to
+    // "this terminal asked for the channel" - the marker, not a role.
+    const role = tree || pendingRoleFromAncestors(rows, ancestors) || "";
+    const segment = formatSegment(role);
     if (segment) process.stdout.write(segment);
   } catch {
     // A broken statusline segment is worse than a missing one.

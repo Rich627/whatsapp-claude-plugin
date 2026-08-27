@@ -81,13 +81,17 @@ Baileys 7 uses LID (Local Identifier) format alongside phone JIDs. The same pers
 
 ## Names and privacy
 
-**Off by default.** Set `WHATSAPP_CACHE_CONTACTS=1` to have the server cache saved contact names from WhatsApp's own contact sync (the same list your phone already has) at `~/.whatsapp-channel/contacts.json` — never the `contacts.md` some people keep for their own DM habits, which this plugin never reads. Only a contact's **name** is cached this way, and only a name — self-reported "About"/display text (`.notify`) is kept separately and never trusted for anything security-relevant, since anyone messaging the account can set that to whatever they want, including someone else's real name or number.
+**On by default.** The server caches saved contact names from WhatsApp's own contact sync (the same list your phone already has) at `~/.whatsapp-channel/contacts.json` — never the `contacts.md` some people keep for their own DM habits, which this plugin never reads. Set `WHATSAPP_CACHE_CONTACTS=0` to turn that off. Only a contact's **name** is cached this way, and only a name — self-reported "About"/display text (`.notify`) is kept separately and never trusted for anything security-relevant, since anyone messaging the account can set that to whatever they want, including someone else's real name or number.
 
-Without it, name resolution and masking still work for the lifetime of the running server (built fresh each run from WhatsApp's own contact sync), it just isn't written to disk — so a restart starts blank again. Turn it on for name/mention lookups to survive a restart. Either way, `WHATSAPP_ACCESS_MODE=static` disables this cache too, on top of `WHATSAPP_CACHE_CONTACTS` — a static deployment can't be made to write local state by one env var but not the other. The recency cache the wizard ranks by (`dm-activity.json`) follows the same on/off switch, since it's the same kind of per-sender data — including for a sender the access gate rejected, which is exactly what makes this opt-in rather than always-on.
+With it off, name resolution and masking still work for the lifetime of the running server (built fresh each run from WhatsApp's own contact sync), it just isn't written to disk — so a restart starts blank again and the wizard's contact screen has nothing to rank. Either way, `WHATSAPP_ACCESS_MODE=static` disables this cache regardless of `WHATSAPP_CACHE_CONTACTS` — a static deployment can't be made to write local state by an env var. The recency cache the wizard ranks by (`dm-activity.json`) follows the same switch, since it's the same kind of per-sender data — including for a sender the access gate rejected, which is exactly what the opt-out is there for.
+
+Saved names sync on connect only when the cache holds no saved name at all (WhatsApp otherwise sends them just once, at linking); the server asks for the contact list again, logs a count (`address book synced: 3 saved name(s)` — never a name or number), and stops asking once one is cached. It never asks more than once every five minutes, and never runs with `WHATSAPP_CACHE_CONTACTS=0` or in static mode. After it, `contacts.json` holds the names of everyone saved on your phone, on your disk only. Chat-list order cannot be re-fetched, so the wizard ranks by the DM activity it has seen since.
 
 **Names may reach the AI model; raw phone numbers should not.** When you ask Claude to reply and mention someone, it can use a saved name (`"Akash"`) instead of a number — that name is what appears in Claude's context. Anywhere a number would otherwise be shown to a human (an ambiguous-name error, `group_roster` for someone with no saved name) it's masked to the last 4 digits (`•••••5122`) before it's built into any string, not filtered afterward.
 
 This is a **best-effort mitigation, not a hard guarantee**: it depends on a saved contact actually being a name and not, say, a phone number typed into the name field, and on `.notify` not being trusted in place of it (checked explicitly for group rosters — see below). If you'd rather no name data ever reaches an AI model at all, don't grant any group `roster` access and use raw JIDs/numbers in `mentions` instead of names.
+
+The in-session `review` (see the wizard section below) never lets the candidate lists enter the session — only the `+`/`-` list comes back, by saved name or masked number.
 
 ## Group roster & @all mentions
 
@@ -100,26 +104,54 @@ Both fail with a clear error if the group's `roster` flag isn't granted.
 
 ## Guided bulk setup (wizard)
 
-`bun scripts/access.ts wizard` shows a checkbox screen of your **5 most recently active groups** and a second one for your **10 most recently active DM contacts** — the same recency signal the WhatsApp app itself sorts its own chat list by — so review stays to one screen each instead of scaling with how many groups or contacts you actually have. Navigate with the arrow keys, toggle with space, submit with enter.
+`bun scripts/access.ts wizard` draws **one screen**: a search line, a `Picked:` chip
+line, then **CONTACTS** on the left and **GROUPS** on the right - everything Claude
+can already reach comes pre-ticked, so the screen shows you the current state instead
+of an empty list. Untick to take access away, tick to grant, in the same pass.
 
-- **Groups**: pick which ones Claude can reply in, then (only for the ones you just picked) a second checkbox for which also get roster access.
-- **Contacts**: pick which ones can message Claude — added straight to the allowlist, no second question.
-- Archived groups are skipped by default (pass `--include-archived` to include them). Anything already configured, or outside the top 5/10, isn't shown here — add it individually later with `group add`/`allow`, or just ask Claude (it already knows the name from context).
-- Ctrl-C cancels cleanly at any point; nothing is written until every question on screen has been answered.
+Keys: type to filter both columns, `↑↓` move, `Tab` (or `←→`) switches column,
+`Space` toggles, `Enter` in the search box ticks the highlighted row and clears the
+search, `Enter` on an empty search box submits, `Backspace` on an empty search box
+removes the last chip, `r` flags a group you are granting for roster access, `Ctrl+Z`
+undoes one step, `Ctrl+R` restores the access list from before the last run, `Esc`
+clears the search or quits, `Ctrl+C` quits. Mouse is best effort: click a row to
+toggle it, click a chip's `×` to remove it.
+
+A chip with `-` and struck through is a grant you are taking away; a chip with `+` is
+a new grant.
+
+**It needs a real terminal.** Run it through a pipe or from inside an AI session and
+it says so and exits, rather than hanging.
+
+`/whatsapp-channel:access review` opens this same screen in a new terminal window, waits for you, and reports back only what changed; `bun scripts/access.ts undo` (or `wizard --undo`) is still the one step back.
+
+- Roster is still asked only for groups you are granting in this run - flag one with
+  `r` while it is ticked. An already-granted group keeps whatever roster flag it has
+  (change it with `group add --roster` / `--no-roster`).
+- Archived groups are still skipped by default and the wizard says how many it hid —
+  pass `--include-archived` to include them.
+- Nothing is written until you have seen the full `+`/`-` list and answered **Apply these changes?**. Answer `n`, or press Ctrl-C at any point, and nothing is written at all.
+- After a write, `bun scripts/access.ts wizard --undo` (or plain `undo`) puts the access list back to just before that run - run it with `--dry-run` first. Cached names are not restored, only the access list.
 - A group the wizard adds gets `requireMention: true` (only reply when addressed) — a more cautious default than `group add`'s own CLI default of `false` (reply to everything), deliberately: the wizard is the guided path for a less technical setup, the CLI is for someone already comfortable with explicit flags. Change it after the fact with `group add --mention` or `--no-mention`.
+- Narrow terminal (under 70 columns)? The two columns stack instead of sitting side
+  by side. `NO_COLOR` is respected.
 
 ### Taking access back (`wizard --revoke`)
 
-`bun scripts/access.ts wizard --revoke` is the same screen in reverse: it lists **everything currently configured** — every group in `access.json`'s `groups`, every contact in `allowFrom` — and you tick what should lose access. Unlike the grant screen it is never capped or ranked: a revoke list that left entries off could leave them permanently unrevokable.
+`--revoke` is now an **alias for the same screen** - there is only one wizard, and
+revoking is unticking a row that came pre-ticked. The old command keeps working so a
+habit or an old note does not break.
 
-- **Leaving everything unticked removes nothing.** An empty selection is never read as "remove all".
-- Revoking a group keeps its `config.md` and `memory.md`, same as `group rm`, in case you add it back.
-- Revoking a contact also forgets their cached name and recency — unless another allowlist entry still resolves to the same person (someone allowlisted under both their `@lid` and phone form), in which case the cache is kept, because the surviving grant still needs it.
-- Ctrl-C cancels cleanly, and nothing is written until every question on screen has been answered.
+- **An untouched screen changes nothing.** Submitting without touching a tick is
+  read as "leave everything as it is" - it can neither remove nor grant.
+- Revoking a group keeps its `config.md` and `memory.md`, same as `group rm`, in case
+  you add it back.
+- Revoking a contact **keeps their cached name and recency** - only the allowlist
+  entry goes. `remove <jid>` still forgets a cached name (unchanged), and
+  `forget <jid>` still clears one deliberately - see "Removing someone already
+  granted access" below.
 
-It reads the same two functions the in-session `/whatsapp-channel:access manage` screen reads, so the terminal and the chat path cannot disagree about what is configured or what a revoke cleans up.
-
-Group/contact names and recency come from caches (`~/.whatsapp-channel/groups-meta.json`, `dm-activity.json`, `contacts.json`) that only the running server writes — automatically, as WhatsApp reports chat activity, no manual step needed once the account has connected at least once. If it's never connected yet, the wizard has nothing to show; pair it first. `groups-meta.json` is always written; `dm-activity.json` and `contacts.json` follow `WHATSAPP_CACHE_CONTACTS` (see "Names and privacy" above) — with it off (the default), the DM screen has nothing to rank until you turn it on.
+Group/contact names and recency come from caches (`~/.whatsapp-channel/groups-meta.json`, `dm-activity.json`, `contacts.json`) that only the running server writes — automatically, as WhatsApp reports chat activity, no manual step needed once the account has connected at least once. If it's never connected yet, the wizard has nothing to show; pair it first. `groups-meta.json` is always written; `dm-activity.json` and `contacts.json` follow `WHATSAPP_CACHE_CONTACTS`, which is on unless you set it to `0` (see "Names and privacy" above) — with it off, the CONTACTS column has nothing to rank. The CONTACTS column lists recent DM activity first, then every contact whose _saved_ name arrived from the phone's contact sync — so someone you've never messaged is still findable by name. A number with no saved name is never offered: if it was not worth saving on the phone it is not worth a row, and a self-reported display name never earns one on its own. The only unnamed rows are numbers that are _already_ allowed — they sit at the bottom of the column, masked, so they can still be unticked. The wizard says so on screen instead of silently leaving the column empty: one line when no DM activity is on record at all, another when there is a record but nothing new in it. Its search line runs over the whole cached pool, so every contact on record is reachable without paging.
 
 It's a terminal command, deliberately not a Claude Code skill: running it yourself, outside any chat, is what makes this true —
 
@@ -136,6 +168,8 @@ The `/whatsapp-channel:access` skill will point you at it if you ask for guided 
 `remove` requires the JID to actually be on the allowlist, and refuses otherwise — but with caching on, a name/activity entry gets cached the moment anyone DMs once, allowlisted or not (contact and chat sync events fire before the access gate runs). `bun scripts/access.ts forget <jid>` purges the cached name and activity entry directly, with no allowlist requirement — the general-purpose way to clear someone's cached identity regardless of whether they were ever approved.
 
 ## Mention detection
+
+A message that does **not** trigger the server in such a group is still kept, text only, in `~/.whatsapp-channel/messages.jsonl` with `routed: false`, so `catch_up` can show you the room; it is never routed, notified or counted as unreplied (retention rules: [USAGE.md, "Your own replies"](./USAGE.md#your-own-replies)). Nothing is kept for a group that is not allowlisted or for a sender the group's own `allowFrom` rejects.
 
 In groups with `requireMention: true`, any of the following triggers the server:
 

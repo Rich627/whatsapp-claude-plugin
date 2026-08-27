@@ -55,13 +55,23 @@ import {
   normalizeMentionJids,
   mentionsForChunk,
 } from "./lib/mentions";
+import { logContainsId } from "./lib/message-log-probe";
+import {
+  awaitingReply,
+  keepLogLine,
+  RECENT_LIMIT,
+  recentBothSides,
+  renderLogEntry,
+} from "./lib/message-view";
+import { formatSentLine, parseSentLog } from "./lib/sent-log";
 import {
   contactName,
+  hasSavedName,
   mergeContact,
   migrateContactKey,
   type ContactsMap,
 } from "./scripts/contacts";
-import { looksLikeNumber, maskNumber } from "./scripts/mask";
+import { looksLikeNumber, maskJid, maskNumber } from "./scripts/mask";
 import { wizardCmd } from "./scripts/wizard-cmd";
 import {
   createServer,
@@ -93,6 +103,8 @@ const CONTACTS_FILE = join(STATE_DIR, "contacts.json");
 const GROUPS_META_FILE = join(STATE_DIR, "groups-meta.json");
 const DM_ACTIVITY_FILE = join(STATE_DIR, "dm-activity.json");
 const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
+// Every message id THIS server sent (see trackSent). Never an inbound id.
+const SENT_LOG = join(STATE_DIR, "sent.jsonl");
 const TASKS_FILE = join(STATE_DIR, "tasks.md");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
 const IPC_TOKEN_FILE = join(STATE_DIR, ".ipc-token");
@@ -128,17 +140,20 @@ try {
 
 const PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER;
 const STATIC = process.env.WHATSAPP_ACCESS_MODE === "static";
-// Off by default: contacts.json/dm-activity.json cache the display name and
-// last-activity time of EVERYONE the account has ever seen, including a
-// sender the access gate rejected (contacts.upsert/chats.upsert fire from
-// Baileys before any allowlist check runs) - so unlike access.json (which
-// only ever holds jids the owner explicitly allowed), this is plaintext
-// persistence the owner may not expect for someone they never approved.
+// On by default: contacts.json/dm-activity.json cache the display name and
+// last-activity time of everyone the account has seen, so saved names,
+// mention lookups and the wizard's contact list survive a restart instead
+// of starting blank every run. Opt out with WHATSAPP_CACHE_CONTACTS=0 -
+// the reason someone might is that the cache also holds a sender the
+// access gate rejected (contacts.upsert/chats.upsert fire from Baileys
+// before any allowlist check runs), so unlike access.json (which only ever
+// holds jids the owner explicitly allowed) this is plaintext persistence
+// for someone they never approved.
 // STATIC mode already disables all local config writes (see saveAccess) -
-// this cache follows the same rule, never just WHATSAPP_CACHE_CONTACTS
-// alone, so a static deployment can't be made to write local state by
-// setting one env var but not the other.
-const CACHE_CONTACTS = !STATIC && process.env.WHATSAPP_CACHE_CONTACTS === "1";
+// this cache follows the same rule and STATIC is checked first, so a
+// static deployment still never writes these two files whatever
+// WHATSAPP_CACHE_CONTACTS is set to.
+const CACHE_CONTACTS = !STATIC && process.env.WHATSAPP_CACHE_CONTACTS !== "0";
 // The client process that spawned us, when it identifies itself. Claude Code
 // sets CLAUDE_PID; other MCP clients set nothing, which reads as "unknown"
 // and is reported as such rather than guessed at.
@@ -368,6 +383,14 @@ function releaseSingletonLock(): void {
   } catch {}
 }
 
+// The role file exists this early on purpose. acquireSingletonLock() below is
+// a synchronous process probe (a PowerShell CIM spawn on Windows, 2-6 s), and
+// the real role cannot be known until it returns - but the statusline is
+// rendered long before that and Claude Code will not redraw it while the
+// session is idle. "starting" is not a role, it is "a server is coming up
+// here"; the first settled role overwrites it a moment later.
+writeRoleFile("starting");
+
 // Null when we hold the connection. Set when another server has it: we stay
 // up in conflict mode, serve one tool that says so, and never touch Baileys —
 // the invariant is one connection, not one process. Exiting instead would be
@@ -404,7 +427,7 @@ diagFileEnabled = isPrimary;
 // having to remember to opt out individually.
 let pastInitialRole = false;
 function writeRoleFile(
-  role: "primary" | "secondary" | "reconnecting",
+  role: "primary" | "secondary" | "reconnecting" | "starting",
   everConnected = false,
 ): void {
   try {
@@ -417,6 +440,14 @@ function writeRoleFile(
     // reader just checks whether the owner is one of its own ancestors.
     writeFileSync(ROLE_FILE, CLIENT_ID ? `${role}\n${CLIENT_ID}\n` : role);
   } catch {}
+  // Provisional, not a settled role: it must not consume the "first role is
+  // never announced" allowance, or the real primary/secondary that follows
+  // would fire a role-change notification on a session that never changed
+  // role. This early return is also what keeps the provisional
+  // writeRoleFile("starting") call above — which runs before `pastInitialRole`
+  // is evaluated — from ever reading it: the flag's declaration position
+  // doesn't matter, this guard is what's load-bearing.
+  if (role === "starting") return;
   if (pastInitialRole) notifyRoleChange(role, everConnected);
   pastInitialRole = true;
 }
@@ -971,6 +1002,10 @@ async function becomePrimary(): Promise<void> {
   // stopped: there is no primary → secondary transition to stop them for.
   if (!STATIC) setInterval(checkApprovals, 5000).unref();
   setInterval(pruneMessageLog, 60 * 60 * 1000).unref();
+  // A promoted secondary loaded sent.jsonl at ITS boot; the primary it is
+  // replacing kept appending since. Re-read (pruneMessageLog -> pruneSentLog)
+  // before the socket opens, or its replayed sends read as hand replies.
+  pruneMessageLog();
   await startIpcListener();
   await connectWhatsApp();
 }
@@ -1228,7 +1263,11 @@ async function ensureLidResolved(jid: string): Promise<void> {
     if (pn) recordLidMapping(normalized, pn);
   } catch (err) {
     logDiag(
-      `${LOG_PREFIX}: active LID resolution failed for ${normalized}: ${err}\n`,
+      // Masked: this runs from handleMessage BEFORE the gate, so an unmasked
+      // jid here is a refused stranger's identifier on disk - the leak the
+      // hand-reply path avoids this function entirely to prevent (see the
+      // cached-lid-map-only comment in logOwnerHandReply).
+      `${LOG_PREFIX}: active LID resolution failed for ${maskJid(normalized)}: ${err}\n`,
     );
   }
 }
@@ -1256,11 +1295,11 @@ const groupNameCache: Record<string, string> = {};
 // ─── Group metadata cache (persisted) ──────────────────────────────────
 // scripts/access.ts's wizard runs as a standalone terminal command with no
 // WhatsApp connection of its own - only this server process has one. This
-// on-disk snapshot (name, member count, archived flag) is how the wizard
-// sees real group names without needing a live socket. Written whenever
-// list_groups runs (name/count) and whenever an archived state changes
-// (chats.upsert/chats.update, see connectWhatsApp) - never by the wizard
-// itself, which only reads it.
+// on-disk snapshot (name, member count, archived flag, last activity) is how
+// the wizard sees real group names without needing a live socket - nothing
+// per-person. Written whenever list_groups runs (name/count) and whenever an
+// archived state changes (chats.upsert/chats.update, see connectWhatsApp) -
+// never by the wizard itself, which only reads it.
 type GroupMeta = {
   name: string;
   memberCount: number;
@@ -1455,6 +1494,43 @@ async function refreshGroupsMeta(
   return groups;
 }
 
+// Saved names arrive via contactAction -> contacts.upsert (baileys
+// lib/Utils/chat-utils.js:667) only during the pairing-time app-state sync
+// (lib/Socket/chats.js:824-834). A resync re-sends in full only for a
+// collection at version 0 (chats.js:376-384), so clear it first - Baileys'
+// own recovery move (chats.js:437) via its authState.keys API. Only
+// critical_unblock_low carries contactAction (chat-utils.js:440-449). Guard
+// is the cache on disk plus the reconnect-storm cooldown, never a flag.
+let addressBookSyncAttemptedAt = 0;
+
+async function syncSavedNamesOnce(
+  activeSock: NonNullable<typeof sock>,
+): Promise<void> {
+  if (!CACHE_CONTACTS) return;
+  reloadContactsMap();
+  if (hasSavedName(contactsMap)) return;
+  if (Date.now() - addressBookSyncAttemptedAt < GROUPS_META_CONNECT_COOLDOWN_MS)
+    return;
+  addressBookSyncAttemptedAt = Date.now();
+  // Typed on the rc.9 socket (Socket/index.d.ts:178); checked at runtime
+  // anyway so a Baileys that drops it degrades to "no names" rather than
+  // throwing inside the connection handler.
+  if (typeof activeSock.resyncAppState !== "function") return;
+  await activeSock.authState.keys.set({
+    "app-state-sync-version": { critical_unblock_low: null },
+  });
+  await activeSock.resyncAppState(["critical_unblock_low"], true);
+  // The contacts.upsert events flush AFTER the promise resolves
+  // (Utils/event-buffer.js:135-141; a 1,200-entry snapshot took 13 s), so
+  // count a full minute later. ponytail: one delayed log line, never the
+  // cache itself - the upsert listener already merged the names.
+  setTimeout(() => {
+    reloadContactsMap();
+    const saved = Object.values(contactsMap).filter((c) => c.name).length;
+    logDiag(`${LOG_PREFIX}: address book synced: ${saved} saved name(s)\n`);
+  }, 60_000);
+}
+
 async function resolveGroupName(groupJid: string): Promise<string> {
   if (groupNameCache[groupJid]) return groupNameCache[groupJid];
   try {
@@ -1536,7 +1612,7 @@ function pruneExpired(a: Access): boolean {
 
 type GateResult =
   | { action: "deliver"; access: Access }
-  | { action: "drop" }
+  | { action: "drop"; reason?: "no-mention" }
   | { action: "pair"; code: string; isResend: boolean };
 
 function gate(
@@ -1544,6 +1620,7 @@ function gate(
   senderJid: string,
   text: string,
   mentionedJids: string[],
+  mint = true,
 ): GateResult {
   const access = loadAccess();
   const pruned = pruneExpired(access);
@@ -1559,7 +1636,10 @@ function gate(
       return { action: "deliver", access };
     if (access.dmPolicy === "allowlist") return { action: "drop" };
 
-    // pairing mode
+    // pairing mode. A backlog message (offline replay) never gets a pairing
+    // reply, so it must not mint or refresh a code either: that would fill the
+    // 3 pending slots and bump `replies` for a code nobody was ever shown.
+    if (!mint) return { action: "drop" };
     for (const [code, p] of Object.entries(access.pending)) {
       if (
         p.senderId === senderJid ||
@@ -1598,7 +1678,9 @@ function gate(
     requireMention &&
     !isMentioned(text, mentionedJids, access.mentionPatterns)
   ) {
-    return { action: "drop" };
+    // The one drop the log keeps (see handleMessage): the group is
+    // configured and the sender is allowed, the message just was not for us.
+    return { action: "drop", reason: "no-mention" };
   }
   return { action: "deliver", access };
 }
@@ -1645,7 +1727,7 @@ function checkApprovals(): void {
 
   for (const senderId of files) {
     const file = join(APPROVED_DIR, senderId);
-    void sock.sendMessage(senderId, { text: "Paired! Say hi to Claude." }).then(
+    void sendTracked(senderId, { text: "Paired! Say hi to Claude." }).then(
       () => rmSync(file, { force: true }),
       (err) => {
         logDiag(`${LOG_PREFIX}: failed to send approval confirm: ${err}\n`);
@@ -1779,7 +1861,7 @@ setInterval(() => {
     job.lastFired = minuteKey;
 
     logDiag(
-      `${LOG_PREFIX}: cron firing for ${job.groupJid}: ${job.prompt.slice(0, 50)}...\n`,
+      `${LOG_PREFIX}: cron firing for ${maskJid(job.groupJid)}: ${job.prompt.slice(0, 50)}...\n`,
     );
     mcp
       .notification({
@@ -1883,23 +1965,65 @@ function chunk(
 
 // ─── Echo detection ────────────────────────────────────────────────────
 
-const sentMessages = new Map<string, number>();
+// 24h: an own send only needs to be recognisable for as long as WhatsApp
+// might replay it, which is well inside a day.
+const SENT_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Boot: everything this server sent in the last 24h, across restarts.
+// `let` because pruneSentLog rebuilds it from what survives the rewrite.
+let durableSentIds = (() => {
+  try {
+    return parseSentLog(
+      existsSync(SENT_LOG) ? readFileSync(SENT_LOG, "utf8") : "",
+      Date.now() - SENT_TTL_MS,
+    ).ids;
+  } catch {
+    return new Set<string>();
+  }
+})();
 
 function trackSent(key: WAMessageKey): void {
-  if (key.id) sentMessages.set(key.id, Date.now());
-}
-
-function isEcho(key: WAMessageKey): boolean {
-  if (key.fromMe) return true;
-  return key.id ? sentMessages.has(key.id) : false;
-}
-
-setInterval(() => {
-  const cutoff = Date.now() - 5 * 60 * 1000;
-  for (const [id, ts] of sentMessages) {
-    if (ts < cutoff) sentMessages.delete(id);
+  if (!key.id) return;
+  const now = Date.now();
+  durableSentIds.add(key.id);
+  // Never throws into a send: a failure here degrades to today's behaviour
+  // (in-memory only), it must not turn a delivered message into an error.
+  try {
+    appendFileSync(SENT_LOG, formatSentLine(key.id, now) + "\n", {
+      mode: 0o600,
+    });
+  } catch (err) {
+    logDiag(`${LOG_PREFIX}: failed to persist sent id: ${err}\n`);
   }
-}, 60_000).unref();
+}
+
+// Every send this server makes has to be tracked, not just the reply tool's:
+// handleMessage treats "fromMe and not sent by this server" as the owner
+// typing on their phone, and Baileys' event buffer delivers a batch under
+// its FIRST entry's type, so an own `append` sharing a window with an inbound
+// `notify` arrives as notify - untracked, it would be logged as a hand reply
+// under the owner's name and clear that chat's unreplied count.
+async function sendTracked(
+  jid: string,
+  content: Parameters<WASocket["sendMessage"]>[1],
+): Promise<WAMessage | undefined> {
+  const sent = await sock!.sendMessage(jid, content);
+  if (sent?.key) trackSent(sent.key);
+  return sent;
+}
+
+// durableSentIds is sent.jsonl read back, so it survives a restart; it is
+// the only real test of "this server sent it" (see trackSent).
+function wasSentByServer(id: string | null | undefined): boolean {
+  return !!id && durableSentIds.has(id);
+}
+
+// Fork default (owner, 2026-08-26): the owner's own display name, never the
+// phone number. safeName strips the characters that would break a rendered
+// log line (the profile name is self-set data crossing into model-visible text).
+function ownerDisplayName(): string {
+  return safeName(sock?.user?.name)?.trim() || "You (by hand)";
+}
 
 // ─── Message stores (bounded) ──────────────────────────────────────────
 
@@ -1944,6 +2068,13 @@ interface MessageLogEntry {
   replied: boolean;
   /** Absent on legacy lines — treat missing as 'in'. */
   direction?: "in" | "out";
+  /** 'owner' = the owner typed this on their phone, not the agent.
+   *  Absent = today's meaning (agent-sent if direction 'out', inbound otherwise). */
+  by?: "owner";
+  /** false = stored for context only (a configured group's message that did
+   *  not mention us). Never routed, never notified, never unreplied.
+   *  Absent = routed, today's meaning. */
+  routed?: false;
   image_path?: string;
   attachment_kind?: string;
   group_name?: string;
@@ -2000,10 +2131,12 @@ async function waitForUnreplied(maxMs: number): Promise<MessageLogEntry[]> {
 }
 
 function formatMessages(entries: MessageLogEntry[]): string {
+  const owner = ownerDisplayName();
   return entries
     .map((m) => {
-      const parts = [`[${m.ts}] ${m.user} in ${m.group_name ?? m.chat_id}:`];
-      if (m.text) parts.push(m.text);
+      const view = renderLogEntry(m, owner);
+      const parts = [`[${m.ts}] ${view.who} in ${m.group_name ?? m.chat_id}:`];
+      if (view.text) parts.push(view.text);
       if (m.image_path) parts.push(`(image: ${m.image_path})`);
       if (m.attachment_kind) parts.push(`(${m.attachment_kind} attachment)`);
       parts.push(`  chat_id=${m.chat_id} message_id=${m.id}`);
@@ -2020,7 +2153,7 @@ function getUnreplied(): MessageLogEntry[] {
     for (const line of lines) {
       try {
         const entry = JSON.parse(line) as MessageLogEntry;
-        if (!entry.replied) unreplied.push(entry);
+        if (awaitingReply(entry)) unreplied.push(entry);
       } catch {}
     }
     return unreplied;
@@ -2029,10 +2162,12 @@ function getUnreplied(): MessageLogEntry[] {
   }
 }
 
-/** Last ~N messages per chat, both directions, chronological — for catch_up.
- *  The 24h window is enforced by pruneMessageLog, not here. */
+/** Last ~5 messages from each side per chat, chronological — for catch_up.
+ *  The 5-line cap on the owner's own hand-typed replies is their privacy
+ *  limit (see lib/message-view.ts); how long a line lives at all is
+ *  keepLogLine's decision, enforced by pruneMessageLog, not here. */
 function getRecentByChat(
-  limit = 15,
+  limit = RECENT_LIMIT,
 ): Map<string, { entries: MessageLogEntry[]; unreplied: number }> {
   const byChat = new Map<
     string,
@@ -2050,28 +2185,49 @@ function getRecentByChat(
           byChat.set(entry.chat_id, bucket);
         }
         bucket.entries.push(entry);
-        if ((entry.direction ?? "in") === "in" && !entry.replied)
-          bucket.unreplied++;
+        if (awaitingReply(entry)) bucket.unreplied++;
       } catch {}
     }
     for (const bucket of byChat.values()) {
-      bucket.entries.sort((a, b) => a.ts.localeCompare(b.ts));
-      bucket.entries = bucket.entries.slice(-limit);
+      bucket.entries = recentBothSides(bucket.entries, limit);
     }
   } catch {}
   return byChat;
 }
 
-/** Prune entries older than 24h to keep the log small */
+/** Drop sent ids older than 24h and rebuild the in-memory set from what is
+ *  left. Rides pruneMessageLog's hourly tick (registered in becomePrimary, which also calls this once on promotion)
+ *  rather than adding a second timer. */
+function pruneSentLog(): void {
+  try {
+    if (!existsSync(SENT_LOG)) return;
+    const { ids, lines } = parseSentLog(
+      readFileSync(SENT_LOG, "utf8"),
+      Date.now() - SENT_TTL_MS,
+    );
+    durableSentIds = ids;
+    writeFileSync(SENT_LOG, lines.length ? lines.join("\n") + "\n" : "", {
+      mode: 0o600,
+    });
+  } catch {}
+}
+
+/** Prune the log: open inbounds after 24h, context lines after 7 days (keepLogLine) */
 function pruneMessageLog(): void {
+  // First: pruneMessageLog returns early when messages.jsonl does not exist
+  // yet, and sent.jsonl can exist without it (pairing notices go to chats
+  // that are never logged).
+  pruneSentLog();
   try {
     if (!existsSync(MESSAGE_LOG)) return;
-    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    // Two lifetimes, decided in lib/message-view.ts: a routed inbound is a
+    // to-do and lives a day; context lines live a week.
+    const now = Date.now();
     const lines = readFileSync(MESSAGE_LOG, "utf8").split("\n").filter(Boolean);
     const kept = lines.filter((line) => {
       try {
         const entry = JSON.parse(line) as MessageLogEntry;
-        return new Date(entry.ts).getTime() > cutoff;
+        return keepLogLine(entry, now);
       } catch {
         return false;
       }
@@ -2253,7 +2409,7 @@ mcp.setNotificationHandler(
     const owner = access.allowFrom[0];
     if (sock && owner) {
       const sent = await sock.sendMessage(owner, { text }).catch((e) => {
-        logDiag(`permission_request send to ${owner} failed: ${e}\n`);
+        logDiag(`permission_request send to ${maskJid(owner)} failed: ${e}\n`);
         return undefined;
       });
       if (sent?.key?.id) {
@@ -2395,10 +2551,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           {
             name: "catch_up",
             description:
-              'Recover conversation context after a restart. For every chat active in the last 24h, returns the recent messages in BOTH directions (sender name for incoming, "You" for replies this agent sent), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
+              'Recover conversation context. Pass `chat` (a chat_id, or part of a group or contact name, case-insensitive) to get ONE chat - do this before drafting a message to someone, so the room is in view without dumping every chat. Without `chat`: every chat. For every chat with a line still in the log (up to 7 days of context; an unanswered message addressed to you lives 24h), returns the recent messages in BOTH directions (sender name for incoming, "You" for a reply this agent sent, and the owner\'s own name for a message they typed on their phone — those show only their most recent hour, older ones read "replied (text expired)"), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
             inputSchema: {
               type: "object",
-              properties: {},
+              properties: {
+                chat: {
+                  type: "string",
+                  description:
+                    "Optional: a chat_id, or part of a group/contact name (case-insensitive). Only that chat is returned.",
+                },
+              },
             },
           },
           {
@@ -2635,7 +2797,7 @@ const handleToolCall = async (req: {
           args.chat_id as string,
           args.message_id as string,
         );
-        await sock.sendMessage(args.chat_id as string, {
+        await sendTracked(args.chat_id as string, {
           react: { text: args.emoji as string, key },
         });
         return { content: [{ type: "text", text: "reacted" }] };
@@ -2687,7 +2849,7 @@ const handleToolCall = async (req: {
           args.message_id as string,
           true,
         );
-        await sock.sendMessage(args.chat_id as string, {
+        await sendTracked(args.chat_id as string, {
           text: args.text as string,
           edit: editKey,
         });
@@ -2770,24 +2932,38 @@ const handleToolCall = async (req: {
       case "catch_up": {
         const byChat = getRecentByChat();
         const sections: string[] = [];
+        const owner = ownerDisplayName();
+        // One chat on request: the owner drafts a message to someone and
+        // wants that room in view, not every chat they have (2026-08-27).
+        const want = String(args.chat ?? "")
+          .trim()
+          .toLowerCase();
         for (const [chatId, { entries, unreplied }] of byChat) {
           const name =
             entries.find((e) => e.group_name)?.group_name ??
             entries.find((e) => (e.direction ?? "in") === "in")?.user ??
             chatId;
+          if (
+            want &&
+            chatId.toLowerCase() !== want &&
+            !name.toLowerCase().includes(want)
+          )
+            continue;
           const header = `=== ${name} (chat_id=${chatId})${unreplied ? ` — ${unreplied} unreplied` : ""} ===`;
           const lines = entries.map((e) => {
-            const who = e.direction === "out" ? "You" : e.user;
+            const view = renderLogEntry(e, owner);
             const extras =
               (e.image_path ? ` (image: ${e.image_path})` : "") +
               (e.attachment_kind ? ` (${e.attachment_kind} attachment)` : "");
-            return `[${e.ts}] ${who}: ${e.text}${extras}`;
+            return `[${e.ts}] ${view.who}: ${view.text}${extras}`;
           });
           sections.push([header, ...lines].join("\n"));
         }
         let text = sections.length
           ? sections.join("\n\n")
-          : "No chat activity in the last 24h.";
+          : want
+            ? `No chat on record matching "${want}".`
+            : "No chat activity on record.";
         try {
           if (existsSync(TASKS_FILE)) {
             const open = readFileSync(TASKS_FILE, "utf8")
@@ -3218,10 +3394,80 @@ function safeName(s: string | undefined | null): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, "_");
 }
 
-async function handleMessage(msg: WAMessage): Promise<void> {
+// The owner replied on their phone. Log it for the chats the agent is already
+// allowed to see, so unreplied clears and catch_up shows both halves. This is
+// deliberately NOT gate(): gate is the INBOUND path and mints/refreshes pairing
+// codes as a side effect (server.ts:1584-1602) — a message the owner sent must
+// never burn a pairing slot or trigger a "pairing required" reply. Only gate's
+// pure reads are reused.
+async function logOwnerHandReply(msg: WAMessage): Promise<void> {
+  const chatId = msg.key.remoteJid!;
+  if (
+    chatId === "status@broadcast" ||
+    chatId.endsWith("@broadcast") ||
+    chatId.endsWith("@newsletter")
+  )
+    return;
+
+  const isGroup = chatId.endsWith("@g.us");
+  const access = loadAccess();
+  if (isGroup) {
+    if (!access.groups[chatId]) return;
+  } else {
+    if (access.dmPolicy === "disabled") return;
+    const peerJid = jidNormalizedUser(chatId);
+    // Cached lid map only (isAllowedJid → resolveToPhone), never
+    // ensureLidResolved: that one WRITES lid-map.json on success and logs the
+    // jid on failure, which for a chat that is then dropped would be a new
+    // on-disk record of a contact the owner never allowlisted. The cost is
+    // that a hand reply to a @lid contact nobody has mapped yet is dropped
+    // until their next inbound message maps them - strictly less stored.
+    if (!isAllowedJid(peerJid, access.allowFrom)) return;
+  }
+
+  // Only now is the text read at all. No diag line, no log line, nothing on
+  // the drop paths above.
+  const text = extractText(msg.message);
+  if (!text) return; // media-only / reaction / protocol message — see NOTE 3
+
+  // Idempotence: an id already in the log is a replay (second line behind
+  // wasSentByServer), or markReplied would flip this chat's unreplied to replied.
+  try {
+    if (
+      msg.key.id &&
+      existsSync(MESSAGE_LOG) &&
+      logContainsId(readFileSync(MESSAGE_LOG, "utf8"), msg.key.id)
+    )
+      return;
+  } catch {}
+
+  const tsSec = Number(msg.messageTimestamp ?? 0);
+  const groupName = isGroup ? await resolveGroupName(chatId) : undefined;
+
+  markReplied(chatId);
+  persistMessage({
+    id: msg.key.id ?? `hand-${Date.now()}`,
+    chat_id: chatId,
+    user: ownerDisplayName(),
+    user_id: ownJid || "self",
+    text,
+    ts: new Date(tsSec > 0 ? tsSec * 1000 : Date.now()).toISOString(),
+    replied: true,
+    direction: "out",
+    by: "owner",
+    ...(groupName && groupName !== chatId ? { group_name: groupName } : {}),
+  });
+}
+
+async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   if (!msg.message) return;
-  if (isEcho(msg.key)) return;
   if (!msg.key.remoteJid) return;
+  // fromMe: our own echo, or the owner typing on their phone.
+  if (msg.key.fromMe) {
+    if (wasSentByServer(msg.key.id)) return;
+    return logOwnerHandReply(msg);
+  }
+  if (wasSentByServer(msg.key.id)) return;
 
   const remoteJid = msg.key.remoteJid;
   // Status updates / channel broadcasts aren't DMs or groups — treating them
@@ -3255,20 +3501,52 @@ async function handleMessage(msg: WAMessage): Promise<void> {
   await ensureLidResolved(senderJid);
 
   // Gate check
-  const result = gate(remoteJid, senderJid, text, mentionedJids);
+  const result = gate(remoteJid, senderJid, text, mentionedJids, !backlog);
 
   if (result.action === "drop") {
+    // resolveToPhone returns its INPUT when the lid is unmapped, so echoing it
+    // through the mask printed "(resolved: X)" with the same X twice - reading
+    // as a success when resolution had in fact failed. Say which it was.
+    const mapped = isLidUser(senderJid) ? lidMap[senderJid] : undefined;
     logDiag(
-      `${LOG_PREFIX}: dropped inbound from ${senderJid}` +
-        `${isLidUser(senderJid) ? ` (resolved: ${resolveToPhone(senderJid)})` : ""} chat=${remoteJid}\n`,
+      `${LOG_PREFIX}: dropped inbound from ${maskJid(senderJid)}` +
+        `${isLidUser(senderJid) ? (mapped ? ` (resolved: ${maskNumber(mapped)})` : " (lid unresolved)") : ""}` +
+        ` chat=${maskJid(remoteJid)}\n`,
     );
+    // Log-but-don't-route (fork #16): a configured group's message that
+    // simply did not mention us is kept, text only, so catch_up can show the
+    // room when the owner wants to write to it. It is never routed, notified
+    // or counted as unreplied - `routed: false` is what getUnreplied and the
+    // catch_up counter key on. Every other drop reason stores nothing.
+    if (isGroup && result.reason === "no-mention") {
+      // Same content rule as the delivered path: real media becomes
+      // "(image)" etc.; reactions, edits, revokes and poll updates carry no
+      // content and are not kept.
+      const dropMedia = classifyMedia(msg.message);
+      const kept = text || (dropMedia ? `(${dropMedia.kind})` : "");
+      if (kept) {
+        const groupName = await resolveGroupName(remoteJid);
+        persistMessage({
+          id: messageId,
+          chat_id: remoteJid,
+          user: msg.pushName ?? senderJid.split("@")[0],
+          user_id: senderJid,
+          text: kept,
+          ts: new Date(timestamp * 1000).toISOString(),
+          replied: true,
+          direction: "in",
+          routed: false,
+          ...(groupName ? { group_name: groupName } : {}),
+        });
+      }
+    }
     return;
   }
 
   if (result.action === "pair") {
-    if (!sock) return;
+    if (backlog || !sock) return;
     const lead = result.isResend ? "Still pending" : "Pairing required";
-    await sock.sendMessage(remoteJid, {
+    await sendTracked(remoteJid, {
       text: `${lead} — run in Claude Code:\n\n/whatsapp-channel:access pair ${result.code}`,
     });
     return;
@@ -3277,9 +3555,12 @@ async function handleMessage(msg: WAMessage): Promise<void> {
   const access = result.access;
 
   // ─── In-chat commands ───────────────────────────────────────────────
-  if (text.trim().toLowerCase() === "/new") {
+  // Every block below that ACTS on a message is skipped for a replayed
+  // backlog message: the pile from while we were offline is read, never
+  // answered (see the messages.upsert handler).
+  if (!backlog && text.trim().toLowerCase() === "/new") {
     if (sock) {
-      await sock.sendMessage(remoteJid, {
+      await sendTracked(remoteJid, {
         text: "🔄 Context cleared. Starting fresh.",
       });
     }
@@ -3318,7 +3599,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
   // swallowing a real message — sender sees a tick, agent never sees the
   // text — is worse than missing an approval. On clients that never send
   // permission requests, nothing is listening at all.
-  const permMatch = PERMISSION_REPLY_RE.exec(text);
+  const permMatch = backlog ? null : PERMISSION_REPLY_RE.exec(text);
   if (permMatch && claimPermission(permMatch[2]!.toLowerCase())) {
     void mcp.notification({
       method: "notifications/claude/channel/permission",
@@ -3334,26 +3615,22 @@ async function handleMessage(msg: WAMessage): Promise<void> {
       const emoji = permMatch[1]!.toLowerCase().startsWith("y")
         ? "\u2705"
         : "\u274C";
-      void sock
-        .sendMessage(remoteJid, {
-          react: { text: emoji, key: msg.key },
-        })
-        .catch(() => {});
+      void sendTracked(remoteJid, {
+        react: { text: emoji, key: msg.key },
+      }).catch(() => {});
     }
     return;
   }
 
   // Ack reaction
-  if (access.ackReaction && sock && messageId) {
-    void sock
-      .sendMessage(remoteJid, {
-        react: { text: access.ackReaction, key: msg.key },
-      })
-      .catch(() => {});
+  if (!backlog && access.ackReaction && sock && messageId) {
+    void sendTracked(remoteJid, {
+      react: { text: access.ackReaction, key: msg.key },
+    }).catch(() => {});
   }
 
   // Typing indicator
-  if (sock) {
+  if (sock && !backlog) {
     void sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
   }
 
@@ -3370,7 +3647,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
     | undefined;
 
   const media = classifyMedia(msg.message);
-  if (media) {
+  if (media && !backlog) {
     if (media.kind === "image") {
       // Eager download for images (small, commonly sent)
       try {
@@ -3471,6 +3748,10 @@ async function handleMessage(msg: WAMessage): Promise<void> {
     ...(attachment ? { attachment_kind: attachment.kind } : {}),
     ...(groupName ? { group_name: groupName } : {}),
   });
+
+  // A backlog line is logged (above) and shows in catch_up/unreplied; it is
+  // never pushed live - the session reads it when it asks.
+  if (backlog) return;
 
   // Emit channel notification. Built once and reused for the broadcast
   // below so a secondary's session sees byte-identical content to the
@@ -3655,8 +3936,13 @@ async function connectWhatsApp(): Promise<void> {
     let changed = false;
     for (const c of contacts) {
       if (c.name || c.notify) {
+        // A snapshot entry can arrive under its @lid id while also carrying
+        // the phone form: key on the phone form when it is there, so the
+        // name never lands under an @lid key that resolveByName would hand
+        // back verbatim. No recordLidMapping here - it reloads contactsMap
+        // from disk and would wipe every merge made so far in this batch.
         if (
-          mergeContact(contactsMap, contactKey(c.id), {
+          mergeContact(contactsMap, contactKey(c.phoneNumber ?? c.id), {
             name: c.name,
             notify: c.notify,
           })
@@ -3766,8 +4052,13 @@ async function connectWhatsApp(): Promise<void> {
       reconnectAttempt = 0;
       pairingCodeRequested = false;
       ownJid = jidNormalizedUser(sock!.user?.id ?? "");
+      // Baileys never emits a lid-mapping.update for our own account, yet
+      // the owner's self-chat arrives under their own @lid: without this
+      // seed, isAllowedJid can't match it to the allowlisted phone and
+      // logOwnerHandReply drops every message the owner sends themselves.
+      if (ownJid && sock!.user?.lid) recordLidMapping(sock!.user.lid, ownJid);
       const resolvedOwn = ownJid ? resolveToPhone(ownJid) : "";
-      logDiag(`${LOG_PREFIX}: connected as ${ownJid}\n`);
+      logDiag(`${LOG_PREFIX}: connected as ${maskJid(ownJid)}\n`);
 
       // Auto-add owner to allowlist on first connection
       if (ownJid && !STATIC) {
@@ -3780,7 +4071,7 @@ async function connectWhatsApp(): Promise<void> {
           }
           saveAccess(access);
           logDiag(
-            `${LOG_PREFIX}: auto-added owner ${resolvedOwn} to allowlist\n`,
+            `${LOG_PREFIX}: auto-added owner ${maskJid(resolvedOwn)} to allowlist\n`,
           );
         }
       }
@@ -3803,8 +4094,8 @@ async function connectWhatsApp(): Promise<void> {
         `  → edit personality at ~/.whatsapp-channel/groups/<groupJid>/config.md`,
         ``,
         `Already have contacts and groups you talk to on WhatsApp? Run`,
-        `\`${WIZARD_CMD}\` for a checkbox screen to bulk-approve`,
-        `them instead of pairing each one individually.`,
+        `\`/whatsapp-channel:access review\` to open the access screen in a new terminal window and add or remove them in one pass,`,
+        `or \`${WIZARD_CMD}\` to open that same screen yourself, with no AI model involved.`,
         ``,
         `Ready to receive messages.`,
       ].join("\n");
@@ -3831,6 +4122,14 @@ async function connectWhatsApp(): Promise<void> {
         logDiag(
           `${LOG_PREFIX}: failed to warm groups-meta cache on connect: ${err}\n`,
         );
+      });
+
+      // Same fire-and-forget contract as the groups-meta warm-up above: a
+      // failure here must never break the connection, and it must never block
+      // startup. Guarded inside on the on-disk cache, so this is a no-op on
+      // every connect once names are actually cached.
+      syncSavedNamesOnce(sock!).catch((err) => {
+        logDiag(`${LOG_PREFIX}: address book sync failed: ${err}\n`);
       });
     }
 
@@ -3881,21 +4180,39 @@ async function connectWhatsApp(): Promise<void> {
   sock.ev.on(
     "messages.upsert",
     async (ev: { messages: WAMessage[]; type: string }) => {
-      // The one line that answers "did it even get here?". JIDs only, never
-      // message text: this file is a debugging aid, not a second transcript.
+      // The one line that answers "did it even get here?". Masked JIDs only,
+      // never message text: this file is a debugging aid, not a second
+      // transcript. It runs BEFORE the allowlist gate, so an unmasked number
+      // here would be a dropped stranger's real number on disk - the one
+      // trace the hand-reply feature promises not to leave (USAGE.md).
       // Logged before the notify filter so a batch dropped for arriving as
       // "append" (offline backlog) is distinguishable from one that never came.
       logDiag(
         `${LOG_PREFIX}: inbound upsert type=${ev.type} n=${ev.messages.length} ` +
           `decrypted=[${ev.messages.map((m) => (m.message ? "y" : "NULL")).join(",")}] ` +
           `from=[${ev.messages
-            .map((m) => String(m.key?.participant ?? m.key?.remoteJid))
+            .map((m) => {
+              // Chat first, then sender: `participant ?? remoteJid` would hide
+              // the group. A missing jid stays legible - the absence IS the finding.
+              const chat = m.key?.remoteJid;
+              const who = m.key?.participant;
+              if (!chat) return who ? maskJid(String(who)) : "undefined";
+              return (
+                maskJid(String(chat)) + (who ? `/${maskJid(String(who))}` : "")
+              );
+            })
             .join(",")}]\n`,
       );
-      if (ev.type !== "notify") return;
+      // "append" is the offline backlog WhatsApp delivers on reconnect: the
+      // night's messages when no server was connected. They go through the
+      // same gate so the log (and catch_up) has them, but as BACKLOG: no
+      // live notification, no media download, no pairing reply - a replay
+      // must never make this server act on a message that is hours old.
+      const backlog = ev.type === "append";
+      if (!backlog && ev.type !== "notify") return;
       for (const msg of ev.messages) {
         try {
-          await handleMessage(msg);
+          await handleMessage(msg, backlog);
         } catch (err) {
           logDiag(`${LOG_PREFIX}: message handler error: ${err}\n`);
         }

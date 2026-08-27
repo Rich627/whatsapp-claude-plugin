@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   contactName,
   forgetContact,
+  hasSavedName,
   mergeContact,
   migrateContactKey,
   resolveByName,
@@ -233,5 +234,28 @@ describe("resolveByName", () => {
       ok: false,
       reason: "not_found",
     });
+  });
+});
+
+describe("hasSavedName", () => {
+  test("only a non-empty .name counts; notify-only, empty-string and an empty cache do not", () => {
+    expect(hasSavedName({})).toBe(false);
+    // The exact state this check exists for: entries exist (everyone who has
+    // ever messaged the account), but not one of them is a name the owner
+    // saved, so nothing can be resolved by name yet.
+    expect(
+      hasSavedName({
+        "a@s.whatsapp.net": { notify: "aki_98" },
+        "b@s.whatsapp.net": { notify: "neha" },
+      }),
+    ).toBe(false);
+    // Same rule mergeContact enforces: "" means "not provided", never a name.
+    expect(hasSavedName({ "a@s.whatsapp.net": { name: "" } })).toBe(false);
+    expect(
+      hasSavedName({
+        "a@s.whatsapp.net": { notify: "aki_98" },
+        "b@s.whatsapp.net": { name: "Akash", notify: "aki_98" },
+      }),
+    ).toBe(true);
   });
 });
