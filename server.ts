@@ -3915,6 +3915,11 @@ async function connectWhatsApp(): Promise<void> {
       reconnectAttempt = 0;
       pairingCodeRequested = false;
       ownJid = jidNormalizedUser(sock!.user?.id ?? "");
+      // Baileys never emits a lid-mapping.update for our own account, yet
+      // the owner's self-chat arrives under their own @lid: without this
+      // seed, isAllowedJid can't match it to the allowlisted phone and
+      // logOwnerHandReply drops every message the owner sends themselves.
+      if (ownJid && sock!.user?.lid) recordLidMapping(sock!.user.lid, ownJid);
       const resolvedOwn = ownJid ? resolveToPhone(ownJid) : "";
       logDiag(`${LOG_PREFIX}: connected as ${maskJid(ownJid)}\n`);
 
