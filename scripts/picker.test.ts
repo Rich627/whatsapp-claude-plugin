@@ -708,6 +708,33 @@ describe("layout", () => {
     expect(text).toMatch(/\+\d+ more/);
   });
 
+  test("every line fits the terminal even when one chip plus '+N more' would not", () => {
+    const many = Array.from({ length: 24 }, (_, i) =>
+      item({
+        jid: `c${i}@s.whatsapp.net`,
+        label: `Name number ${i} Longish`,
+        granted: true,
+      }),
+    );
+    // 30 columns is the floor: below it the fixed prompt text itself no
+    // longer fits, and no real terminal is that narrow.
+    for (const [cols, rows] of [
+      [40, 24],
+      [30, 5],
+      [100, 2],
+    ]) {
+      const lines = layout(
+        initPicker(model({ dms: many }), cols, rows),
+        cols,
+        rows,
+      );
+      expect(lines.length).toBeLessThanOrEqual(rows);
+      for (const l of lines) {
+        expect(displayWidth(stripAnsi(l))).toBeLessThanOrEqual(cols);
+      }
+    }
+  });
+
   test("Restore is dim / not clickable when hasBackup:false", () => {
     const s = initPicker(model({ hasBackup: false }), 100, 24);
     const lines = layout(s, 100, 24);

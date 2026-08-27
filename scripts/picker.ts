@@ -100,11 +100,13 @@ function graphemes(s: string): string[] {
 // characters (ZWJ, variation selectors) take no cell, CJK/Hangul/kana and
 // presentation emoji take two, everything else one.
 // ponytail: unicode-property heuristic, not East_Asian_Width (JS has no
-// \p{EAW}); fullwidth ASCII (FF01-FF60) counts 1 and regional-indicator
-// flags count 1 - swap in a real EAW table if a terminal ever overlaps.
+// \p{EAW}). scx= (not sc=) so CJK punctuation and the prolonged-sound mark
+// count wide; the literal ranges are fullwidth forms, enclosed CJK and
+// compatibility forms; halfwidth Hangul and regional-indicator flags stay
+// 1. Swap in a real EAW table if a terminal ever overlaps.
 const ZERO_WIDTH = /^[\p{M}\p{Cf}]/u;
 const WIDE =
-  /^(?!\p{Regional_Indicator})[\p{Ideographic}\p{sc=Hangul}\p{sc=Hiragana}\p{sc=Katakana}\p{Emoji_Presentation}]/u;
+  /^(?!\p{Regional_Indicator})(?![ﾠ-ￜ])[\p{scx=Han}\p{scx=Hangul}\p{scx=Hiragana}\p{scx=Katakana}\p{scx=Bopomofo}\p{sc=Yi}\p{Emoji_Presentation}　㈀-㋿︰-﹏！-｠￠-￦]/u;
 function cellWidth(g: string): number {
   if (ZERO_WIDTH.test(g)) return 0;
   return WIDE.test(g) ? 2 : 1;
@@ -510,8 +512,9 @@ const SEQ: Record<string, PickerEvent> = {
   B: { type: "down" },
   C: { type: "tab" },
   D: { type: "tab" },
-  Z: { type: "tab" },
 };
+// Shift-Tab is CSI-only; SS3 never carries Z.
+const CSI_ONLY: Record<string, PickerEvent> = { Z: { type: "tab" } };
 
 export function decodeInput(chunk: string): PickerEvent[] {
   const events: PickerEvent[] = [];
@@ -548,7 +551,7 @@ export function decodeInput(chunk: string): PickerEvent[] {
       }
       const final = chunk[j];
       const body = chunk.slice(i + 2, j);
-      const ev = body === "" ? SEQ[final] : undefined;
+      const ev = body === "" ? (SEQ[final] ?? CSI_ONLY[final]) : undefined;
       if (ev) events.push(ev);
       else if (body.startsWith("<") && final === "M") {
         // SGR mouse press; release ("m") and wheel (b >= 64) -> nothing.
@@ -730,11 +733,11 @@ function renderChips(
     used += addWidth;
   }
   // The "+N more" prefix has to fit in the same budget - the loop above did
-  // not reserve for it, so drop leading chips until it does.
+  // not reserve for it, so drop leading chips until it does, down to none.
   let prefixPlain = droppedCount > 0 ? `+${droppedCount} more ` : "";
   while (
     droppedCount > 0 &&
-    chosen.length > 1 &&
+    chosen.length > 0 &&
     used + displayWidth(prefixPlain) > maxWidth
   ) {
     used -= chosen.shift()!.width + 1;
@@ -956,7 +959,11 @@ function render(
   lines.push(footer.colored);
   for (const r of footer.ranges) footerRanges.push({ row: footerRow, ...r });
 
-  return { lines, geometry: { itemRows, chipRanges, footerRanges, searchRow } };
+  // A terminal shorter than the layout shows the top; nothing may scroll.
+  return {
+    lines: lines.slice(0, rows),
+    geometry: { itemRows, chipRanges, footerRanges, searchRow },
+  };
 }
 
 export const layout = (state: PickerState, cols: number, rows: number) =>

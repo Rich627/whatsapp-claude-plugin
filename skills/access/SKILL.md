@@ -280,7 +280,9 @@ restated here on purpose.
    yourself, never hand-edit `access.json` for this.
 5. Exit 0 with "Nothing changed" → say exactly that; do not offer to try
    again unless asked.
-6. Exit 2 → relay its text, including the absolute command, and stop.
+6. Exit 1 "still open after 30 minutes" → the window is still up and nothing
+   was written. Say so, and do not re-run `review` while it is open.
+7. Exit 2 → relay its text, including the absolute command, and stop.
 
 ### `undo` — put back the last run of the access screen
 

@@ -1522,12 +1522,13 @@ async function syncSavedNamesOnce(
   await activeSock.resyncAppState(["critical_unblock_low"], true);
   // The contacts.upsert events flush AFTER the promise resolves
   // (Utils/event-buffer.js:135-141; a 1,200-entry snapshot took 13 s), so
-  // count later. ponytail: one delayed log line, never the cache itself.
+  // count a full minute later. ponytail: one delayed log line, never the
+  // cache itself - the upsert listener already merged the names.
   setTimeout(() => {
     reloadContactsMap();
     const saved = Object.values(contactsMap).filter((c) => c.name).length;
     logDiag(`${LOG_PREFIX}: address book synced: ${saved} saved name(s)\n`);
-  }, 15_000);
+  }, 60_000);
 }
 
 async function resolveGroupName(groupJid: string): Promise<string> {
