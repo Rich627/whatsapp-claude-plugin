@@ -1530,6 +1530,7 @@ async function refreshGroupsMeta(
 // restart still retries at once - the timestamp lives in memory only.
 const CONTACT_PATCH_COLLECTION = "critical_unblock_low" as const;
 const ADDRESS_BOOK_FLUSH_GRACE_MS = 2000;
+const ADDRESS_BOOK_FLUSH_WAIT_MS = 60_000;
 const ADDRESS_BOOK_SYNC_COOLDOWN_MS = GROUPS_META_CONNECT_COOLDOWN_MS;
 let addressBookSyncAttemptedAt = 0;
 
@@ -1551,17 +1552,23 @@ async function syncSavedNamesOnce(
   });
   await activeSock.resyncAppState([CONTACT_PATCH_COLLECTION], true);
   // resyncAppState is wrapped in createBufferedFunction: the contacts.upsert
-  // events it produces are flushed on a 100ms timer that fires AFTER the
-  // promise above resolves (Utils/event-buffer.js:135-141), so counting here
-  // and now would always read the pre-sync number. Count from disk after a
-  // grace window instead.
-  // ponytail: fixed grace window, not an event handshake - this only affects
+  // events it produces are flushed AFTER the promise above resolves
+  // (Utils/event-buffer.js:135-141), and a 1,200-entry snapshot took 13 s to
+  // reach disk on the first live run, so counting right away always read the
+  // pre-sync number. Poll the disk until a saved name shows up, then log.
+  // ponytail: polled log line, not an event handshake - this only affects
   // the accuracy of one log line, never the cache itself or the guard above.
-  setTimeout(() => {
+  const startedAt = Date.now();
+  const report = () => {
     reloadContactsMap();
     const saved = Object.values(contactsMap).filter((c) => c.name).length;
+    if (saved === 0 && Date.now() - startedAt < ADDRESS_BOOK_FLUSH_WAIT_MS) {
+      setTimeout(report, ADDRESS_BOOK_FLUSH_GRACE_MS);
+      return;
+    }
     logDiag(`${LOG_PREFIX}: address book synced: ${saved} saved name(s)\n`);
-  }, ADDRESS_BOOK_FLUSH_GRACE_MS);
+  };
+  setTimeout(report, ADDRESS_BOOK_FLUSH_GRACE_MS);
 }
 
 async function resolveGroupName(groupJid: string): Promise<string> {
