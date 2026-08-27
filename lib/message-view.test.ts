@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
+  awaitingReply,
+  NOT_ADDRESSED,
   recentWindow,
   renderLogEntry,
   type ViewableEntry,
@@ -79,6 +81,32 @@ describe("renderLogEntry", () => {
     });
   });
 
+  test("routed:false group entry: who carries the not-addressed suffix, text intact, never expires", () => {
+    const entry: ViewableEntry = {
+      user: "Ravi",
+      text: "meeting moved to 3",
+      ts: hoursAgo(25),
+      direction: "in",
+      routed: false,
+    };
+    expect(renderLogEntry(entry, "Kaushik", now)).toEqual({
+      who: `Ravi${NOT_ADDRESSED}`,
+      text: "meeting moved to 3",
+    });
+  });
+
+  test("owner entry is never marked not-addressed even with routed:false present", () => {
+    const entry: ViewableEntry = {
+      user: "Kaushik N",
+      text: "ok",
+      ts: minutesAgo(5),
+      direction: "out",
+      by: "owner",
+      routed: false,
+    };
+    expect(renderLogEntry(entry, "Kaushik", now).who).toBe("Kaushik");
+  });
+
   test("owner entry with an unparseable ts: fails closed (expired)", () => {
     const entry: ViewableEntry = {
       user: "self",
@@ -105,6 +133,24 @@ describe("renderLogEntry", () => {
       who: "You (by hand)",
       text: "see you at six",
     });
+  });
+});
+
+describe("awaitingReply", () => {
+  test("inbound, unreplied: waiting", () => {
+    expect(awaitingReply({ replied: false, direction: "in" })).toBe(true);
+  });
+  test("legacy line with no direction: treated as inbound", () => {
+    expect(awaitingReply({ replied: false })).toBe(true);
+  });
+  test("routed:false: never waiting, even unreplied", () => {
+    expect(
+      awaitingReply({ replied: false, direction: "in", routed: false }),
+    ).toBe(false);
+  });
+  test("outbound or replied: not waiting", () => {
+    expect(awaitingReply({ replied: false, direction: "out" })).toBe(false);
+    expect(awaitingReply({ replied: true, direction: "in" })).toBe(false);
   });
 });
 

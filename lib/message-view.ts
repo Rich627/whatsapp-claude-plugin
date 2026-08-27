@@ -11,7 +11,27 @@ export type ViewableEntry = {
   ts: string;
   direction?: "in" | "out";
   by?: "owner";
+  /** false = kept for context only, was never addressed to the agent. */
+  routed?: false;
 };
+
+/** An inbound line still waiting for an answer. A `routed: false` line was
+ *  never addressed to the agent, so it can never be waiting. The ONLY place
+ *  this rule exists - getUnreplied and the catch_up counter both call it. */
+export function awaitingReply(entry: {
+  replied?: boolean;
+  direction?: "in" | "out";
+  routed?: false;
+}): boolean {
+  return (
+    (entry.direction ?? "in") === "in" &&
+    !entry.replied &&
+    entry.routed !== false
+  );
+}
+
+/** Suffix on the sender of an entry that was never addressed to the agent. */
+export const NOT_ADDRESSED = " (not addressed to Claude)";
 
 /** Owner-authored text is visible this long, then collapses. */
 export const OWNER_TEXT_TTL_MS = 60 * 60 * 1000;
@@ -37,7 +57,12 @@ export function renderLogEntry(
   ownerName: string,
   now: number = Date.now(),
 ): { who: string; text: string } {
-  const who = entry.by === "owner" ? ownerName : entry.user;
+  const who =
+    entry.by === "owner"
+      ? ownerName
+      : entry.routed === false
+        ? `${entry.user}${NOT_ADDRESSED}`
+        : entry.user;
   if (entry.by !== "owner") return { who, text: entry.text };
 
   const age = now - Date.parse(entry.ts);

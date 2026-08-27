@@ -56,7 +56,12 @@ import {
   mentionsForChunk,
 } from "./lib/mentions";
 import { logContainsId } from "./lib/message-log-probe";
-import { RECENT_LIMIT, recentWindow, renderLogEntry } from "./lib/message-view";
+import {
+  awaitingReply,
+  RECENT_LIMIT,
+  recentWindow,
+  renderLogEntry,
+} from "./lib/message-view";
 import { formatSentLine, parseSentLog } from "./lib/sent-log";
 import {
   contactName,
@@ -1652,7 +1657,7 @@ function pruneExpired(a: Access): boolean {
 
 type GateResult =
   | { action: "deliver"; access: Access }
-  | { action: "drop" }
+  | { action: "drop"; reason?: "no-mention" }
   | { action: "pair"; code: string; isResend: boolean };
 
 function gate(
@@ -1714,7 +1719,9 @@ function gate(
     requireMention &&
     !isMentioned(text, mentionedJids, access.mentionPatterns)
   ) {
-    return { action: "drop" };
+    // The one drop the log keeps (see handleMessage): the group is
+    // configured and the sender is allowed, the message just was not for us.
+    return { action: "drop", reason: "no-mention" };
   }
   return { action: "deliver", access };
 }
@@ -2128,6 +2135,10 @@ interface MessageLogEntry {
   /** 'owner' = the owner typed this on their phone, not the agent.
    *  Absent = today's meaning (agent-sent if direction 'out', inbound otherwise). */
   by?: "owner";
+  /** false = stored for context only (a configured group's message that did
+   *  not mention us). Never routed, never notified, never unreplied.
+   *  Absent = routed, today's meaning. */
+  routed?: false;
   image_path?: string;
   attachment_kind?: string;
   group_name?: string;
@@ -2217,7 +2228,7 @@ function getUnreplied(): MessageLogEntry[] {
     for (const line of lines) {
       try {
         const entry = JSON.parse(line) as MessageLogEntry;
-        if (!entry.replied) unreplied.push(entry);
+        if (awaitingReply(entry)) unreplied.push(entry);
       } catch {}
     }
     return unreplied;
@@ -2249,8 +2260,7 @@ function getRecentByChat(
           byChat.set(entry.chat_id, bucket);
         }
         bucket.entries.push(entry);
-        if ((entry.direction ?? "in") === "in" && !entry.replied)
-          bucket.unreplied++;
+        if (awaitingReply(entry)) bucket.unreplied++;
       } catch {}
     }
     for (const bucket of byChat.values()) {
@@ -3563,6 +3573,29 @@ async function handleMessage(msg: WAMessage): Promise<void> {
         `${isLidUser(senderJid) ? (mapped ? ` (resolved: ${maskNumber(mapped)})` : " (lid unresolved)") : ""}` +
         ` chat=${maskJid(remoteJid)}\n`,
     );
+    // Log-but-don't-route (fork #16): a configured group's message that
+    // simply did not mention us is kept, text only, so catch_up can show the
+    // room when the owner wants to write to it. It is never routed, notified
+    // or counted as unreplied - `routed: false` is what getUnreplied and the
+    // catch_up counter key on. Every other drop reason stores nothing.
+    if (isGroup && result.reason === "no-mention") {
+      const kept = text || (msg.message ? "(media)" : "");
+      if (kept) {
+        const groupName = await resolveGroupName(remoteJid);
+        persistMessage({
+          id: messageId,
+          chat_id: remoteJid,
+          user: msg.pushName ?? senderJid.split("@")[0],
+          user_id: senderJid,
+          text: kept,
+          ts: new Date(timestamp * 1000).toISOString(),
+          replied: true,
+          direction: "in",
+          routed: false,
+          ...(groupName ? { group_name: groupName } : {}),
+        });
+      }
+    }
     return;
   }
 
