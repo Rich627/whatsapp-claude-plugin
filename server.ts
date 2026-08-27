@@ -2010,7 +2010,8 @@ function chunk(
 
 const sentMessages = new Map<string, number>();
 
-// Same 24h window messages.jsonl uses, so both logs age out together.
+// 24h: an own send only needs to be recognisable for as long as WhatsApp
+// might replay it, which is well inside a day.
 const SENT_TTL_MS = 24 * 60 * 60 * 1000;
 
 function readSentLog(): string {
@@ -2239,10 +2240,10 @@ function getUnreplied(): MessageLogEntry[] {
   }
 }
 
-/** Last ~5 messages per chat, both directions, chronological — for catch_up.
- *  The 5-message window is the privacy limit on the owner's own hand-typed
- *  replies (see lib/message-view.ts); the 24h window is enforced by
- *  pruneMessageLog, not here. */
+/** Last ~5 messages from each side per chat, chronological — for catch_up.
+ *  The 5-line cap on the owner's own hand-typed replies is their privacy
+ *  limit (see lib/message-view.ts); how long a line lives at all is
+ *  keepLogLine's decision, enforced by pruneMessageLog, not here. */
 function getRecentByChat(
   limit = RECENT_LIMIT,
 ): Map<string, { entries: MessageLogEntry[]; unreplied: number }> {
@@ -2289,7 +2290,7 @@ function pruneSentLog(): void {
   } catch {}
 }
 
-/** Prune entries older than 24h to keep the log small */
+/** Prune the log: open inbounds after 24h, context lines after 7 days (keepLogLine) */
 function pruneMessageLog(): void {
   // First: pruneMessageLog returns early when messages.jsonl does not exist
   // yet, and sent.jsonl can exist without it (pairing notices go to chats
@@ -2628,7 +2629,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           {
             name: "catch_up",
             description:
-              'Recover conversation context after a restart. For every chat active in the last 24h, returns the recent messages in BOTH directions (sender name for incoming, "You" for a reply this agent sent, and the owner\'s own name for a message they typed on their phone — those show only their most recent hour, older ones read "replied (text expired)"), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
+              'Recover conversation context after a restart. For every chat with a line still in the log (up to 7 days of context; a message addressed to you lives 24h), returns the recent messages in BOTH directions (sender name for incoming, "You" for a reply this agent sent, and the owner\'s own name for a message they typed on their phone — those show only their most recent hour, older ones read "replied (text expired)"), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
             inputSchema: {
               type: "object",
               properties: {},
@@ -3021,7 +3022,7 @@ const handleToolCall = async (req: {
         }
         let text = sections.length
           ? sections.join("\n\n")
-          : "No chat activity in the last 24h.";
+          : "No chat activity on record.";
         try {
           if (existsSync(TASKS_FILE)) {
             const open = readFileSync(TASKS_FILE, "utf8")
@@ -3526,7 +3527,7 @@ async function logOwnerHandReply(msg: WAMessage): Promise<void> {
   });
 }
 
-async function handleMessage(msg: WAMessage): Promise<void> {
+async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   if (!msg.message) return;
   if (!msg.key.remoteJid) return;
   // MUST come before isEcho: its fromMe clause would swallow this again.
@@ -3608,7 +3609,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
   }
 
   if (result.action === "pair") {
-    if (!sock) return;
+    if (backlog || !sock) return;
     const lead = result.isResend ? "Still pending" : "Pairing required";
     await sendTracked(remoteJid, {
       text: `${lead} — run in Claude Code:\n\n/whatsapp-channel:access pair ${result.code}`,
@@ -3708,7 +3709,7 @@ async function handleMessage(msg: WAMessage): Promise<void> {
     | undefined;
 
   const media = classifyMedia(msg.message);
-  if (media) {
+  if (media && !backlog) {
     if (media.kind === "image") {
       // Eager download for images (small, commonly sent)
       try {
@@ -3809,6 +3810,10 @@ async function handleMessage(msg: WAMessage): Promise<void> {
     ...(attachment ? { attachment_kind: attachment.kind } : {}),
     ...(groupName ? { group_name: groupName } : {}),
   });
+
+  // A backlog line is logged (above) and shows in catch_up/unreplied; it is
+  // never pushed live - the session reads it when it asks.
+  if (backlog) return;
 
   // Emit channel notification. Built once and reused for the broadcast
   // below so a secondary's session sees byte-identical content to the
@@ -4265,10 +4270,16 @@ async function connectWhatsApp(): Promise<void> {
             })
             .join(",")}]\n`,
       );
-      if (ev.type !== "notify") return;
+      // "append" is the offline backlog WhatsApp delivers on reconnect: the
+      // night's messages when no server was connected. They go through the
+      // same gate so the log (and catch_up) has them, but as BACKLOG: no
+      // live notification, no media download, no pairing reply - a replay
+      // must never make this server act on a message that is hours old.
+      const backlog = ev.type === "append";
+      if (!backlog && ev.type !== "notify") return;
       for (const msg of ev.messages) {
         try {
-          await handleMessage(msg);
+          await handleMessage(msg, backlog);
         } catch (err) {
           logDiag(`${LOG_PREFIX}: message handler error: ${err}\n`);
         }

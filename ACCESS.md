@@ -175,7 +175,7 @@ The `/whatsapp-channel:access` skill will point you at it if you ask for guided 
 
 ## Mention detection
 
-A message that does **not** trigger the server in such a group is still kept, text only, in `~/.whatsapp-channel/messages.jsonl` with `routed: false`, so `catch_up` can show you the room (tagged "not addressed to Claude") when you ask for a message to that group. It is never routed to the model as an inbound, never notified, never counted as unreplied, and it is kept for 7 days (a message addressed to Claude is kept for 24 hours - it is a to-do, not context). Nothing is kept for a group that is not allowlisted or for a sender the group's own `allowFrom` rejects.
+A message that does **not** trigger the server in such a group is still kept, text only, in `~/.whatsapp-channel/messages.jsonl` with `routed: false`, so `catch_up` can show you the room (tagged "not addressed to Claude") when you ask for a message to that group. It is never routed to the model as an inbound, never notified, never counted as unreplied, and it is kept for 7 days (an unanswered message addressed to Claude is kept for 24 hours - it is a to-do, not context). Nothing is kept for a group that is not allowlisted or for a sender the group's own `allowFrom` rejects.
 
 In groups with `requireMention: true`, any of the following triggers the server:
 

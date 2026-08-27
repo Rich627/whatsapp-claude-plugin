@@ -50,16 +50,25 @@ export const INBOUND_TTL_MS = 24 * 60 * 60 * 1000;
 export const CONTEXT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function keepLogLine(
-  entry: { ts: string; direction?: "in" | "out"; by?: "owner"; routed?: false },
+  entry: {
+    ts: string;
+    direction?: "in" | "out";
+    by?: "owner";
+    routed?: false;
+    replied?: boolean;
+  },
   now: number = Date.now(),
 ): boolean {
   const t = Date.parse(entry.ts);
   if (!Number.isFinite(t)) return false;
-  const isRoutedInbound =
+  // An answered inbound is no longer a to-do - it is the other half of a
+  // conversation whose reply we keep a week, so it stays a week too.
+  const openInbound =
     (entry.direction ?? "in") === "in" &&
     entry.routed !== false &&
-    entry.by !== "owner";
-  return now - t < (isRoutedInbound ? INBOUND_TTL_MS : CONTEXT_TTL_MS);
+    entry.by !== "owner" &&
+    !entry.replied;
+  return now - t < (openInbound ? INBOUND_TTL_MS : CONTEXT_TTL_MS);
 }
 
 /** Suffix on the sender of an entry that was never addressed to the agent. */

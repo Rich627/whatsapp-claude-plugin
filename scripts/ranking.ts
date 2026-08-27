@@ -246,7 +246,7 @@ export function rankDms(
     });
   const addressBookRows: Candidate[] = [];
   for (const [raw, entry] of Object.entries(contacts)) {
-    if (!entry?.name) continue;
+    if (!hasSavedName(raw)) continue;
     const resolved = contactKeyFor(lidMap, raw);
     if (alreadyAllowed.has(resolved) || seen.has(resolved)) continue;
     seen.add(resolved);

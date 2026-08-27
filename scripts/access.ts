@@ -556,7 +556,11 @@ async function wizard(args: string[]): Promise<void> {
         // bottom (still shown - it must stay revocable).
         ...[...configuredDms]
           .sort(
-            (x, y) => Number(/^•/.test(x.label)) - Number(/^•/.test(y.label)),
+            // Unnamed = the label is nothing but the masked number, or a
+            // self-reported name that ends in it: every shape dmLabel makes.
+            (x, y) =>
+              Number(x.label.endsWith(x.description)) -
+              Number(y.label.endsWith(y.description)),
           )
           .map((c) => buildItem(c, "dm", true)),
         ...dmCandidates.map((c) => buildItem(c, "dm", false)),

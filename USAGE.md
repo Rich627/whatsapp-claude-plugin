@@ -149,7 +149,7 @@ readable for **1 hour**; after that the line collapses to `<your name> replied (
 the fact that you answered is still shown, the words are not. That is a display rule: the raw
 line stays in `~/.whatsapp-channel/messages.jsonl` for **7 days**, the same as every other
 context line there (replies Claude sent for you, and a mention-gated group's unaddressed chatter).
-A message **addressed to Claude** is kept for **24 hours** only - it is a to-do, not context.
+An **unanswered** message addressed to Claude is kept for **24 hours** only - it is a to-do, not context; once answered it is context and stays the week.
 Backfill goes exactly as far as WhatsApp's own offline queue: whatever was sent while no server
 was connected is delivered on the next reconnect and logged then; anything older than that queue
 is gone for good.

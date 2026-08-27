@@ -199,9 +199,18 @@ describe("recentBothSides", () => {
 });
 
 describe("keepLogLine", () => {
-  test("a routed inbound lives 24h", () => {
+  test("an UNANSWERED routed inbound lives 24h; an answered one is context and lives 7 days", () => {
     expect(keepLogLine({ ts: hoursAgo(23), direction: "in" }, now)).toBe(true);
     expect(keepLogLine({ ts: hoursAgo(25), direction: "in" }, now)).toBe(false);
+    expect(
+      keepLogLine({ ts: hoursAgo(25), direction: "in", replied: true }, now),
+    ).toBe(true);
+    expect(
+      keepLogLine(
+        { ts: hoursAgo(8 * 24), direction: "in", replied: true },
+        now,
+      ),
+    ).toBe(false);
   });
   test("context lines live 7 days: unaddressed group chatter, own replies, owner hand replies", () => {
     const sixDays = hoursAgo(6 * 24);
