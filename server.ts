@@ -59,6 +59,7 @@ import { logContainsId } from "./lib/message-log-probe";
 import {
   awaitingReply,
   keepDroppedForContext,
+  keepLogLine,
   RECENT_LIMIT,
   recentBothSides,
   renderLogEntry,
@@ -2296,12 +2297,14 @@ function pruneMessageLog(): void {
   pruneSentLog();
   try {
     if (!existsSync(MESSAGE_LOG)) return;
-    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    // Two lifetimes, decided in lib/message-view.ts: a routed inbound is a
+    // to-do and lives a day; context lines live a week.
+    const now = Date.now();
     const lines = readFileSync(MESSAGE_LOG, "utf8").split("\n").filter(Boolean);
     const kept = lines.filter((line) => {
       try {
         const entry = JSON.parse(line) as MessageLogEntry;
-        return new Date(entry.ts).getTime() > cutoff;
+        return keepLogLine(entry, now);
       } catch {
         return false;
       }

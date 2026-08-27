@@ -127,7 +127,7 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 | `edit_message`        | Edit a message the account previously sent.                                                                                                                                                                           |
 | `status`              | Check connection state and get the pairing code if not yet paired.                                                                                                                                                    |
 | `unreplied`           | List received messages not yet replied to.                                                                                                                                                                            |
-| `catch_up`            | Post-restart context recovery: recent two-way conversation per chat (last 24h), unreplied counts, and open items from `~/.whatsapp-channel/tasks.md`.                                                                 |
+| `catch_up`            | Post-restart context recovery: recent two-way conversation per chat (up to 7 days of context; a message addressed to Claude is kept 24h), unreplied counts, and open items from `~/.whatsapp-channel/tasks.md`.       |
 | `list_groups`         | List every group the account is in, with JID, allowlist state, and roster-grant state. Also refreshes the local group name cache the access wizard reads.                                                             |
 | `group_roster`        | List a group's members by saved name, or a masked number — never raw. Requires [roster access](./ACCESS.md#group-roster--all-mentions).                                                                               |
 
@@ -147,16 +147,18 @@ under `WHATSAPP_DIAG_DEBUG=1`, is the library's own and is not masked by us.)
 `catch_up` replays the last **5** messages from the other side and the last **5** of your own per chat, merged in time order, so your own texts never crowd out what the room said. In a mention-gated group it also shows what members said without addressing Claude (tagged "not addressed to Claude") - kept for context only, never routed or counted as unreplied. Your own hand-typed text is
 readable for **1 hour**; after that the line collapses to `<your name> replied (text expired)` —
 the fact that you answered is still shown, the words are not. That is a display rule: the raw
-line stays in `~/.whatsapp-channel/messages.jsonl` until the log's existing 24-hour prune
-removes it, the same as every other message there. Messages Claude sent and messages you
-received keep the existing 24-hour window in full. There is **no backfill**: the plugin only sees messages
-while it is running, so anything you typed while it was stopped is gone for good.
+line stays in `~/.whatsapp-channel/messages.jsonl` for **7 days**, the same as every other
+context line there (replies Claude sent for you, and a mention-gated group's unaddressed chatter).
+A message **addressed to Claude** is kept for **24 hours** only - it is a to-do, not context.
+Backfill goes exactly as far as WhatsApp's own offline queue: whatever was sent while no server
+was connected is delivered on the next reconnect and logged then; anything older than that queue
+is gone for good.
 
 Separately, `~/.whatsapp-channel/sent.jsonl` records only the **id and timestamp** of messages the
 plugin itself has sent — never the text, phone number, or chat. It exists because WhatsApp can
 re-deliver the plugin's own recent messages after a restart, and without this record they would
 look like replies you typed yourself, wrongly clearing a chat's unreplied list. It is pruned to
-the same 24 hours as `messages.jsonl` and created with owner-only permissions.
+24 hours and created with owner-only permissions.
 
 ## Photos & Media
 

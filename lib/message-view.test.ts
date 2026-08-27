@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   awaitingReply,
   keepDroppedForContext,
+  keepLogLine,
   NOT_ADDRESSED,
   recentBothSides,
   recentWindow,
@@ -194,6 +195,31 @@ describe("recentBothSides", () => {
       entries.push({ ts: hoursAgo(10 - i), direction: "out", n: 100 + i });
     const got = recentBothSides(entries, 5).map((e) => e.n);
     expect(got).toEqual([4, 5, 6, 7, 8, 104, 105, 106, 107, 108]);
+  });
+});
+
+describe("keepLogLine", () => {
+  test("a routed inbound lives 24h", () => {
+    expect(keepLogLine({ ts: hoursAgo(23), direction: "in" }, now)).toBe(true);
+    expect(keepLogLine({ ts: hoursAgo(25), direction: "in" }, now)).toBe(false);
+  });
+  test("context lines live 7 days: unaddressed group chatter, own replies, owner hand replies", () => {
+    const sixDays = hoursAgo(6 * 24);
+    const eightDays = hoursAgo(8 * 24);
+    expect(
+      keepLogLine({ ts: sixDays, direction: "in", routed: false }, now),
+    ).toBe(true);
+    expect(
+      keepLogLine({ ts: eightDays, direction: "in", routed: false }, now),
+    ).toBe(false);
+    expect(keepLogLine({ ts: sixDays, direction: "out" }, now)).toBe(true);
+    expect(
+      keepLogLine({ ts: sixDays, direction: "out", by: "owner" }, now),
+    ).toBe(true);
+  });
+  test("a legacy line with no direction is treated as routed inbound; an unparseable ts is dropped", () => {
+    expect(keepLogLine({ ts: hoursAgo(25) }, now)).toBe(false);
+    expect(keepLogLine({ ts: "nope" }, now)).toBe(false);
   });
 });
 
