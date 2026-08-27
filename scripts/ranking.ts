@@ -201,6 +201,25 @@ function dmLabel(contacts: ContactsMap, key: string): string {
   return masked;
 }
 
+// The key whose contacts.json entry carries this person's saved name. A name
+// can sit under the raw @lid key (cached before the mapping was known) or
+// under the resolved phone key (migrated later, or saved from the address
+// book); pick whichever actually has a name, not whichever merely exists,
+// otherwise a notify-only @lid entry shadows the saved name next to it.
+// Falls back to the resolved key so the masked number is the real identity.
+function nameKey(
+  contacts: ContactsMap,
+  lidMap: Record<string, string>,
+  jid: string,
+): string {
+  const key = contactKeyFor(lidMap, jid);
+  const named = (k: string) => {
+    const n = contacts[k]?.name;
+    return Boolean(n && !looksLikeNumber(n));
+  };
+  return named(jid) ? jid : key;
+}
+
 // See dmLabel above for why a `.notify`-only label is marked unverified
 // rather than shown like a saved name.
 //
@@ -222,9 +241,8 @@ export function rankDms(
   // here. Only candidates are filtered; an already-allowed unnamed entry is
   // still listed by listConfiguredDms so it can be revoked.
   const hasSavedName = (jid: string) => {
-    const key = contactKeyFor(lidMap, jid);
-    const entry = contacts[jid] ?? contacts[key];
-    return Boolean(entry?.name && !looksLikeNumber(entry.name));
+    const n = contacts[nameKey(contacts, lidMap, jid)]?.name;
+    return Boolean(n && !looksLikeNumber(n));
   };
   const activityRows = Object.entries(activity)
     .filter(([jid]) => !alreadyAllowed.has(contactKeyFor(lidMap, jid)))
@@ -240,7 +258,7 @@ export function rankDms(
         // The saved name may sit under the phone key while the activity is
         // lid-keyed: look it up where it lives, or the row shows a masked
         // number and "Search: <name>" finds nothing.
-        label: dmLabel(contacts, contacts[jid] ? jid : key),
+        label: dmLabel(contacts, nameKey(contacts, lidMap, jid)),
         description: maskNumber(jid),
       };
     });
@@ -252,7 +270,7 @@ export function rankDms(
     seen.add(resolved);
     addressBookRows.push({
       jid: resolved,
-      label: dmLabel(contacts, contacts[resolved] ? resolved : raw),
+      label: dmLabel(contacts, nameKey(contacts, lidMap, raw)),
       description: maskNumber(resolved),
     });
   }
@@ -284,7 +302,7 @@ export function listConfiguredDms(
       // is what tells the @lid row apart from the phone one.
       return {
         jid,
-        label: dmLabel(contacts, key),
+        label: dmLabel(contacts, nameKey(contacts, lidMap, jid)),
         description: maskNumber(key),
       };
     })

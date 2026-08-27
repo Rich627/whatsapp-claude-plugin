@@ -1667,6 +1667,7 @@ function gate(
   senderJid: string,
   text: string,
   mentionedJids: string[],
+  mint = true,
 ): GateResult {
   const access = loadAccess();
   const pruned = pruneExpired(access);
@@ -1682,7 +1683,10 @@ function gate(
       return { action: "deliver", access };
     if (access.dmPolicy === "allowlist") return { action: "drop" };
 
-    // pairing mode
+    // pairing mode. A backlog message (offline replay) never gets a pairing
+    // reply, so it must not mint or refresh a code either: that would fill the
+    // 3 pending slots and bump `replies` for a code nobody was ever shown.
+    if (!mint) return { action: "drop" };
     for (const [code, p] of Object.entries(access.pending)) {
       if (
         p.senderId === senderJid ||
@@ -3585,7 +3589,7 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   await ensureLidResolved(senderJid);
 
   // Gate check
-  const result = gate(remoteJid, senderJid, text, mentionedJids);
+  const result = gate(remoteJid, senderJid, text, mentionedJids, !backlog);
 
   if (result.action === "drop") {
     // resolveToPhone returns its INPUT when the lid is unmapped, so echoing it

@@ -248,6 +248,19 @@ describe("rankGroups", () => {
 });
 
 describe("rankDms", () => {
+  test("a notify-only @lid entry does not shadow the saved name under the phone key", () => {
+    const lidMap = { "123@lid": "61403911675@s.whatsapp.net" };
+    const contacts: ContactsMap = {
+      "123@lid": { notify: "RandomPush" },
+      "61403911675@s.whatsapp.net": { name: "Boss" },
+      "61400000001@s.whatsapp.net": { name: "Aaron" },
+    };
+    // Boss has activity, so ranks above the address-book-only Aaron - and
+    // is ONE row, not a masked activity row plus an address-book duplicate.
+    const result = rankDms({ "123@lid": 100 }, contacts, [], lidMap);
+    expect(result.map((c) => c.label)).toEqual(["Boss", "Aaron"]);
+  });
+
   test("orders by most recent activity first", () => {
     const activity = { "old@s.whatsapp.net": 100, "new@s.whatsapp.net": 200 };
     const named: ContactsMap = {
@@ -633,6 +646,19 @@ describe("listConfiguredDms", () => {
       {
         jid: "184710990000999@lid",
         label: "Akash",
+        description: "•••••1675",
+      },
+    ]);
+  });
+
+  test("LID handling: a name cached under the raw @lid key still shows when the mapping is known", () => {
+    const lidMap = { "184710990000999@lid": "61403911675@s.whatsapp.net" };
+    const contacts: ContactsMap = { "184710990000999@lid": { name: "Boss" } };
+    const result = listConfiguredDms(["184710990000999@lid"], contacts, lidMap);
+    expect(result).toEqual([
+      {
+        jid: "184710990000999@lid",
+        label: "Boss",
         description: "•••••1675",
       },
     ]);
