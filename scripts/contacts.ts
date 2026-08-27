@@ -127,3 +127,50 @@ export function resolveByName(map: ContactsMap, name: string): NameResolution {
     return { ok: false, reason: "ambiguous", candidates: matches };
   return { ok: true, jid: matches[0] };
 }
+
+// ─── Stranger TTL (#30) ─────────────────────────────────────────────────
+// contacts.upsert/chats.upsert fire from Baileys BEFORE the access gate, so
+// one message from a stranger the gate then drops still lands their display
+// name in contacts.json and a timestamp in dm-activity.json. With the cache
+// on by default (0.22.0) and nothing ever pruning it, that record was
+// permanent. This is the one rule that ages those strangers out; the server
+// runs it on the same hourly tick as pruneMessageLog.
+//
+// What NEVER ages out:
+// - a saved name (`.name`) - the owner's own address book, synced from
+//   their phone; forgetting it would undo the address-book sync
+// - an allowlisted key - someone the owner explicitly approved
+// - a notify-only contact with dm-activity younger than the TTL
+export const STRANGER_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+
+/** Mutates both maps in place (house style - see mergeContact). Returns
+ *  which map actually changed so the caller saves only what moved.
+ *  `allowedKeys` must already be contactKey()-resolved, the same key form
+ *  both maps use. */
+export function pruneStrangers(
+  contacts: ContactsMap,
+  dmActivity: Record<string, number>,
+  allowedKeys: ReadonlySet<string>,
+  now: number = Date.now(),
+  ttlMs: number = STRANGER_TTL_MS,
+): { contacts: boolean; dms: boolean } {
+  let dmsChanged = false;
+  for (const [key, ts] of Object.entries(dmActivity)) {
+    // A malformed timestamp is kept, not dropped: this prune exists to
+    // forget stale strangers, and "we can't tell how old" is not "old".
+    if (typeof ts !== "number" || !Number.isFinite(ts)) continue;
+    if (now - ts < ttlMs) continue;
+    if (allowedKeys.has(key)) continue;
+    delete dmActivity[key];
+    dmsChanged = true;
+  }
+  let contactsChanged = false;
+  for (const [key, entry] of Object.entries(contacts)) {
+    if (entry.name) continue; // saved on the phone - never forgotten here
+    if (allowedKeys.has(key)) continue;
+    if (key in dmActivity) continue; // activity younger than the TTL (above)
+    delete contacts[key];
+    contactsChanged = true;
+  }
+  return { contacts: contactsChanged, dms: dmsChanged };
+}

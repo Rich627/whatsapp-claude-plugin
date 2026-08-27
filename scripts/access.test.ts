@@ -428,6 +428,29 @@ describe("groups", () => {
     expect(access(dir).groups["1@g.us"].requireMention).toBe(false);
   });
 
+  test("--no-context opts a group out of no-mention context; omitting it writes no key", () => {
+    const dir = freshStateDir();
+    run(dir, "group", "add", "1@g.us", "--no-context");
+    expect(access(dir).groups["1@g.us"].context).toBe(false);
+    // Default: the key is not materialised at all (absent = kept, 0.22.0).
+    run(dir, "group", "add", "2@g.us");
+    expect("context" in access(dir).groups["2@g.us"]).toBe(false);
+    // Merge preserves it when other flags change...
+    run(dir, "group", "add", "1@g.us", "--roster");
+    expect(access(dir).groups["1@g.us"].context).toBe(false);
+    expect(access(dir).groups["1@g.us"].roster).toBe(true);
+    // ...and --context turns it back on explicitly.
+    run(dir, "group", "add", "1@g.us", "--context");
+    expect(access(dir).groups["1@g.us"].context).toBe(true);
+  });
+
+  test("passing both --context and --no-context together is refused", () => {
+    const dir = freshStateDir();
+    const res = run(dir, "group", "add", "1@g.us", "--context", "--no-context");
+    expect(res.code).toBe(1);
+    expect(existsSync(join(dir, "access.json"))).toBe(false);
+  });
+
   test("passing both --roster and --no-roster together is refused, never silently resolved", () => {
     const dir = freshStateDir();
     const res = run(dir, "group", "add", "1@g.us", "--roster", "--no-roster");

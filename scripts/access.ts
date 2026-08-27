@@ -83,6 +83,9 @@ type GroupPolicy = {
   requireMention: boolean;
   allowFrom: string[];
   roster?: boolean;
+  // false = a no-mention message stores nothing (server.ts is the reader).
+  // Absent = kept for catch_up context, the 0.22.0 default.
+  context?: boolean;
 };
 type PendingEntry = { senderId: string; chatId: string; expiresAt: number };
 type Access = {
@@ -178,7 +181,7 @@ const USAGE = `Usage: bun scripts/access.ts <command>
   forget <jid>                    purge a cached name/activity entry, even
                                    for a JID never allowlisted (see remove)
   policy <${POLICIES.join("|")}>   set the DM policy
-  group add <groupJid> [--mention|--no-mention] [--allow a,b] [--roster|--no-roster]
+  group add <groupJid> [--mention|--no-mention] [--allow a,b] [--roster|--no-roster] [--context|--no-context]
   group rm <groupJid>             stop responding in a group (files kept)
   review                          open the access screen in a NEW terminal
                                    window, wait for it, then print what
@@ -277,7 +280,7 @@ function status(): void {
   for (const [jid, g] of groups) {
     const name = meta[jid]?.name;
     lines.push(
-      `  - ${name ? `${name}  ` : ""}${jid}  mention=${g.requireMention}  roster=${!!g.roster}`,
+      `  - ${name ? `${name}  ` : ""}${jid}  mention=${g.requireMention}  roster=${!!g.roster}${g.context === false ? "  context=false" : ""}`,
     );
   }
   process.stdout.write(lines.join("\n") + "\n");
@@ -352,6 +355,8 @@ function group(args: string[]): void {
         allow: { type: "string" },
         roster: { type: "boolean" },
         "no-roster": { type: "boolean" },
+        context: { type: "boolean" },
+        "no-context": { type: "boolean" },
         backup: { type: "boolean" },
       },
       allowPositionals: true,
@@ -366,6 +371,8 @@ function group(args: string[]): void {
     allow,
     roster = false,
     "no-roster": noRoster = false,
+    context: contextOn = false,
+    "no-context": noContext = false,
     backup,
   } = parsed.values;
   const jid = requireArg(jidArg, "group JID");
@@ -374,6 +381,8 @@ function group(args: string[]): void {
   // ambiguous, never silently resolved one way.
   if (mention && noMention) die("Cannot pass both --mention and --no-mention.");
   if (roster && noRoster) die("Cannot pass both --roster and --no-roster.");
+  if (contextOn && noContext)
+    die("Cannot pass both --context and --no-context.");
   const a = load();
   if (sub === "rm") {
     if (!a.groups[jid]) {
@@ -414,11 +423,16 @@ function group(args: string[]): void {
         : (existing?.allowFrom ?? []),
     roster: roster ? true : noRoster ? false : (existing?.roster ?? false),
   };
+  // Unlike roster, absent means ON here (0.22.0 shipped context kept), so
+  // the key is only materialised once someone has actually set it - a
+  // policy that never mentioned context stays byte-identical.
+  const contextVal = contextOn ? true : noContext ? false : existing?.context;
+  if (contextVal !== undefined) a.groups[jid].context = contextVal;
   save(a, { backup });
 
   const config = provisionGroupFiles(jid);
   process.stdout.write(
-    `${existing ? "Updated" : "Added"} ${jid} (mention required: ${a.groups[jid].requireMention}, roster: ${a.groups[jid].roster}).\nEdit its personality at ${config}\n`,
+    `${existing ? "Updated" : "Added"} ${jid} (mention required: ${a.groups[jid].requireMention}, roster: ${a.groups[jid].roster}, context kept: ${a.groups[jid].context !== false}).\nEdit its personality at ${config}\n`,
   );
 }
 

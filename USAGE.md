@@ -139,7 +139,7 @@ you have enabled). Anything you send to any other chat is discarded before its t
 read, logged or stored, and the drop itself is not recorded either — the drop path writes no
 diagnostic line and no log line. The one diagnostic line per inbound batch that precedes it masks every number to its last four digits (a group keeps its identifying form; a legacy `<number>-<timestamp>@g.us` group has its creator's number masked) and carries no message id or text; Baileys' own logging (`info`+, or `debug` under `WHATSAPP_DIAG_DEBUG=1`) is not masked by us.
 
-`catch_up` replays the last **5** messages from the other side and the last **5** of your own per chat, merged in time order, so your own texts never crowd out what the room said. In a mention-gated group it also shows what members said without addressing Claude (tagged "not addressed to Claude") - kept for context only, never routed or counted as unreplied. Your own hand-typed text is
+`catch_up` replays the last **5** messages from the other side and the last **5** of your own per chat, merged in time order, so your own texts never crowd out what the room said. In a mention-gated group it also shows what members said without addressing Claude (tagged "not addressed to Claude") - kept for context only, never routed or counted as unreplied; opt a group out of that with `group add <jid> --no-context` ([ACCESS.md](./ACCESS.md#mention-detection)) and nothing unaddressed is stored for it at all. Your own hand-typed text is
 readable for **1 hour**; after that the line collapses to `<your name> replied (text expired)` —
 the fact that you answered is still shown, the words are not. That is a display rule: the raw
 line stays in `~/.whatsapp-channel/messages.jsonl` for **7 days**, the same as every other

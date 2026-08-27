@@ -57,6 +57,14 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.22.1",
+      notes: [
+        "Mention-gated groups can now opt out of context: `group add <jid> --no-context` restores the stricter meaning of mention gating for that group - nothing members say is stored unless Claude was addressed. Groups that never set it keep context, as 0.22.0 shipped.",
+        "Someone who merely messaged the account and was never approved no longer sits in the contact caches forever: their dm-activity entry ages out after 90 days and an unapproved cached name with no recent activity goes with it. Names saved on your own phone never age out this way.",
+        "The address-book re-sync for a server holding no saved names now asks WhatsApp at most once a day, tracked across restarts - an account with genuinely nothing saved no longer requests a full contact snapshot on every reconnect.",
+      ],
+    },
+    {
       version: "0.22.0",
       notes: [
         'Fixed: the WA:<role> statusline segment was blank for the first few seconds of a session, and because Claude Code only redraws the statusline when you type, it often stayed blank until your first message. A terminal that asked for the WhatsApp channel now shows a dim WA:… straight away, and the server writes its role file earlier, so the real primary/secondary label arrives sooner. Add `"refreshInterval": 5` to your statusLine setting (see USAGE.md) and the label updates on its own instead of waiting for your next keystroke.',

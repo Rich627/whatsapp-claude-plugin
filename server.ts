@@ -69,6 +69,7 @@ import {
   hasSavedName,
   mergeContact,
   migrateContactKey,
+  pruneStrangers,
   type ContactsMap,
 } from "./scripts/contacts";
 import { looksLikeNumber, maskJid, maskNumber } from "./scripts/mask";
@@ -105,6 +106,12 @@ const DM_ACTIVITY_FILE = join(STATE_DIR, "dm-activity.json");
 const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
 // Every message id THIS server sent (see trackSent). Never an inbound id.
 const SENT_LOG = join(STATE_DIR, "sent.jsonl");
+// Epoch-ms of the last address-book resync attempt (see syncSavedNamesOnce).
+// On disk, not in memory: the in-process cooldown resets every time the
+// watchdog cycles the server, and for an account with genuinely zero saved
+// names "no name cached yet" is permanent - without this, every connect
+// would null the app-state version and demand a full snapshot forever.
+const ADDRESS_BOOK_SYNC_MARKER = join(STATE_DIR, ".addressbook-sync");
 const TASKS_FILE = join(STATE_DIR, "tasks.md");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
 const IPC_TOKEN_FILE = join(STATE_DIR, ".ipc-token");
@@ -1053,6 +1060,12 @@ type GroupPolicy = {
   // (`?? false`/`!!`) everywhere - a policy written before this field
   // existed has no `roster` key at all, not an explicit false.
   roster?: boolean;
+  // false = a no-mention message in this group is stored NOWHERE - restores
+  // the pre-0.22 meaning of mention gating ("Claude only ever sees messages
+  // that mention it"). Absent/true = kept text-only for catch_up context
+  // (routed: false), the 0.22.0 default. Read as `!== false` everywhere so
+  // a policy written before this field existed keeps context.
+  context?: boolean;
 };
 
 type Access = {
@@ -1499,9 +1512,25 @@ async function refreshGroupsMeta(
 // (lib/Socket/chats.js:824-834). A resync re-sends in full only for a
 // collection at version 0 (chats.js:376-384), so clear it first - Baileys'
 // own recovery move (chats.js:437) via its authState.keys API. Only
-// critical_unblock_low carries contactAction (chat-utils.js:440-449). Guard
-// is the cache on disk plus the reconnect-storm cooldown, never a flag.
+// critical_unblock_low carries contactAction (chat-utils.js:440-449). Guards
+// are the cache on disk, the reconnect-storm cooldown, and the once-a-day
+// on-disk marker below.
 let addressBookSyncAttemptedAt = 0;
+
+// Across restarts: one attempt per day, however often the server cycles.
+// Still self-healing (a phone that saves its first contact tomorrow gets
+// synced tomorrow), but an account with zero saved names costs one full
+// snapshot a day, not one per reconnect (#29).
+const ADDRESS_BOOK_SYNC_RETRY_MS = 24 * 60 * 60 * 1000;
+
+function lastAddressBookSyncMs(): number {
+  try {
+    const t = Number(readFileSync(ADDRESS_BOOK_SYNC_MARKER, "utf8").trim());
+    return Number.isFinite(t) ? t : 0;
+  } catch {
+    return 0;
+  }
+}
 
 async function syncSavedNamesOnce(
   activeSock: NonNullable<typeof sock>,
@@ -1511,7 +1540,16 @@ async function syncSavedNamesOnce(
   if (hasSavedName(contactsMap)) return;
   if (Date.now() - addressBookSyncAttemptedAt < GROUPS_META_CONNECT_COOLDOWN_MS)
     return;
+  if (Date.now() - lastAddressBookSyncMs() < ADDRESS_BOOK_SYNC_RETRY_MS) return;
   addressBookSyncAttemptedAt = Date.now();
+  // Written BEFORE the resync, same as the in-process stamp: a resync that
+  // throws still counts as today's attempt, or a socket that rejects it
+  // would put us right back in the retry-every-connect loop.
+  try {
+    writeFileSync(ADDRESS_BOOK_SYNC_MARKER, String(Date.now()), {
+      mode: 0o600,
+    });
+  } catch {}
   // Typed on the rc.9 socket (Socket/index.d.ts:178); checked at runtime
   // anyway so a Baileys that drops it degrades to "no names" rather than
   // throwing inside the connection handler.
@@ -1612,7 +1650,7 @@ function pruneExpired(a: Access): boolean {
 
 type GateResult =
   | { action: "deliver"; access: Access }
-  | { action: "drop"; reason?: "no-mention" }
+  | { action: "drop"; reason?: "no-mention"; keepContext?: boolean }
   | { action: "pair"; code: string; isResend: boolean };
 
 function gate(
@@ -1678,9 +1716,16 @@ function gate(
     requireMention &&
     !isMentioned(text, mentionedJids, access.mentionPatterns)
   ) {
-    // The one drop the log keeps (see handleMessage): the group is
+    // The one drop the log CAN keep (see handleMessage): the group is
     // configured and the sender is allowed, the message just was not for us.
-    return { action: "drop", reason: "no-mention" };
+    // Unless the owner opted this group out (`context: false`), in which
+    // case even this drop stores nothing - decided here, where the policy
+    // is already in hand, so handleMessage never re-reads access for a drop.
+    return {
+      action: "drop",
+      reason: "no-mention",
+      keepContext: policy.context !== false,
+    };
   }
   return { action: "deliver", access };
 }
@@ -2212,12 +2257,39 @@ function pruneSentLog(): void {
   } catch {}
 }
 
+/** Age gate-rejected strangers out of contacts.json / dm-activity.json
+ *  (#30). Rides the same hourly tick as pruneMessageLog. Reloads both maps
+ *  first, the same reason reloadContactsMap exists at all: scripts/access.ts
+ *  mutates these files between our writes. */
+function pruneStrangerCaches(): void {
+  if (!CACHE_CONTACTS) return; // nothing persists anyway
+  try {
+    reloadContactsMap();
+    reloadDmActivity();
+    const access = loadAccess();
+    // Everyone with standing approval, in the key form both caches use.
+    // Group allowFrom entries count too: someone approved for a group only
+    // is still someone the owner named, not a stranger.
+    const allowed = new Set<string>();
+    for (const jid of access.allowFrom) allowed.add(contactKey(jid));
+    for (const g of Object.values(access.groups))
+      for (const jid of g.allowFrom ?? []) allowed.add(contactKey(jid));
+    if (ownJid) allowed.add(contactKey(ownJid));
+    const changed = pruneStrangers(contactsMap, dmActivity, allowed);
+    if (changed.contacts) saveContactsMap();
+    if (changed.dms) saveDmActivity();
+  } catch (err) {
+    logDiag(`${LOG_PREFIX}: stranger-cache prune failed: ${err}\n`);
+  }
+}
+
 /** Prune the log: open inbounds after 24h, context lines after 7 days (keepLogLine) */
 function pruneMessageLog(): void {
   // First: pruneMessageLog returns early when messages.jsonl does not exist
   // yet, and sent.jsonl can exist without it (pairing notices go to chats
   // that are never logged).
   pruneSentLog();
+  pruneStrangerCaches();
   try {
     if (!existsSync(MESSAGE_LOG)) return;
     // Two lifetimes, decided in lib/message-view.ts: a routed inbound is a
@@ -3518,7 +3590,7 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
     // room when the owner wants to write to it. It is never routed, notified
     // or counted as unreplied - `routed: false` is what getUnreplied and the
     // catch_up counter key on. Every other drop reason stores nothing.
-    if (isGroup && result.reason === "no-mention") {
+    if (isGroup && result.reason === "no-mention" && result.keepContext) {
       // Same content rule as the delivered path: real media becomes
       // "(image)" etc.; reactions, edits, revokes and poll updates carry no
       // content and are not kept.
