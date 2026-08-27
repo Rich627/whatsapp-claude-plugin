@@ -2629,7 +2629,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           {
             name: "catch_up",
             description:
-              'Recover conversation context. Pass `chat` (a chat_id, or part of a group or contact name, case-insensitive) to get ONE chat - do this before drafting a message to someone, so the room is in view without dumping every chat. Without `chat`: every chat. For every chat with a line still in the log (up to 7 days of context; a message addressed to you lives 24h), returns the recent messages in BOTH directions (sender name for incoming, "You" for a reply this agent sent, and the owner\'s own name for a message they typed on their phone — those show only their most recent hour, older ones read "replied (text expired)"), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
+              'Recover conversation context. Pass `chat` (a chat_id, or part of a group or contact name, case-insensitive) to get ONE chat - do this before drafting a message to someone, so the room is in view without dumping every chat. Without `chat`: every chat. For every chat with a line still in the log (up to 7 days of context; an unanswered message addressed to you lives 24h), returns the recent messages in BOTH directions (sender name for incoming, "You" for a reply this agent sent, and the owner\'s own name for a message they typed on their phone — those show only their most recent hour, older ones read "replied (text expired)"), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
             inputSchema: {
               type: "object",
               properties: {
@@ -3639,7 +3639,10 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   const access = result.access;
 
   // ─── In-chat commands ───────────────────────────────────────────────
-  if (text.trim().toLowerCase() === "/new") {
+  // Every block below that ACTS on a message is skipped for a replayed
+  // backlog message: the pile from while we were offline is read, never
+  // answered (see the messages.upsert handler).
+  if (!backlog && text.trim().toLowerCase() === "/new") {
     if (sock) {
       await sendTracked(remoteJid, {
         text: "🔄 Context cleared. Starting fresh.",
@@ -3680,7 +3683,7 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   // swallowing a real message — sender sees a tick, agent never sees the
   // text — is worse than missing an approval. On clients that never send
   // permission requests, nothing is listening at all.
-  const permMatch = PERMISSION_REPLY_RE.exec(text);
+  const permMatch = backlog ? null : PERMISSION_REPLY_RE.exec(text);
   if (permMatch && claimPermission(permMatch[2]!.toLowerCase())) {
     void mcp.notification({
       method: "notifications/claude/channel/permission",
@@ -3704,14 +3707,14 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   }
 
   // Ack reaction
-  if (access.ackReaction && sock && messageId) {
+  if (!backlog && access.ackReaction && sock && messageId) {
     void sendTracked(remoteJid, {
       react: { text: access.ackReaction, key: msg.key },
     }).catch(() => {});
   }
 
   // Typing indicator
-  if (sock) {
+  if (sock && !backlog) {
     void sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
   }
 
