@@ -155,41 +155,11 @@ describe("end-to-end (real processes)", () => {
 
   // A live process carrying `marker` in its command line, so a role file
   // named after it survives the liveness filter the way a real server's does.
-  // `ps` shows the command only once the exec has landed, so wait for it
-  // rather than racing it.
-  async function spawnFakeServer(
-    marker: string,
-  ): Promise<ReturnType<typeof spawn>> {
-    const child = spawn(
-      "bun",
-      ["-e", `/*${marker}*/ setTimeout(() => {}, 30000)`],
-      { stdio: "ignore" },
-    );
-    for (let i = 0; i < 100; i++) {
-      try {
-        const out = execFileSync(
-          "ps",
-          ["-p", String(child.pid), "-o", "command="],
-          {
-            encoding: "utf8",
-          },
-        );
-        if (out.includes(marker)) return child;
-      } catch {}
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    child.kill();
-    throw new Error(`fake server ${marker} never showed up in ps`);
-  }
-
-  // Same purpose as spawnFakeServer (a live process carrying `marker` in its
-  // command line), but confirmed ready via its OWN stdout signal instead of
-  // polling external `ps` - the same technique the two-hop wrapper test below
-  // already relies on. Process creation supplies the full command line up
-  // front on this platform (no exec-replacement gap to race), so a stdout
-  // signal is enough proof the process exists and PowerShell's CIM query
-  // will already see it.
-  function spawnReady(marker: string): Promise<ReturnType<typeof spawn>> {
+  // Confirmed ready via its OWN stdout signal rather than polling `ps` (which
+  // Windows lacks) - the same technique the two-hop wrapper test below relies
+  // on: by the time the child has printed, its exec has landed, so both `ps`
+  // and PowerShell's CIM query already show the command line.
+  function spawnFakeServer(marker: string): Promise<ReturnType<typeof spawn>> {
     return new Promise((resolve, reject) => {
       const child = spawn(
         "bun",
@@ -368,9 +338,9 @@ describe("end-to-end (real processes)", () => {
   // acceptance criteria only ever exercised by hand.
   test("a live stamped role always beats the pending marker", async () => {
     const channelMarker = `WA_CHANNEL_${process.pid}`;
-    const askedForChannel = await spawnReady(channelMarker);
+    const askedForChannel = await spawnFakeServer(channelMarker);
     const marker = `WA_FAKE_${process.pid}_stamp_beats_marker`;
-    const server = await spawnReady(marker);
+    const server = await spawnFakeServer(marker);
     try {
       const dir = freshStateDir();
       writeFileSync(
@@ -401,7 +371,7 @@ describe("end-to-end (real processes)", () => {
   // through to the marker there would be a guess the spec forbids.
   test("a garbage tree-fallback role file does not fall through to the marker", async () => {
     const channelMarker = `WA_CHANNEL_${process.pid}_b`;
-    const askedForChannel = await spawnReady(channelMarker);
+    const askedForChannel = await spawnFakeServer(channelMarker);
     const wrapperMarker = `WA_WRAPPER_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     const serverMarker = `WA_SERVER_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     const wrapper = spawn(
@@ -467,7 +437,7 @@ describe("end-to-end (real processes)", () => {
   // case in this file pins it to a sentinel on purpose (see runStatusline's
   // comment), so this is the one place the real string is deliberately live.
   test("prints the pending marker when an ancestor asked for the channel", async () => {
-    const askedForChannel = await spawnReady(
+    const askedForChannel = await spawnFakeServer(
       "plugin:whatsapp-channel@whatsapp-claude-plugin",
     );
     try {

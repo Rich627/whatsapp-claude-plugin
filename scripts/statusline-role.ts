@@ -303,11 +303,10 @@ export function pendingRoleFromAncestors(
 // "starting" has no role to name yet - it means the server is coming up, or
 // this terminal asked for the channel and nothing has answered. One ellipsis
 // glyph, dim, so the first paint is never blank and never claims a role.
-const LABEL: Record<string, string> = { starting: "…" };
-
 export function formatSegment(role: string): string {
   const color = COLOR[role];
-  return color ? `${color}WA:${LABEL[role] ?? role}${RESET}` : "";
+  const label = role === "starting" ? "…" : role;
+  return color ? `${color}WA:${label}${RESET}` : "";
 }
 
 // Every role file in the state dir whose server is still running. Missing
@@ -375,10 +374,10 @@ function main(): void {
       WRAPPER_MATCH,
       SERVER_MATCH,
     );
-    const roleFile = pid === null ? "" : join(STATE_DIR, `.role-${pid}`);
+    const roleFile = pid === null ? null : join(STATE_DIR, `.role-${pid}`);
     // Line 1 only: a stamped file has the owner pid on line 2.
     const tree =
-      roleFile && existsSync(roleFile)
+      roleFile !== null && existsSync(roleFile)
         ? readFileSync(roleFile, "utf8").split("\n")[0]!.trim()
         : "";
     // Last: neither path found a role file for this terminal, so fall back to

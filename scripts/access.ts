@@ -93,19 +93,21 @@ type Access = {
   [key: string]: unknown;
 };
 
+const EMPTY_ACCESS: Access = {
+  dmPolicy: "pairing",
+  allowFrom: [],
+  groups: {},
+  pending: {},
+};
+
 function load(): Access {
-  const empty: Access = {
-    dmPolicy: "pairing",
-    allowFrom: [],
-    groups: {},
-    pending: {},
-  };
-  if (!existsSync(ACCESS_FILE)) return empty;
+  // A copy: callers mutate what load() hands back.
+  if (!existsSync(ACCESS_FILE)) return structuredClone(EMPTY_ACCESS);
   try {
     const parsed = JSON.parse(readFileSync(ACCESS_FILE, "utf8")) as
       Partial<Access> | undefined;
     return {
-      ...empty,
+      ...EMPTY_ACCESS,
       ...parsed,
       allowFrom: parsed?.allowFrom ?? [],
       groups: parsed?.groups ?? {},
@@ -428,7 +430,14 @@ const PRIVACY_DISCLOSURE =
 // run from a repo checkout, so "bun scripts/access.ts" resolves to nothing
 // there. Printed only after a write, and it is the same one-step undo the
 // in-session `review` launcher points at (skills/access/SKILL.md, `undo`).
-const UNDO_HINT = `Changed your mind? Run \`${wizardCmd(join(import.meta.dir, ".."))} --undo --dry-run\` to see what would come back, then the same command without --dry-run.`;
+const WIZARD_CMD = wizardCmd(join(import.meta.dir, ".."));
+const UNDO_HINT = `Changed your mind? Run \`${WIZARD_CMD} --undo --dry-run\` to see what would come back, then the same command without --dry-run.`;
+
+const isEmpty = (d: AccessDiff): boolean =>
+  !d.added.groups.length &&
+  !d.added.dms.length &&
+  !d.removed.groups.length &&
+  !d.removed.dms.length;
 
 const NOTHING_TO_REVIEW =
   "Nothing to review - no group or contact activity is cached yet and nothing is " +
@@ -502,13 +511,12 @@ async function wizard(args: string[]): Promise<void> {
     const configuredDms = listConfiguredDms(a.allowFrom, contacts, lidMap);
     const configuredDmJids = new Set(configuredDms.map((c) => c.jid));
 
-    // Eligible-but-archived, counted the same way rankGroups filters: a group
-    // already configured was never a candidate, archived or not.
-    const hiddenArchived = includeArchived
-      ? 0
-      : Object.entries(meta).filter(
-          ([jid, g]) => g.archived && !configuredGroupJids.has(jid),
-        ).length;
+    // Eligible-but-archived: the uncapped pool minus what is being shown,
+    // so a configured group is never counted (rankGroups drops it either
+    // way) and --include-archived makes this 0 by construction.
+    const hiddenArchived =
+      rankGroups(meta, configuredGroupJids, true).length -
+      groupCandidates.length;
 
     // Order of these three exits is load-bearing (see access.test.ts): (1)
     // truly nothing to review, whether or not there is a terminal - the
@@ -602,13 +610,9 @@ async function wizard(args: string[]): Promise<void> {
 
       const shown = { groups: configuredGroupJids, dms: configuredDmJids };
       const before = load();
-      const d = diffAccess(before, applySelection(before, res, shown));
-      const nothing =
-        d.added.groups.length === 0 &&
-        d.added.dms.length === 0 &&
-        d.removed.groups.length === 0 &&
-        d.removed.dms.length === 0;
-      if (nothing) {
+      const proposed = applySelection(before, res, shown);
+      const d = diffAccess(before, proposed);
+      if (isEmpty(d)) {
         process.stdout.write(
           "\nNothing changed - your ticks match what was already set up.\n",
         );
@@ -616,31 +620,11 @@ async function wizard(args: string[]): Promise<void> {
         return;
       }
 
-      // Labels from the lists that were on screen; masked fallback otherwise -
-      // same rule undo() uses, and the reason a raw number never reaches this
-      // output.
-      const labels = new Map(
-        [
-          ...configuredGroups,
-          ...groupCandidates,
-          ...configuredDms,
-          ...dmCandidates,
-        ].map((c) => [c.jid, c]),
-      );
-      // formatLabel, not raw c.label: this is what the operator reads right
-      // above "Apply these changes?" - the same security rule that sanitises
-      // a drawn row/chip (self-reported names are attacker-chosen) applies
-      // to this consent list too (review finding 3).
-      const labelShown = (jid: string): string => {
-        const c = labels.get(jid);
-        if (c) return `${formatLabel(c.label)}  [${c.description}]`;
-        return jid.endsWith("@g.us") ? groupAnchor(jid) : maskNumber(jid);
-      };
+      // Same +/- lines `undo` and `review` print (deltaLines: formatLabel'd,
+      // masked fallback) - this is the consent list the operator reads right
+      // above "Apply these changes?", so it must never read differently.
       const lines = [
-        ...d.added.groups.map((j) => `+ ${labelShown(j)}`),
-        ...d.added.dms.map((j) => `+ ${labelShown(j)}`),
-        ...d.removed.groups.map((j) => `- ${labelShown(j)}`),
-        ...d.removed.dms.map((j) => `- ${labelShown(j)}`),
+        ...deltaLines(d, before, proposed),
         "(+ = access this grants, - = access this takes away)",
       ];
       process.stdout.write(`\n${lines.join("\n")}\n`);
@@ -721,20 +705,17 @@ const PICKER_OPENING =
 
 const PICKER_NO_CHANGE =
   "Nothing changed - the access screen was closed without applying anything.\n" +
-  "If the window closed by itself, run " +
-  `${wizardCmd(join(import.meta.dir, ".."))} ` +
-  "in your own terminal to see why.";
+  `If the window closed by itself, run ${WIZARD_CMD} in your own terminal to see why.`;
 
 const PICKER_STILL_OPEN =
   "The access screen is still open after 30 minutes - nothing has been reported back. " +
   "Finish in that window, then run review again.";
 
-// D2. `wizardCmd(join(import.meta.dir, ".."))` is the same resolved absolute
-// command UNDO_HINT already uses - a marketplace install is not a repo
-// checkout.
-const PICKER_NO_LAUNCHER = (cmd: string) =>
+// D2. WIZARD_CMD is the resolved absolute command - a marketplace install is
+// not a repo checkout.
+const PICKER_NO_LAUNCHER =
   "Could not open a terminal window from here.\n" +
-  `Run this in your own terminal, then come back:\n  ${cmd}\n` +
+  `Run this in your own terminal, then come back:\n  ${WIZARD_CMD}\n` +
   "Nothing was changed.";
 
 const PICKER_ONLY_DELTA =
@@ -779,15 +760,14 @@ function pickerLaunch(): Launch | null {
     return { cmd: "cmd", args: ["/c", "start", "", ...argv] };
   }
   if (process.platform === "darwin") {
-    // wizardCmd() is already `bun "<abs>" wizard` with the path quoted;
+    // WIZARD_CMD is already `bun "<abs>" wizard` with the path quoted;
     // JSON.stringify then escapes " and \ exactly the way an AppleScript
     // string literal does.
-    const sh = wizardCmd(join(import.meta.dir, ".."));
     return {
       cmd: "osascript",
       args: [
         "-e",
-        `tell application "Terminal" to do script ${JSON.stringify(sh)}`,
+        `tell application "Terminal" to do script ${JSON.stringify(WIZARD_CMD)}`,
       ],
     };
   }
@@ -804,11 +784,7 @@ function pickerLaunch(): Launch | null {
 // candidate list (brief, "Security surface"). Takes no arguments: nothing
 // that could come from a WhatsApp message reaches the launched command line.
 async function review(args: string[]): Promise<void> {
-  try {
-    parseArgs({ args, options: {}, allowPositionals: false });
-  } catch (err) {
-    die(`${(err as Error).message}\n\n${USAGE}`);
-  }
+  if (args.length) die(`review takes no arguments.\n\n${USAGE}`);
 
   // Before anything is launched, so a marker left by an earlier run can
   // never short-circuit this one.
@@ -817,9 +793,7 @@ async function review(args: string[]): Promise<void> {
   const before = load();
   const launch = pickerLaunch();
   if (!launch) {
-    process.stdout.write(
-      PICKER_NO_LAUNCHER(wizardCmd(join(import.meta.dir, ".."))) + "\n",
-    );
+    process.stdout.write(PICKER_NO_LAUNCHER + "\n");
     process.exit(2);
   }
 
@@ -835,9 +809,7 @@ async function review(args: string[]): Promise<void> {
   // the child at ~/.whatsapp-channel instead.
   const res = spawnSync(launch.cmd, launch.args, { stdio: "inherit" });
   if (res.error || res.status !== 0) {
-    process.stdout.write(
-      PICKER_NO_LAUNCHER(wizardCmd(join(import.meta.dir, ".."))) + "\n",
-    );
+    process.stdout.write(PICKER_NO_LAUNCHER + "\n");
     process.exit(2);
   }
 
@@ -853,12 +825,7 @@ async function review(args: string[]): Promise<void> {
 
   const after = load();
   const d = diffAccess(before, after);
-  const nothing =
-    d.added.groups.length === 0 &&
-    d.added.dms.length === 0 &&
-    d.removed.groups.length === 0 &&
-    d.removed.dms.length === 0;
-  if (nothing) {
+  if (isEmpty(d)) {
     process.stdout.write(PICKER_NO_CHANGE + "\n");
     return;
   }
@@ -913,20 +880,16 @@ function deltaLines(d: AccessDiff, a: Access, b: Access): string[] {
     const description = c?.description ?? fallback(jid);
     return `${label}  [${description}]`;
   };
-  const lines: string[] = [];
-  for (const jid of d.added.groups) {
-    lines.push(`+ ${line(jid, groupLabels, groupAnchor)}`);
-  }
-  for (const jid of d.added.dms) {
-    lines.push(`+ ${line(jid, dmLabels, maskNumber)}`);
-  }
-  for (const jid of d.removed.groups) {
-    lines.push(`- ${line(jid, groupLabels, groupAnchor)}`);
-  }
-  for (const jid of d.removed.dms) {
-    lines.push(`- ${line(jid, dmLabels, maskNumber)}`);
-  }
-  return lines;
+  return (
+    [
+      ["+", d.added.groups, groupLabels, groupAnchor],
+      ["+", d.added.dms, dmLabels, maskNumber],
+      ["-", d.removed.groups, groupLabels, groupAnchor],
+      ["-", d.removed.dms, dmLabels, maskNumber],
+    ] as const
+  ).flatMap(([sign, jids, labels, fallback]) =>
+    jids.map((jid) => `${sign} ${line(jid, labels, fallback)}`),
+  );
 }
 
 function undo(args: string[]): void {
@@ -953,13 +916,7 @@ function undo(args: string[]): void {
   // and the restore still works.
   const currentBytes = existsSync(ACCESS_FILE)
     ? readFileSync(ACCESS_FILE)
-    : Buffer.from(
-        JSON.stringify(
-          { dmPolicy: "pairing", allowFrom: [], groups: {}, pending: {} },
-          null,
-          2,
-        ) + "\n",
-      );
+    : Buffer.from(JSON.stringify(EMPTY_ACCESS, null, 2) + "\n");
   const bakBytes = readFileSync(ACCESS_BAK_FILE);
   let current: Access;
   let bak: Access;
@@ -976,12 +933,7 @@ function undo(args: string[]): void {
     );
   }
   const d = diffAccess(current, bak);
-  if (
-    d.added.groups.length === 0 &&
-    d.added.dms.length === 0 &&
-    d.removed.groups.length === 0 &&
-    d.removed.dms.length === 0
-  ) {
+  if (isEmpty(d)) {
     process.stdout.write(
       "The previous access.json is identical to the current one - undo would change nothing.\n",
     );

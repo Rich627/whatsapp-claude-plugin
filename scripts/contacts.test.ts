@@ -238,31 +238,24 @@ describe("resolveByName", () => {
 });
 
 describe("hasSavedName", () => {
-  test("empty cache has no saved name", () => {
+  test("only a non-empty .name counts; notify-only, empty-string and an empty cache do not", () => {
     expect(hasSavedName({})).toBe(false);
-  });
-
-  test("a notify-only cache still counts as having no saved name", () => {
     // The exact state this check exists for: entries exist (everyone who has
     // ever messaged the account), but not one of them is a name the owner
     // saved, so nothing can be resolved by name yet.
-    const map: ContactsMap = {
-      "a@s.whatsapp.net": { notify: "aki_98" },
-      "b@s.whatsapp.net": { notify: "neha" },
-    };
-    expect(hasSavedName(map)).toBe(false);
-  });
-
-  test("one saved name anywhere in the map is enough", () => {
-    const map: ContactsMap = {
-      "a@s.whatsapp.net": { notify: "aki_98" },
-      "b@s.whatsapp.net": { name: "Akash", notify: "aki_98" },
-    };
-    expect(hasSavedName(map)).toBe(true);
-  });
-
-  test("an empty-string name is not a saved name", () => {
+    expect(
+      hasSavedName({
+        "a@s.whatsapp.net": { notify: "aki_98" },
+        "b@s.whatsapp.net": { notify: "neha" },
+      }),
+    ).toBe(false);
     // Same rule mergeContact enforces: "" means "not provided", never a name.
     expect(hasSavedName({ "a@s.whatsapp.net": { name: "" } })).toBe(false);
+    expect(
+      hasSavedName({
+        "a@s.whatsapp.net": { notify: "aki_98" },
+        "b@s.whatsapp.net": { name: "Akash", notify: "aki_98" },
+      }),
+    ).toBe(true);
   });
 });

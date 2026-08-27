@@ -85,13 +85,13 @@ Baileys 7 uses LID (Local Identifier) format alongside phone JIDs. The same pers
 
 With it off, name resolution and masking still work for the lifetime of the running server (built fresh each run from WhatsApp's own contact sync), it just isn't written to disk — so a restart starts blank again and the wizard's contact screen has nothing to rank. Either way, `WHATSAPP_ACCESS_MODE=static` disables this cache regardless of `WHATSAPP_CACHE_CONTACTS` — a static deployment can't be made to write local state by an env var. The recency cache the wizard ranks by (`dm-activity.json`) follows the same switch, since it's the same kind of per-sender data — including for a sender the access gate rejected, which is exactly what the opt-out is there for.
 
-Names sync once, on first connect. WhatsApp hands a linked device the names you saved on your phone only during the contact sync it runs when the device is linked, and never repeats it on a reconnect — so a server linked before this cache existed had names for nobody. When the server connects and its cache holds no saved name at all, it now asks WhatsApp to send that contact list again from the top, once, and logs how many names arrived (`address book synced: 3 saved name(s)` — a count, never a name or a number). It stops asking as soon as the cache holds a saved name, and never asks more than once every five minutes even if none ever arrive (a phone with no saved contacts), so it is a one-off, not something that repeats on every reconnect; with `WHATSAPP_CACHE_CONTACTS=0` or in static mode it never runs at all. This is the one place the cache grows beyond people who have messaged you: after the sync, `contacts.json` holds the names of everyone saved on your phone, whether or not they ever wrote to this number - on your disk only, never sent anywhere. What this cannot bring back is the order of your chat list — that arrives only with the one-time history sync at linking, and WhatsApp offers no way to re-fetch it, so the wizard ranks by the DM activity it has seen since.
+Saved names sync on connect only when the cache holds no saved name at all (WhatsApp otherwise sends them just once, at linking); the server asks for the contact list again, logs a count (`address book synced: 3 saved name(s)` — never a name or number), and stops asking once one is cached. It never asks more than once every five minutes, and never runs with `WHATSAPP_CACHE_CONTACTS=0` or in static mode. After it, `contacts.json` holds the names of everyone saved on your phone, on your disk only. Chat-list order cannot be re-fetched, so the wizard ranks by the DM activity it has seen since.
 
 **Names may reach the AI model; raw phone numbers should not.** When you ask Claude to reply and mention someone, it can use a saved name (`"Akash"`) instead of a number — that name is what appears in Claude's context. Anywhere a number would otherwise be shown to a human (an ambiguous-name error, `group_roster` for someone with no saved name) it's masked to the last 4 digits (`•••••5122`) before it's built into any string, not filtered afterward.
 
 This is a **best-effort mitigation, not a hard guarantee**: it depends on a saved contact actually being a name and not, say, a phone number typed into the name field, and on `.notify` not being trusted in place of it (checked explicitly for group rosters — see below). If you'd rather no name data ever reaches an AI model at all, don't grant any group `roster` access and use raw JIDs/numbers in `mentions` instead of names.
 
-The in-session `review` opens the same terminal screen in a new window, so the candidate lists never enter the session at all — only the `+`/`-` list comes back, by saved name or masked number.
+The in-session `review` (see the wizard section below) never lets the candidate lists enter the session — only the `+`/`-` list comes back, by saved name or masked number.
 
 ## Group roster & @all mentions
 
@@ -123,9 +123,6 @@ a new grant.
 **It needs a real terminal.** Run it through a pipe or from inside an AI session and
 it says so and exits, rather than hanging.
 
-No caps any more: both columns list everything on record and scroll - the search line
-is how you reach a long list without paging through it.
-
 `/whatsapp-channel:access review` opens this same screen in a new terminal window, waits for you, and reports back only what changed; `bun scripts/access.ts undo` (or `wizard --undo`) is still the one step back.
 
 - Roster is still asked only for groups you are granting in this run - flag one with
@@ -153,9 +150,6 @@ habit or an old note does not break.
   entry goes. `remove <jid>` still forgets a cached name (unchanged), and
   `forget <jid>` still clears one deliberately - see "Removing someone already
   granted access" below.
-- Ctrl-C cancels cleanly, and nothing is written until you approve the `+`/`-` list.
-
-The in-session path opens this very screen, so there is nothing left to disagree about what is configured or what a revoke cleans up.
 
 Group/contact names and recency come from caches (`~/.whatsapp-channel/groups-meta.json`, `dm-activity.json`, `contacts.json`) that only the running server writes — automatically, as WhatsApp reports chat activity, no manual step needed once the account has connected at least once. If it's never connected yet, the wizard has nothing to show; pair it first. `groups-meta.json` is always written; `dm-activity.json` and `contacts.json` follow `WHATSAPP_CACHE_CONTACTS`, which is on unless you set it to `0` (see "Names and privacy" above) — with it off, the CONTACTS column has nothing to rank. The CONTACTS column lists recent DM activity first, then every contact whose _saved_ name arrived from the phone's contact sync — so someone you've never messaged is still findable by name. A number with no saved name is never offered: if it was not worth saving on the phone it is not worth a row, and a self-reported display name never earns one on its own. The only unnamed rows are numbers that are _already_ allowed — they sit at the bottom of the column, masked, so they can still be unticked. The wizard says so on screen instead of silently leaving the column empty: one line when no DM activity is on record at all, another when there is a record but nothing new in it. Its search line runs over the whole cached pool, so every contact on record is reachable without paging.
 
@@ -175,7 +169,7 @@ The `/whatsapp-channel:access` skill will point you at it if you ask for guided 
 
 ## Mention detection
 
-A message that does **not** trigger the server in such a group is still kept, text only, in `~/.whatsapp-channel/messages.jsonl` with `routed: false`, so `catch_up` can show you the room (tagged "not addressed to Claude") when you ask for a message to that group. It is never routed to the model as an inbound, never notified, never counted as unreplied, and it is kept for 7 days (an unanswered message addressed to Claude is kept for 24 hours - it is a to-do, not context). Nothing is kept for a group that is not allowlisted or for a sender the group's own `allowFrom` rejects.
+A message that does **not** trigger the server in such a group is still kept, text only, in `~/.whatsapp-channel/messages.jsonl` with `routed: false`, so `catch_up` can show you the room; it is never routed, notified or counted as unreplied (retention rules: [USAGE.md, "Your own replies"](./USAGE.md#your-own-replies)). Nothing is kept for a group that is not allowlisted or for a sender the group's own `allowFrom` rejects.
 
 In groups with `requireMention: true`, any of the following triggers the server:
 

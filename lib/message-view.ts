@@ -1,10 +1,5 @@
-// Pulled out of server.ts so the render rule is testable without its
-// connect-on-import side effects (same reason mask.ts/mentions.ts were
-// split out, see scripts/ranking.ts's own header). The window slice and the
-// owner-text expiry are pure decisions about how a stored log line renders
-// at a given moment - no I/O, nothing here mutates or re-derives the stored
-// entry. Expiry is a RENDER-TIME rule only: the log line keeps the owner's
-// original text forever, so no other code path may hide or reveal it again.
+// Pure render/retention rules for stored log lines (no I/O); split out of
+// server.ts so they are testable without its connect-on-import side effects.
 export type ViewableEntry = {
   user: string;
   text: string;
@@ -28,15 +23,6 @@ export function awaitingReply(entry: {
     !entry.replied &&
     entry.routed !== false
   );
-}
-
-/** The ONE drop the log keeps for context: a configured group's message
- *  that simply did not mention the agent. Every other drop stores nothing. */
-export function keepDroppedForContext(
-  isGroup: boolean,
-  reason: string | undefined,
-): boolean {
-  return isGroup && reason === "no-mention";
 }
 
 /** How long a log line lives. A ROUTED inbound - something addressed to
@@ -63,11 +49,7 @@ export function keepLogLine(
   if (!Number.isFinite(t)) return false;
   // An answered inbound is no longer a to-do - it is the other half of a
   // conversation whose reply we keep a week, so it stays a week too.
-  const openInbound =
-    (entry.direction ?? "in") === "in" &&
-    entry.routed !== false &&
-    entry.by !== "owner" &&
-    !entry.replied;
+  const openInbound = entry.by !== "owner" && awaitingReply(entry);
   return now - t < (openInbound ? INBOUND_TTL_MS : CONTEXT_TTL_MS);
 }
 
@@ -83,28 +65,28 @@ export const EXPIRED_TEXT = "replied (text expired)";
 /** How many messages per chat catch_up replays. */
 export const RECENT_LIMIT = 5;
 
+const byTs = <T extends { ts: string }>(a: T, b: T) => a.ts.localeCompare(b.ts);
+
 /** Last `limit` entries, oldest-first. Non-mutating. */
 export function recentWindow<T extends { ts: string }>(
   entries: T[],
   limit: number = RECENT_LIMIT,
 ): T[] {
-  return [...entries].sort((a, b) => a.ts.localeCompare(b.ts)).slice(-limit);
+  return [...entries].sort(byTs).slice(-limit);
 }
 
 /** The catch_up window per chat: the last `limit` lines from OTHERS and the
- *  last `limit` of the owner's/agent's own, merged oldest-first. One window
- *  over both directions let four of the owner's own texts crowd out what the
- *  room actually said (owner, 2026-08-27). The owner's-text privacy limit
- *  (see OWNER_TEXT_TTL_MS) is unchanged - still at most `limit` of theirs. */
+ *  last `limit` of the owner's/agent's own, merged oldest-first, so the
+ *  owner's own texts cannot crowd out what the room said (owner, 2026-08-27). */
 export function recentBothSides<
   T extends { ts: string; direction?: "in" | "out" },
 >(entries: T[], limit: number = RECENT_LIMIT): T[] {
-  const theirs = entries.filter((e) => (e.direction ?? "in") === "in");
-  const ours = entries.filter((e) => (e.direction ?? "in") === "out");
-  return recentWindow(
-    [...recentWindow(theirs, limit), ...recentWindow(ours, limit)],
-    limit * 2,
-  );
+  const sorted = [...entries].sort(byTs);
+  const isIn = (e: T) => (e.direction ?? "in") === "in";
+  return [
+    ...sorted.filter(isIn).slice(-limit),
+    ...sorted.filter((e) => !isIn(e)).slice(-limit),
+  ].sort(byTs);
 }
 
 /** How one entry renders at time `now`. The ONLY place the expiry rule and

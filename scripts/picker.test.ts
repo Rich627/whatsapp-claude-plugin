@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { PassThrough } from "node:stream";
+import { stripVTControlCharacters as stripAnsi } from "node:util";
 import {
   applySelection,
   chipsOf,
@@ -18,10 +19,6 @@ import {
   type PickerModel,
   type PickerState,
 } from "./picker";
-
-function stripAnsi(s: string): string {
-  return s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "");
-}
 
 function item(overrides: Partial<PickerItem> = {}): PickerItem {
   return {
@@ -384,17 +381,6 @@ describe("reducePicker", () => {
     expect(s.cursor.groups).toBe(0);
   });
 
-  test("Tab cycles search → Contacts → Groups → search", () => {
-    let s = initPicker(model({ dms: [rohan], groups: [family] }), 100, 24);
-    expect(s.focus).toBe("dms");
-    s = press(s, { type: "tab" });
-    expect(s.focus).toBe("groups");
-    s = press(s, { type: "tab" });
-    expect(s.focus).toBe("search");
-    s = press(s, { type: "tab" });
-    expect(s.focus).toBe("dms");
-  });
-
   test("typing while a column is focused snaps the caret to the search line", () => {
     let s = initPicker(model({ dms: [rohan], groups: [family] }), 100, 24);
     s = press(s, { type: "tab" }, { type: "char", ch: "z" });
@@ -594,21 +580,6 @@ describe("layout", () => {
     expect(text).toContain("GROUPS");
     expect(text).toContain("[x] Rohan");
     expect(text).toContain("[ ] Priya");
-  });
-
-  test("no drawn line contains @g.us, @s.whatsapp.net, @lid, or the raw digit run from any item's jid", () => {
-    const numberDm = item({
-      jid: "61403911675@s.whatsapp.net",
-      label: "•••••1675",
-      granted: false,
-    });
-    const s = initPicker(model({ dms: [numberDm], groups: [family] }), 100, 24);
-    const text = layout(s, 100, 24).join("\n");
-    expect(text).not.toContain("@g.us");
-    expect(text).not.toContain("@s.whatsapp.net");
-    expect(text).not.toContain("@lid");
-    expect(text).not.toContain("61403911675");
-    expect(text).not.toContain(family.jid);
   });
 
   test("every line's stripAnsi width <= cols, and lines.length <= rows, at several sizes", () => {

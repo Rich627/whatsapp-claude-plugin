@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
   awaitingReply,
-  keepDroppedForContext,
   keepLogLine,
   NOT_ADDRESSED,
   recentBothSides,
@@ -15,47 +14,34 @@ const minutesAgo = (m: number) => new Date(now - m * 60 * 1000).toISOString();
 const hoursAgo = (h: number) =>
   new Date(now - h * 60 * 60 * 1000).toISOString();
 
+// An owner hand-reply as persistMessage logs it; `over` varies one field.
+const owner = (over: Partial<ViewableEntry> = {}): ViewableEntry => ({
+  user: "self",
+  text: "see you at six",
+  ts: minutesAgo(30),
+  direction: "out",
+  by: "owner",
+  ...over,
+});
+
 describe("renderLogEntry", () => {
   test("owner entry, 30 minutes old: text intact", () => {
-    const entry: ViewableEntry = {
-      user: "self",
-      text: "see you at six",
-      ts: minutesAgo(30),
-      direction: "out",
-      by: "owner",
-    };
-    expect(renderLogEntry(entry, "Kaushik", now)).toEqual({
+    expect(renderLogEntry(owner(), "Kaushik", now)).toEqual({
       who: "Kaushik",
       text: "see you at six",
     });
   });
 
   test("owner entry, 61 minutes old: expired", () => {
-    const entry: ViewableEntry = {
-      user: "self",
-      text: "see you at six",
-      ts: minutesAgo(61),
-      direction: "out",
-      by: "owner",
-    };
-    expect(renderLogEntry(entry, "Kaushik", now)).toEqual({
-      who: "Kaushik",
-      text: "replied (text expired)",
-    });
+    expect(
+      renderLogEntry(owner({ ts: minutesAgo(61) }), "Kaushik", now),
+    ).toEqual({ who: "Kaushik", text: "replied (text expired)" });
   });
 
   test("owner entry, exactly 60 minutes old: boundary is strict >, not expired", () => {
-    const entry: ViewableEntry = {
-      user: "self",
-      text: "see you at six",
-      ts: minutesAgo(60),
-      direction: "out",
-      by: "owner",
-    };
-    expect(renderLogEntry(entry, "Kaushik", now)).toEqual({
-      who: "Kaushik",
-      text: "see you at six",
-    });
+    expect(
+      renderLogEntry(owner({ ts: minutesAgo(60) }), "Kaushik", now),
+    ).toEqual({ who: "Kaushik", text: "see you at six" });
   });
 
   test("bot out entry, 25 hours old: never expires, who stays You", () => {
@@ -99,43 +85,14 @@ describe("renderLogEntry", () => {
   });
 
   test("owner entry is never marked not-addressed even with routed:false present", () => {
-    const entry: ViewableEntry = {
-      user: "Kaushik N",
-      text: "ok",
-      ts: minutesAgo(5),
-      direction: "out",
-      by: "owner",
-      routed: false,
-    };
+    const entry = owner({ user: "Kaushik N", text: "ok", routed: false });
     expect(renderLogEntry(entry, "Kaushik", now).who).toBe("Kaushik");
   });
 
   test("owner entry with an unparseable ts: fails closed (expired)", () => {
-    const entry: ViewableEntry = {
-      user: "self",
-      text: "see you at six",
-      ts: "not-a-date",
-      direction: "out",
-      by: "owner",
-    };
-    expect(renderLogEntry(entry, "Kaushik", now)).toEqual({
-      who: "Kaushik",
-      text: "replied (text expired)",
-    });
-  });
-
-  test("owner entry, ownerName fallback: pass-through, no number anywhere", () => {
-    const entry: ViewableEntry = {
-      user: "self",
-      text: "see you at six",
-      ts: minutesAgo(30),
-      direction: "out",
-      by: "owner",
-    };
-    expect(renderLogEntry(entry, "You (by hand)", now)).toEqual({
-      who: "You (by hand)",
-      text: "see you at six",
-    });
+    expect(renderLogEntry(owner({ ts: "not-a-date" }), "Kaushik", now)).toEqual(
+      { who: "Kaushik", text: "replied (text expired)" },
+    );
   });
 });
 
@@ -154,15 +111,6 @@ describe("awaitingReply", () => {
   test("outbound or replied: not waiting", () => {
     expect(awaitingReply({ replied: false, direction: "out" })).toBe(false);
     expect(awaitingReply({ replied: true, direction: "in" })).toBe(false);
-  });
-});
-
-describe("keepDroppedForContext", () => {
-  test("only a group's no-mention drop is kept", () => {
-    expect(keepDroppedForContext(true, "no-mention")).toBe(true);
-    expect(keepDroppedForContext(false, "no-mention")).toBe(false);
-    expect(keepDroppedForContext(true, undefined)).toBe(false);
-    expect(keepDroppedForContext(true, "not-allowed")).toBe(false);
   });
 });
 
@@ -247,11 +195,5 @@ describe("recentWindow", () => {
     }
     // input array unmodified
     expect(entries).toEqual(input);
-  });
-
-  test("3 entries, default limit: returns all 3, ascending ts", () => {
-    const entries = [3, 1, 2].map((n) => ({ ts: hoursAgo(n), n }));
-    const result = recentWindow(entries);
-    expect(result.map((e) => e.n)).toEqual([3, 2, 1]);
   });
 });

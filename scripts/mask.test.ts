@@ -88,11 +88,14 @@ describe("maskJid", () => {
     expect(maskJid("120363427665348138@g.us")).toBe("120363427665348138@g.us");
   });
 
-  test("a LEGACY group JID has its creator's number masked, timestamp kept", () => {
+  test("a LEGACY group or broadcast JID has its creator's number masked, timestamp kept", () => {
     // The case the first version of maskJid got wrong: a bare @g.us
     // passthrough writes <creator-phone>-<created-at> to the diag log intact.
     expect(maskJid("61403911675-1443627404@g.us")).toBe(
       "•••••1675-1443627404@g.us",
+    );
+    expect(maskJid("61403911675-1443627404@broadcast")).toBe(
+      "•••••1675-1443627404@broadcast",
     );
   });
 
@@ -113,12 +116,6 @@ describe("maskJid", () => {
     expect(maskJid("status@broadcast")).toBe("status@broadcast");
     expect(maskJid("120363111111111111@newsletter")).toBe(
       "120363111111111111@newsletter",
-    );
-  });
-
-  test("a LEGACY broadcast list still has its creator's number masked", () => {
-    expect(maskJid("61403911675-1443627404@broadcast")).toBe(
-      "•••••1675-1443627404@broadcast",
     );
   });
 });

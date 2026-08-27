@@ -95,19 +95,29 @@ describe("diffAccess", () => {
     });
   });
 
-  test("identical snapshots produce four empty arrays", () => {
+  test("no difference: identical, both empty, roster-only flip, duplicate allowFrom entries", () => {
+    const EMPTY = {
+      added: { groups: [], dms: [] },
+      removed: { groups: [], dms: [] },
+    };
     const snap = { allowFrom: ["a@s.whatsapp.net"], groups: { "g1@g.us": {} } };
-    expect(diffAccess(snap, snap)).toEqual({
-      added: { groups: [], dms: [] },
-      removed: { groups: [], dms: [] },
-    });
-  });
-
-  test("two snapshots with neither allowFrom nor groups present produce four empty arrays", () => {
-    expect(diffAccess({}, {})).toEqual({
-      added: { groups: [], dms: [] },
-      removed: { groups: [], dms: [] },
-    });
+    expect(diffAccess(snap, snap)).toEqual(EMPTY);
+    expect(diffAccess({}, {})).toEqual(EMPTY);
+    // A group whose roster flag flipped but whose key is present in both is
+    // in neither bucket.
+    expect(
+      diffAccess(
+        { allowFrom: [], groups: { "g1@g.us": { roster: false } } },
+        { allowFrom: [], groups: { "g1@g.us": { roster: true } } },
+      ),
+    ).toEqual(EMPTY);
+    // No phantom add from a duplicate entry.
+    expect(
+      diffAccess(
+        { allowFrom: ["a@s.whatsapp.net"], groups: {} },
+        { allowFrom: ["a@s.whatsapp.net", "a@s.whatsapp.net"], groups: {} },
+      ),
+    ).toEqual(EMPTY);
   });
 
   test("returned arrays are sorted", () => {
@@ -119,27 +129,6 @@ describe("diffAccess", () => {
     const result = diffAccess(prev, next);
     expect(result.added.dms).toEqual(["a@s.whatsapp.net", "z@s.whatsapp.net"]);
     expect(result.added.groups).toEqual(["a@g.us", "z@g.us"]);
-  });
-
-  test("a group whose roster flag flipped but whose key is present in both is in neither bucket", () => {
-    const prev = { allowFrom: [], groups: { "g1@g.us": { roster: false } } };
-    const next = { allowFrom: [], groups: { "g1@g.us": { roster: true } } };
-    expect(diffAccess(prev, next)).toEqual({
-      added: { groups: [], dms: [] },
-      removed: { groups: [], dms: [] },
-    });
-  });
-
-  test("duplicate allowFrom entries do not produce a phantom add", () => {
-    const prev = { allowFrom: ["a@s.whatsapp.net"], groups: {} };
-    const next = {
-      allowFrom: ["a@s.whatsapp.net", "a@s.whatsapp.net"],
-      groups: {},
-    };
-    expect(diffAccess(prev, next)).toEqual({
-      added: { groups: [], dms: [] },
-      removed: { groups: [], dms: [] },
-    });
   });
 });
 
@@ -211,25 +200,22 @@ describe("rankGroups", () => {
     expect(rankGroups(meta, new Set(), false, 2)).toHaveLength(2);
   });
 
-  test("omitting the limit returns the whole pool - the total the wizard discloses", () => {
+  test("omitting the limit returns the whole pool (groups and DMs) - the total the wizard discloses", () => {
     const meta: Record<string, GroupMeta> = {};
     for (let i = 1; i <= 7; i++) {
       meta[`${i}@g.us`] = group({ name: `Group ${i}` });
     }
     expect(rankGroups(meta, new Set(), false)).toHaveLength(7);
     expect(rankGroups(meta, new Set(), false, 2)).toHaveLength(2);
-  });
 
-  test("labels are disambiguated across the WHOLE pool when uncapped", () => {
-    // A cap of 1 would only ever see one of these two, so its label would
-    // never need the disambiguation suffix - uncapped, both are visible to
-    // disambiguate() and both must come back distinct.
-    const meta = {
-      "111999@g.us": group({ name: "Team", memberCount: 4 }),
-      "222888@g.us": group({ name: "Team", memberCount: 4 }),
-    };
-    const result = rankGroups(meta, new Set(), false);
-    expect(new Set(result.map((c) => c.label)).size).toBe(2);
+    const activity: Record<string, number> = {};
+    const named: ContactsMap = {};
+    for (let i = 1; i <= 12; i++) {
+      activity[`${i}@s.whatsapp.net`] = i;
+      named[`${i}@s.whatsapp.net`] = { name: `Person ${i}` };
+    }
+    expect(rankDms(activity, named, [], {})).toHaveLength(12);
+    expect(rankDms(activity, named, [], {}, 2)).toHaveLength(2);
   });
 
   test("label includes member count and an [archived] tag when relevant", () => {
@@ -380,32 +366,6 @@ describe("rankDms", () => {
     expect(rankDms(activity, named, [], {}, 2)).toHaveLength(2);
   });
 
-  test("omitting the limit returns the whole pool - the total the wizard discloses", () => {
-    const activity: Record<string, number> = {};
-    const named: ContactsMap = {};
-    for (let i = 1; i <= 12; i++) {
-      activity[`${i}@s.whatsapp.net`] = i;
-      named[`${i}@s.whatsapp.net`] = { name: `Person ${i}` };
-    }
-    expect(rankDms(activity, named, [], {})).toHaveLength(12);
-    expect(rankDms(activity, named, [], {}, 2)).toHaveLength(2);
-  });
-
-  test("labels are disambiguated across the WHOLE pool when uncapped", () => {
-    // A cap of 1 would only ever see one of these two Alex's - uncapped,
-    // both are visible to disambiguate() and both must come back distinct.
-    const activity = {
-      "61403911675@s.whatsapp.net": 200,
-      "61432609386@s.whatsapp.net": 100,
-    };
-    const contacts: ContactsMap = {
-      "61403911675@s.whatsapp.net": { name: "Alex" },
-      "61432609386@s.whatsapp.net": { name: "Alex" },
-    };
-    const result = rankDms(activity, contacts, [], {});
-    expect(new Set(result.map((c) => c.label)).size).toBe(2);
-  });
-
   test("a saved contact with no DM activity is in the pool", () => {
     const contacts: ContactsMap = {
       "61403911675@s.whatsapp.net": { name: "Thilian" },
@@ -487,14 +447,35 @@ describe("rankDms", () => {
     ]);
   });
 
-  test("labels are disambiguated across the combined pool", () => {
-    const activity = { "61403911675@s.whatsapp.net": 100 };
+  test("labels are disambiguated across the WHOLE pool: uncapped groups, uncapped DMs, and activity + address book combined", () => {
+    // A cap of 1 would only ever see one of each pair, so its label would
+    // never need the disambiguation suffix - uncapped, both are visible to
+    // disambiguate() and both must come back distinct.
+    const distinct = (cs: { label: string }[]) =>
+      new Set(cs.map((c) => c.label)).size;
+    const meta = {
+      "111999@g.us": group({ name: "Team", memberCount: 4 }),
+      "222888@g.us": group({ name: "Team", memberCount: 4 }),
+    };
+    expect(distinct(rankGroups(meta, new Set(), false))).toBe(2);
+
+    const activity = {
+      "61403911675@s.whatsapp.net": 200,
+      "61432609386@s.whatsapp.net": 100,
+    };
     const contacts: ContactsMap = {
+      "61403911675@s.whatsapp.net": { name: "Alex" },
+      "61432609386@s.whatsapp.net": { name: "Alex" },
+    };
+    expect(distinct(rankDms(activity, contacts, [], {}))).toBe(2);
+
+    // One Alex from activity, one from the address book only.
+    const combined: ContactsMap = {
       "61403911675@s.whatsapp.net": { name: "Alex" },
       "a@s.whatsapp.net": { name: "Alex" },
     };
-    const result = rankDms(activity, contacts, [], {}, 10);
-    expect(new Set(result.map((c) => c.label)).size).toBe(2);
+    const oneActive = { "61403911675@s.whatsapp.net": 100 };
+    expect(distinct(rankDms(oneActive, combined, [], {}, 10))).toBe(2);
   });
 });
 

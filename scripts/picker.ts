@@ -10,6 +10,8 @@
 // types/values, never on access.ts. Dependency direction is one-way:
 // access.ts -> picker.ts.
 
+import { stripVTControlCharacters } from "node:util";
+
 export type PickerItem = {
   jid: string; // never drawn - only returned in the result
   label: string; // ranking.ts's label, already through formatLabel()
@@ -88,53 +90,27 @@ export function formatLabel(raw: string): string {
 }
 
 // Module level - constructing a Segmenter per call is the slow path.
-const SEGMENTER =
-  typeof Intl.Segmenter === "function"
-    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
-    : null;
+const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 function graphemes(s: string): string[] {
-  if (SEGMENTER) return [...SEGMENTER.segment(s)].map((seg) => seg.segment);
-  return [...s];
+  return [...SEGMENTER.segment(s)].map((seg) => seg.segment);
 }
 
-// East-Asian Wide/Fullwidth ranges, decided on the grapheme's first code
-// point.
-const WIDE: [number, number][] = [
-  [0x1100, 0x115f],
-  [0x2e80, 0x303e],
-  [0x3041, 0x33ff],
-  [0x3400, 0x4dbf],
-  [0x4e00, 0x9fff],
-  [0xa000, 0xa4cf],
-  [0xac00, 0xd7a3],
-  [0xf900, 0xfaff],
-  [0xfe30, 0xfe4f],
-  [0xff00, 0xff60],
-  [0xffe0, 0xffe6],
-  [0x1f300, 0x1f64f],
-  [0x1f900, 0x1f9ff],
-  [0x20000, 0x3fffd],
-];
-const ZERO_WIDTH = /\p{M}/u;
+// Cell width decided on the grapheme's first code point: marks and format
+// characters (ZWJ, variation selectors) take no cell, CJK/Hangul/kana and
+// presentation emoji take two, everything else one.
+// ponytail: unicode-property heuristic, not East_Asian_Width (JS has no
+// \p{EAW}); fullwidth ASCII (FF01-FF60) counts 1 and regional-indicator
+// flags count 1 - swap in a real EAW table if a terminal ever overlaps.
+const ZERO_WIDTH = /^[\p{M}\p{Cf}]/u;
+const WIDE =
+  /^(?!\p{Regional_Indicator})[\p{Ideographic}\p{sc=Hangul}\p{sc=Hiragana}\p{sc=Katakana}\p{Emoji_Presentation}]/u;
 function cellWidth(g: string): number {
-  const cp = g.codePointAt(0)!;
-  if (
-    ZERO_WIDTH.test(String.fromCodePoint(cp)) ||
-    (cp >= 0x200b && cp <= 0x200d) ||
-    (cp >= 0xfe00 && cp <= 0xfe0f) ||
-    (cp >= 0xe0100 && cp <= 0xe01ef)
-  ) {
-    return 0;
-  }
-  if (WIDE.some(([lo, hi]) => cp >= lo && cp <= hi)) return 2;
-  return 1;
+  if (ZERO_WIDTH.test(g)) return 0;
+  return WIDE.test(g) ? 2 : 1;
 }
 
-// The number of terminal cells `s` occupies - graphemes via Intl.Segmenter
-// (Bun has it), falling back to Array.from (code points) when it does not.
-// ponytail: first-code-point width table; flags/regional indicators count 1,
-// add 1F1E6-1F1FF if a real terminal ever overlaps on one.
+// The number of terminal cells `s` occupies.
 export function displayWidth(s: string): number {
   return graphemes(s).reduce((sum, g) => sum + cellWidth(g), 0);
 }
@@ -161,42 +137,26 @@ function takeWidth(s: string, w: number): string {
 export function truncate(s: string, w: number): string {
   if (w <= 0) return "";
   if (displayWidth(s) <= w) return s;
-  if (w === 1) return "…";
   return takeWidth(s, w - 1) + "…";
 }
 
-// Split on spaces, never mid-word unless a single word is longer than `w`
-// (in which case it's broken, cell-width safe).
+// Greedy word wrap on spaces. A single word wider than `w` gets its own
+// line and is truncated where it is drawn (renderColumn).
 function wrap(text: string, w: number): string[] {
-  if (w <= 0) return [text];
   const words = text.split(" ").filter((w2) => w2.length > 0);
   if (words.length === 0) return [""];
   const lines: string[] = [];
   let cur = "";
   for (const word of words) {
-    if (displayWidth(word) > w) {
-      if (cur) {
-        lines.push(cur);
-        cur = "";
-      }
-      let rest = word;
-      while (rest.length > 0) {
-        let piece = takeWidth(rest, w);
-        if (piece === "") piece = graphemes(rest)[0]; // wide grapheme, narrow column
-        lines.push(piece);
-        rest = rest.slice(piece.length);
-      }
-      continue;
-    }
     const candidate = cur ? `${cur} ${word}` : word;
-    if (displayWidth(candidate) > w) {
+    if (cur && displayWidth(candidate) > w) {
       lines.push(cur);
       cur = word;
     } else {
       cur = candidate;
     }
   }
-  if (cur) lines.push(cur);
+  lines.push(cur);
   return lines;
 }
 
@@ -284,11 +244,15 @@ export function selectionOf(state: PickerState): Selection {
 // `granted` and jid is not already in chips, append it; if it now equals
 // `granted`, remove it from chips. Pushes a "tick" undo entry. Shared by
 // space/enter/backspace-pop/unchip so the chip bookkeeping cannot drift.
+function toggled(set: Set<string>, v: string): Set<string> {
+  const out = new Set(set);
+  if (!out.delete(v)) out.add(v);
+  return out;
+}
+
 function toggleTick(state: PickerState, jid: string): PickerState {
   const item = findItem(state.model, jid);
-  const ticked = new Set(state.ticked);
-  if (ticked.has(jid)) ticked.delete(jid);
-  else ticked.add(jid);
+  const ticked = toggled(state.ticked, jid);
   let chips = state.chips;
   const differs = ticked.has(jid) !== item.granted;
   const inChips = chips.includes(jid);
@@ -370,12 +334,9 @@ export function reducePicker(
         ) {
           return state; // [D2]: not a ticked, not-yet-granted group -> no-op
         }
-        const roster = new Set(state.roster);
-        if (roster.has(item.jid)) roster.delete(item.jid);
-        else roster.add(item.jid);
         return {
           ...state,
-          roster,
+          roster: toggled(state.roster, item.jid),
           undo: [...state.undo, { kind: "roster", jid: item.jid }],
         };
       }
@@ -447,19 +408,11 @@ export function reducePicker(
     }
 
     case "enter": {
-      if (state.search !== "") {
-        if (state.focus === "search") {
-          const target = enterTarget(state);
-          const next = target
-            ? forceTick(state, visibleItems(state, target)[0].jid)
-            : state;
-          return resetSearch(next, "");
-        }
-        const item = highlighted(state);
-        const next = item ? forceTick(state, item.jid) : state;
-        return resetSearch(next, "");
-      }
-      return { ...state, done: "submit" };
+      if (state.search === "") return { ...state, done: "submit" };
+      // highlighted() already resolves the search-line case to enterTarget's
+      // row 0, so one path covers both the caret-in-search and column cases.
+      const item = highlighted(state);
+      return resetSearch(item ? forceTick(state, item.jid) : state, "");
     }
 
     case "esc": {
@@ -478,23 +431,10 @@ export function reducePicker(
       if (!entry) return state;
       const undo = state.undo.slice(0, -1);
       if (entry.kind === "roster") {
-        const roster = new Set(state.roster);
-        if (roster.has(entry.jid)) roster.delete(entry.jid);
-        else roster.add(entry.jid);
-        return { ...state, roster, undo };
+        return { ...state, roster: toggled(state.roster, entry.jid), undo };
       }
-      const item = findItem(state.model, entry.jid);
-      const ticked = new Set(state.ticked);
-      if (ticked.has(entry.jid)) ticked.delete(entry.jid);
-      else ticked.add(entry.jid);
-      let chips = state.chips;
-      const differs = ticked.has(entry.jid) !== item.granted;
-      const inChips = chips.includes(entry.jid);
-      if (differs && !inChips) chips = [...chips, entry.jid];
-      else if (!differs && inChips) {
-        chips = chips.filter((j) => j !== entry.jid);
-      }
-      return { ...state, ticked, chips, undo };
+      // A tick undo is the same flip as a tick, minus the undo push.
+      return { ...toggleTick(state, entry.jid), undo };
     }
 
     case "restore":
@@ -533,9 +473,6 @@ export function reducePicker(
 
     case "resize":
       return { ...state, cols: event.cols, rows: event.rows };
-
-    default:
-      return state;
   }
 }
 
@@ -556,64 +493,43 @@ export function reducePicker(
 // `esc` (or nothing, for a split mouse sequence). `ponytail:` chunk-local
 // decode; add a carry buffer in runPicker if a real terminal splits
 // sequences.
+const KEYS: Record<string, PickerEvent> = {
+  "\x03": { type: "cancel" },
+  "\r": { type: "enter" },
+  "\n": { type: "enter" },
+  "\t": { type: "tab" },
+  "\x7f": { type: "backspace" },
+  "\x08": { type: "backspace" },
+  " ": { type: "space" },
+  "\x1a": { type: "undo" },
+  "\x12": { type: "restore" },
+};
+// Final byte of a bare CSI (ESC [ X) or SS3 (ESC O X) arrow sequence.
+const SEQ: Record<string, PickerEvent> = {
+  A: { type: "up" },
+  B: { type: "down" },
+  C: { type: "tab" },
+  D: { type: "tab" },
+  Z: { type: "tab" },
+};
+
 export function decodeInput(chunk: string): PickerEvent[] {
   const events: PickerEvent[] = [];
   let i = 0;
   while (i < chunk.length) {
     const ch = chunk[i];
-    if (ch === "\x03") {
-      events.push({ type: "cancel" });
-      i++;
-      continue;
-    }
-    if (ch === "\r" || ch === "\n") {
-      events.push({ type: "enter" });
-      i++;
-      continue;
-    }
-    if (ch === "\t") {
-      events.push({ type: "tab" });
-      i++;
-      continue;
-    }
-    if (ch === "\x7f" || ch === "\x08") {
-      events.push({ type: "backspace" });
-      i++;
-      continue;
-    }
-    if (ch === " ") {
-      events.push({ type: "space" });
-      i++;
-      continue;
-    }
-    if (ch === "\x1a") {
-      events.push({ type: "undo" });
-      i++;
-      continue;
-    }
-    if (ch === "\x12") {
-      events.push({ type: "restore" });
+    const key = KEYS[ch];
+    if (key) {
+      events.push(key);
       i++;
       continue;
     }
     if (ch === "\x1b") {
-      if (i + 1 >= chunk.length) {
-        events.push({ type: "esc" });
-        i++;
-        continue;
-      }
       if (chunk[i + 1] === "O") {
-        if (i + 2 >= chunk.length) {
-          // Incomplete SS3 sequence at the end of the chunk - skipped, same
-          // known limitation as an incomplete CSI sequence above.
-          i = chunk.length;
-          continue;
-        }
-        const c3 = chunk[i + 2];
-        if (c3 === "A") events.push({ type: "up" });
-        else if (c3 === "B") events.push({ type: "down" });
-        else if (c3 === "C" || c3 === "D") events.push({ type: "tab" });
-        // any other SS3 final byte -> nothing (skipped)
+        // An incomplete SS3 at the end of the chunk is skipped (same known
+        // limitation as an incomplete CSI below); any other final byte too.
+        const ev = SEQ[chunk[i + 2] ?? ""];
+        if (ev) events.push(ev);
         i += 3;
         continue;
       }
@@ -630,23 +546,14 @@ export function decodeInput(chunk: string): PickerEvent[] {
         i = chunk.length;
         continue;
       }
-      const seq = chunk.slice(i, j + 1);
       const final = chunk[j];
       const body = chunk.slice(i + 2, j);
-      if (seq === "\x1b[A") events.push({ type: "up" });
-      else if (seq === "\x1b[B") events.push({ type: "down" });
-      else if (seq === "\x1b[C" || seq === "\x1b[D" || seq === "\x1b[Z") {
-        events.push({ type: "tab" });
-      } else if (body.startsWith("<") && (final === "M" || final === "m")) {
-        if (final === "M") {
-          const [b, x, y] = body
-            .slice(1)
-            .split(";")
-            .map((n) => Number(n));
-          if (b === 0) events.push({ type: "click", row: y - 1, col: x - 1 });
-          // b >= 64 (wheel) -> nothing
-        }
-        // release ("m") -> nothing
+      const ev = body === "" ? SEQ[final] : undefined;
+      if (ev) events.push(ev);
+      else if (body.startsWith("<") && final === "M") {
+        // SGR mouse press; release ("m") and wheel (b >= 64) -> nothing.
+        const [b, x, y] = body.slice(1).split(";").map(Number);
+        if (b === 0) events.push({ type: "click", row: y - 1, col: x - 1 });
       }
       // any other \x1b[... -> nothing (skipped)
       i = j + 1;
@@ -669,38 +576,16 @@ export function decodeInput(chunk: string): PickerEvent[] {
 // 2.6 layout / hitTest - shared rendering geometry
 // -----------------------------------------------------------------------
 
-const STRIP_ANSI = /\x1b\[[0-9;?]*[a-zA-Z]/g;
-function stripAnsi(s: string): string {
-  return s.replace(STRIP_ANSI, "");
-}
-
-function dim(s: string, color: boolean): string {
-  return color ? `\x1b[2m${s}\x1b[0m` : s;
-}
-function strike(s: string, color: boolean): string {
-  return color ? `\x1b[9m${s}\x1b[0m` : s;
-}
-function green(s: string, color: boolean): string {
-  return color ? `\x1b[32m${s}\x1b[0m` : s;
-}
-function accent(s: string, color: boolean): string {
-  return color ? `\x1b[1;32m${s}\x1b[0m` : s;
-}
+const sgr = (code: string) => (s: string, color: boolean) =>
+  color ? `\x1b[${code}m${s}\x1b[0m` : s;
+const dim = sgr("2");
+const strike = sgr("9");
+const green = sgr("32");
+const accent = sgr("1;32");
 
 function padVisible(s: string, width: number): string {
-  const visLen = displayWidth(stripAnsi(s));
+  const visLen = displayWidth(stripVTControlCharacters(s));
   return visLen >= width ? s : s + " ".repeat(width - visLen);
-}
-
-// Caps a single line to `cols` VISIBLE columns, dropping colour rather than
-// risk cutting an escape sequence in half. Applied once, at the very end of
-// render(), as the hard backstop for the "never wider than cols" guarantee -
-// every section above is already built to fit, this only catches a miss.
-// No ellipsis - it is the backstop, not a truncation.
-function capLine(line: string, cols: number): string {
-  const plain = stripAnsi(line);
-  if (displayWidth(plain) <= cols) return line;
-  return takeWidth(plain, Math.max(0, cols));
 }
 
 // startCol/endCol carry the column's screen x-range so hitTest can tell
@@ -742,9 +627,9 @@ function renderColumn(
   const lines: string[] = [];
   const rowIndex: (number | null)[] = [];
   if (visible.length === 0) {
-    const wrapped = wrap(note.trim() ? note : "(none)", Math.max(1, w));
+    const wrapped = wrap(note.trim() ? note : "(none)", w);
     for (let i = 0; i < bodyRows; i++) {
-      lines.push(dim(wrapped[i] ?? "", color));
+      lines.push(dim(truncate(wrapped[i] ?? "", w), color));
       rowIndex.push(null);
     }
     return { lines, rowIndex };
@@ -762,8 +647,7 @@ function renderColumn(
     visible.length > bodyRows && bodyRows > 1 ? bodyRows - 1 : bodyRows;
   const offset = cursorIdx < slots ? 0 : cursorIdx - slots + 1;
   const overflow = visible.length > offset + slots;
-  const itemSlots = slots;
-  for (let i = 0; i < itemSlots && offset + i < visible.length; i++) {
+  for (let i = 0; i < slots && offset + i < visible.length; i++) {
     const idx = offset + i;
     const item = visible[idx];
     const marker = focused && idx === cursorIdx ? ">" : " ";
@@ -782,14 +666,13 @@ function renderColumn(
     lines.push(`${marker}${coloredBox} ${label}${displayedTag}`);
     rowIndex.push(idx);
   }
-  while (lines.length < itemSlots) {
+  while (lines.length < slots) {
     lines.push("");
     rowIndex.push(null);
   }
   // The more-line only when a row was actually reserved for it.
   if (overflow && slots < bodyRows) {
-    const shown = offset + itemSlots;
-    const more = visible.length - shown;
+    const more = visible.length - (offset + slots);
     lines.push(dim(`… +${more} more`, color));
     rowIndex.push(null);
   }
@@ -820,11 +703,10 @@ function renderChips(
     width: number;
     xCol: number;
   };
+  const labelCap = Math.max(1, Math.min(CHIP_LABEL_CAP, maxWidth - 6));
   const all: Piece[] = chips.map((c) => {
     const sign = c.struck ? "-" : "+";
-    const labelCap = Math.max(1, Math.min(CHIP_LABEL_CAP, maxWidth - 6));
-    const label = truncate(c.label, labelCap);
-    const plain = `[${sign} ${label} ×]`;
+    const plain = `[${sign} ${truncate(c.label, labelCap)} ×]`;
     return {
       jid: c.jid,
       plain,
@@ -847,7 +729,18 @@ function renderChips(
     chosen.unshift(p);
     used += addWidth;
   }
-  const prefixPlain = droppedCount > 0 ? `+${droppedCount} more ` : "";
+  // The "+N more" prefix has to fit in the same budget - the loop above did
+  // not reserve for it, so drop leading chips until it does.
+  let prefixPlain = droppedCount > 0 ? `+${droppedCount} more ` : "";
+  while (
+    droppedCount > 0 &&
+    chosen.length > 1 &&
+    used + displayWidth(prefixPlain) > maxWidth
+  ) {
+    used -= chosen.shift()!.width + 1;
+    droppedCount++;
+    prefixPlain = `+${droppedCount} more `;
+  }
   const prefixColored = droppedCount > 0 ? dim(prefixPlain, color) : "";
   let col = displayWidth(prefixPlain);
   const ranges: { col: number; jid: string }[] = [];
@@ -975,181 +868,99 @@ function render(
   //     independent of body geometry so we can compute it up front) ---
   const full = cols >= displayWidth(FULL_FOOTER_PLAIN);
   const footer = buildFooter(full, color, state.model.hasBackup);
-  const coloredFooter = footer.colored;
-  const footerWordRanges = footer.ranges;
 
-  let lineArr: string[];
+  // Blank separator lines are optional: only as many as the height leaves
+  // over once every mandatory line has its row.
+  let blankBudget = 0;
+  const pushBlank = () => {
+    if (blankBudget > 0) {
+      lines.push("");
+      blankBudget--;
+    }
+  };
+  type Cell = {
+    col: ReturnType<typeof renderColumn>;
+    column: "dms" | "groups";
+    startCol: number;
+    endCol: number;
+  };
+  // Pushes `n` body rows and records, per row, which item each cell holds.
+  const pushRows = (
+    n: number,
+    lineOf: (i: number) => string,
+    cells: Cell[],
+  ) => {
+    for (let i = 0; i < n; i++) {
+      const row = lines.length;
+      lines.push(lineOf(i));
+      for (const { col, ...cell } of cells) {
+        const index = col.rowIndex[i];
+        if (index !== null) itemRows.push({ row, index, ...cell });
+      }
+    }
+  };
+  const column = (
+    which: "dms" | "groups",
+    w: number,
+    n: number,
+  ): ReturnType<typeof renderColumn> =>
+    renderColumn(
+      which === "dms" ? dmsVisible : groupsVisible,
+      which === "dms" ? dmsCursorIdx : groupsCursorIdx,
+      which === "dms" ? dmsFocused : groupsFocused,
+      state.ticked,
+      state.roster,
+      which === "dms" ? state.model.dmNote : state.model.groupNote,
+      w,
+      n,
+      color,
+    );
+
   if (!stacked) {
     const leftW = Math.floor((cols - 2) / 2);
     const rightX = leftW + 2;
-    const rightW = cols - rightX;
     const bodyRows = Math.max(1, rows - 6);
-    const mandatory = 4 + bodyRows;
-    const available = Math.max(0, rows - mandatory);
-    let blankBudget = Math.min(2, available);
-    const pushBlank = () => {
-      if (blankBudget > 0) {
-        lines.push("");
-        blankBudget--;
-      }
-    };
-
+    blankBudget = Math.min(2, Math.max(0, rows - (4 + bodyRows)));
     pushBlank();
     lines.push(`${padVisible("CONTACTS", leftW)}  GROUPS`);
-
-    const left = renderColumn(
-      dmsVisible,
-      dmsCursorIdx,
-      dmsFocused,
-      state.ticked,
-      state.roster,
-      state.model.dmNote,
-      leftW,
+    const left = column("dms", leftW, bodyRows);
+    const right = column("groups", cols - rightX, bodyRows);
+    pushRows(
       bodyRows,
-      color,
+      (i) => `${padVisible(left.lines[i], leftW)}  ${right.lines[i]}`,
+      [
+        { col: left, column: "dms", startCol: 0, endCol: leftW },
+        { col: right, column: "groups", startCol: rightX, endCol: cols },
+      ],
     );
-    const right = renderColumn(
-      groupsVisible,
-      groupsCursorIdx,
-      groupsFocused,
-      state.ticked,
-      state.roster,
-      state.model.groupNote,
-      rightW,
-      bodyRows,
-      color,
-    );
-    for (let i = 0; i < bodyRows; i++) {
-      const row = lines.length;
-      lines.push(
-        `${padVisible(left.lines[i] ?? "", leftW)}  ${right.lines[i] ?? ""}`,
-      );
-      if (left.rowIndex[i] !== null) {
-        itemRows.push({
-          row,
-          column: "dms",
-          index: left.rowIndex[i]!,
-          startCol: 0,
-          endCol: leftW,
-        });
-      }
-      if (right.rowIndex[i] !== null) {
-        itemRows.push({
-          row,
-          column: "groups",
-          index: right.rowIndex[i]!,
-          startCol: rightX,
-          endCol: cols,
-        });
-      }
-    }
-    pushBlank();
-    const footerRow = lines.length;
-    lines.push(coloredFooter);
-    for (const r of footerWordRanges) {
-      footerRanges.push({
-        row: footerRow,
-        action: r.action,
-        start: r.start,
-        end: r.end,
-      });
-    }
-    lineArr = lines;
   } else {
-    const w = cols;
     const bodyRows = Math.max(2, rows - 9);
     const dmsRows = Math.max(1, Math.floor(bodyRows / 2));
     const groupsRows = Math.max(1, bodyRows - dmsRows);
-    const mandatory = 5 + dmsRows + groupsRows;
-    const available = Math.max(0, rows - mandatory);
-    let blankBudget = Math.min(3, available);
-    const pushBlank = () => {
-      if (blankBudget > 0) {
-        lines.push("");
-        blankBudget--;
-      }
-    };
-
+    blankBudget = Math.min(3, Math.max(0, rows - (5 + dmsRows + groupsRows)));
     pushBlank();
     lines.push("CONTACTS");
-    const left = renderColumn(
-      dmsVisible,
-      dmsCursorIdx,
-      dmsFocused,
-      state.ticked,
-      state.roster,
-      state.model.dmNote,
-      w,
-      dmsRows,
-      color,
-    );
-    for (let i = 0; i < dmsRows; i++) {
-      const row = lines.length;
-      lines.push(left.lines[i] ?? "");
-      if (left.rowIndex[i] !== null) {
-        itemRows.push({
-          row,
-          column: "dms",
-          index: left.rowIndex[i]!,
-          startCol: 0,
-          endCol: w,
-        });
-      }
-    }
+    const left = column("dms", cols, dmsRows);
+    pushRows(dmsRows, (i) => left.lines[i], [
+      { col: left, column: "dms", startCol: 0, endCol: cols },
+    ]);
     pushBlank();
     lines.push("GROUPS");
-    const right = renderColumn(
-      groupsVisible,
-      groupsCursorIdx,
-      groupsFocused,
-      state.ticked,
-      state.roster,
-      state.model.groupNote,
-      w,
-      groupsRows,
-      color,
-    );
-    for (let i = 0; i < groupsRows; i++) {
-      const row = lines.length;
-      lines.push(right.lines[i] ?? "");
-      if (right.rowIndex[i] !== null) {
-        itemRows.push({
-          row,
-          column: "groups",
-          index: right.rowIndex[i]!,
-          startCol: 0,
-          endCol: w,
-        });
-      }
-    }
-    pushBlank();
-    const footerRow = lines.length;
-    lines.push(coloredFooter);
-    for (const r of footerWordRanges) {
-      footerRanges.push({
-        row: footerRow,
-        action: r.action,
-        start: r.start,
-        end: r.end,
-      });
-    }
-    lineArr = lines;
+    const right = column("groups", cols, groupsRows);
+    pushRows(groupsRows, (i) => right.lines[i], [
+      { col: right, column: "groups", startCol: 0, endCol: cols },
+    ]);
   }
+  pushBlank();
+  const footerRow = lines.length;
+  lines.push(footer.colored);
+  for (const r of footer.ranges) footerRanges.push({ row: footerRow, ...r });
 
-  const capped = lineArr.map((l) => capLine(l, cols)).slice(0, rows);
-  return {
-    lines: capped,
-    geometry: { itemRows, chipRanges, footerRanges, searchRow },
-  };
+  return { lines, geometry: { itemRows, chipRanges, footerRanges, searchRow } };
 }
 
-export function layout(
-  state: PickerState,
-  cols: number,
-  rows: number,
-): string[] {
-  return render(state, cols, rows).lines;
-}
+export const layout = (state: PickerState, cols: number, rows: number) =>
+  render(state, cols, rows).lines;
 
 export function hitTest(
   state: PickerState,
@@ -1257,58 +1068,51 @@ export async function runPicker(
       "\x1b[H\x1b[2J" + layout(state, state.cols, state.rows).join("\n"),
     );
   };
-  const resizable = output === process.stdout && !!output.isTTY;
-
-  let onData: ((chunk: string) => void) | undefined;
-  let onResize: (() => void) | undefined;
+  const { promise, resolve, reject } = Promise.withResolvers<PickerResult>();
+  const onData = (chunk: string) => {
+    try {
+      for (const ev of decodeInput(chunk)) {
+        state = reducePicker(state, ev);
+        const done = state.done;
+        if (done) {
+          if (done === "cancel") resolve(null);
+          else if (done === "restore") resolve({ action: "restore" });
+          else resolve({ action: "submit", ...selectionOf(state) });
+          return;
+        }
+      }
+      redraw();
+    } catch (err) {
+      reject(err);
+    }
+  };
+  const onResize = () => {
+    state = reducePicker(state, {
+      type: "resize",
+      cols: output.columns ?? state.cols,
+      rows: output.rows ?? state.rows,
+    });
+    redraw();
+  };
 
   try {
-    const result = await new Promise<PickerResult>((resolve, reject) => {
-      onData = (chunk: string) => {
-        try {
-          for (const ev of decodeInput(chunk)) {
-            state = reducePicker(state, ev);
-            if (state.done) {
-              const done = state.done;
-              if (done === "cancel") resolve(null);
-              else if (done === "restore") resolve({ action: "restore" });
-              else resolve({ action: "submit", ...selectionOf(state) });
-              return;
-            }
-          }
-          redraw();
-        } catch (err) {
-          reject(err);
-        }
-      };
-      onResize = () => {
-        state = reducePicker(state, {
-          type: "resize",
-          cols: output.columns ?? state.cols,
-          rows: output.rows ?? state.rows,
-        });
-        redraw();
-      };
-
-      input.setEncoding("utf8");
-      if (input.isTTY) input.setRawMode(true);
-      input.resume();
-      // Alt screen, hide cursor, mouse press reporting (SGR).
-      output.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h");
-      process.once("exit", restore);
-      process.once("SIGINT", onSignal);
-      process.once("SIGTERM", onSignal);
-      input.on("data", onData);
-      if (resizable) output.on("resize", onResize);
-      redraw();
-    });
-    return result;
+    input.setEncoding("utf8");
+    if (input.isTTY) input.setRawMode(true);
+    input.resume();
+    // Alt screen, hide cursor, mouse press reporting (SGR).
+    output.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h");
+    process.once("exit", restore);
+    process.once("SIGINT", onSignal);
+    process.once("SIGTERM", onSignal);
+    input.on("data", onData);
+    output.on("resize", onResize);
+    redraw();
+    return await promise;
   } finally {
-    // Reverse order of setup, always - including on throw.
-    output.write("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
-    if (onData) input.removeListener("data", onData);
-    if (resizable && onResize) output.removeListener("resize", onResize);
-    if (input.isTTY) input.setRawMode(false);
+    // Always - including on throw.
+    restore();
+    input.removeListener("data", onData);
+    output.removeListener("resize", onResize);
     input.pause();
     process.off("exit", restore);
     process.off("SIGINT", onSignal);

@@ -679,25 +679,6 @@ describe("wizard", () => {
   });
 });
 
-// Issue #1: until this existed the wizard could only ever GRANT, so an
-// existing user pointed at it by the update notice found no way to take
-// access back short of editing access.json by hand. `--revoke` is now an
-// alias for the same one-screen picker (see the "wizard" describe block
-// above) - the rest of what this used to cover (select-none, select-one,
-// the doubly-allowlisted cache-keep rule, the disclosure line) now lives in
-// picker.test.ts's reducer/e2e tests and applySelection's unit tests; the
-// cache-keep rule itself stays covered for `remove` at line 260 above, and
-// config.md surviving a revoke is covered by the `group rm` test at line 407.
-describe("wizard --revoke", () => {
-  test("nothing configured: refuses with a clear message, writes nothing", () => {
-    const dir = freshStateDir();
-    const res = run(dir, "wizard", "--revoke");
-    expect(res.code).toBe(1);
-    expect(res.out).toContain("Nothing to review");
-    expect(existsSync(join(dir, "access.json"))).toBe(false);
-  });
-});
-
 // T18: `review` opens the picker in a NEW terminal window and reports back
 // only the delta. WHATSAPP_PICKER_LAUNCH names a fixture "launcher" (a .ts
 // run under this same bun) so these tests never open a real terminal.

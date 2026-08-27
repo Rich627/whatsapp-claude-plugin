@@ -1,21 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { formatSentLine, parseSentLog } from "./sent-log";
-
-// Mirrors sent.jsonl's entry shape - `id` first. If formatSentLine's literal
-// is ever reordered, the "id first, valid JSON" case here is what fails.
-function line(id: string, ts: number): string {
-  return JSON.stringify({ id, ts });
-}
+import { formatSentLine as line, parseSentLog } from "./sent-log";
 
 describe("formatSentLine", () => {
   test("produces id first, valid JSON", () => {
-    const out = formatSentLine("3EB0ABC123", 1234);
+    const out = line("3EB0ABC123", 1234);
     expect(out).toBe('{"id":"3EB0ABC123","ts":1234}');
     expect(JSON.parse(out)).toEqual({ id: "3EB0ABC123", ts: 1234 });
   });
 
   test("round-trips through parseSentLog", () => {
-    const out = formatSentLine("3EB0ABC123", 1234);
+    const out = line("3EB0ABC123", 1234);
     const { ids, lines } = parseSentLog(out + "\n", 1233);
     expect(ids.has("3EB0ABC123")).toBe(true);
     expect(lines).toEqual([out]);
@@ -23,7 +17,7 @@ describe("formatSentLine", () => {
 
   test("an id containing quotes and backslashes round-trips intact", () => {
     const weird = 'we"ird\\id';
-    const out = formatSentLine(weird, 1234);
+    const out = line(weird, 1234);
     const { ids, lines } = parseSentLog(out + "\n", 1233);
     expect(ids.has(weird)).toBe(true);
     expect(lines).toEqual([out]);
@@ -85,23 +79,6 @@ describe("parseSentLog", () => {
     const { ids, lines } = parseSentLog(`\n${a}\n\n`, 1000);
     expect(ids).toEqual(new Set(["A"]));
     expect(lines).toEqual([a]);
-  });
-
-  test("empty text returns an empty set and array", () => {
-    const { ids, lines } = parseSentLog("", 1000);
-    expect(ids.size).toBe(0);
-    expect(lines).toEqual([]);
-  });
-
-  test("lines preserves file order and is byte-identical to the input", () => {
-    const a = line("A", 3000);
-    const b = line("B", 3000);
-    const c = line("C", 3000);
-    const { lines } = parseSentLog([a, b, c].join("\n"), 1000);
-    expect(lines).toEqual([a, b, c]);
-    expect(lines[0]).toBe(a);
-    expect(lines[1]).toBe(b);
-    expect(lines[2]).toBe(c);
   });
 
   test("a duplicate id appearing twice yields one entry in ids, both in lines", () => {

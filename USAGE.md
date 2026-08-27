@@ -76,7 +76,7 @@ After pairing, the policy auto-locks back to `allowlist`.
 
 Each group gets its own personality config at `~/.whatsapp-channel/groups/<groupJid>/config.md`. Edit that file to customize how Claude behaves in each group. Conversation memory is auto-saved to `memory.md` in the same directory.
 
-See [ACCESS.md](./ACCESS.md) for group options (`--mention`, `--allow`, `--roster`). Setting up several groups or contacts at once? Ask for `/whatsapp-channel:access review` and it opens the access screen in a new terminal window - contacts and groups side by side, everything already approved pre-ticked - and reports back only what changed. Running `bun scripts/access.ts wizard` yourself is the same screen - see [Guided bulk setup](./ACCESS.md#guided-bulk-setup-wizard).
+See [ACCESS.md](./ACCESS.md) for group options (`--mention`, `--allow`, `--roster`). Setting up several groups or contacts at once? Ask for `/whatsapp-channel:access review`, or run `bun scripts/access.ts wizard` yourself - see [Guided bulk setup](./ACCESS.md#guided-bulk-setup-wizard).
 
 ## Daily use
 
@@ -119,17 +119,17 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 
 ## Tools exposed to the assistant
 
-| Tool                  | Purpose                                                                                                                                                                                                                                                                                                                                  |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `reply`               | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (quote-reply), `files` (attachments), and `mentions` (names over raw numbers; `"all"` needs [roster access](./ACCESS.md#group-roster--all-mentions)).                                                                                                                    |
-| `react`               | Add an emoji reaction to a message by ID. Any emoji is supported.                                                                                                                                                                                                                                                                        |
-| `download_attachment` | Download media from a received message. Returns the local file path.                                                                                                                                                                                                                                                                     |
-| `edit_message`        | Edit a message the account previously sent.                                                                                                                                                                                                                                                                                              |
-| `status`              | Check connection state and get the pairing code if not yet paired.                                                                                                                                                                                                                                                                       |
-| `unreplied`           | List received messages not yet replied to.                                                                                                                                                                                                                                                                                               |
-| `catch_up`            | Context recovery; pass `chat` (a chat_id or part of a group/contact name) for one chat only - do this before drafting a message to someone. Without it: recent two-way conversation per chat (up to 7 days of context; a message addressed to Claude is kept 24h), unreplied counts, and open items from `~/.whatsapp-channel/tasks.md`. |
-| `list_groups`         | List every group the account is in, with JID, allowlist state, and roster-grant state. Also refreshes the local group name cache the access wizard reads.                                                                                                                                                                                |
-| `group_roster`        | List a group's members by saved name, or a masked number — never raw. Requires [roster access](./ACCESS.md#group-roster--all-mentions).                                                                                                                                                                                                  |
+| Tool                  | Purpose                                                                                                                                                                                                                                                                                                       |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `reply`               | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (quote-reply), `files` (attachments), and `mentions` (names over raw numbers; `"all"` needs [roster access](./ACCESS.md#group-roster--all-mentions)).                                                                                         |
+| `react`               | Add an emoji reaction to a message by ID. Any emoji is supported.                                                                                                                                                                                                                                             |
+| `download_attachment` | Download media from a received message. Returns the local file path.                                                                                                                                                                                                                                          |
+| `edit_message`        | Edit a message the account previously sent.                                                                                                                                                                                                                                                                   |
+| `status`              | Check connection state and get the pairing code if not yet paired.                                                                                                                                                                                                                                            |
+| `unreplied`           | List received messages not yet replied to.                                                                                                                                                                                                                                                                    |
+| `catch_up`            | Context recovery; pass `chat` (a chat_id or part of a group/contact name) for one chat only - do this before drafting a message to someone. Without it: recent two-way conversation per chat (retention: see "Your own replies" below), unreplied counts, and open items from `~/.whatsapp-channel/tasks.md`. |
+| `list_groups`         | List every group the account is in, with JID, allowlist state, and roster-grant state. Also refreshes the local group name cache the access wizard reads.                                                                                                                                                     |
+| `group_roster`        | List a group's members by saved name, or a masked number — never raw. Requires [roster access](./ACCESS.md#group-roster--all-mentions).                                                                                                                                                                       |
 
 ### Your own replies
 
@@ -137,12 +137,7 @@ When you answer a chat from your phone instead of asking Claude to, the server l
 too — but only for chats already on the allowlist (a DM from someone in `allowFrom`, or a group
 you have enabled). Anything you send to any other chat is discarded before its text is read: the text is never
 read, logged or stored, and the drop itself is not recorded either — the drop path writes no
-diagnostic line and no log line. (One line per inbound batch still reaches the diagnostic log
-before any of this, as it did before this feature, but every number in it is masked to its last
-four digits — no full phone number, no message id, no text. A group keeps its identifying form,
-since that is what makes an outage diagnosable, with the creator's number masked out of the
-legacy `<number>-<timestamp>` style. Baileys' own library logging, at `info` and above or `debug`
-under `WHATSAPP_DIAG_DEBUG=1`, is the library's own and is not masked by us.)
+diagnostic line and no log line. The one diagnostic line per inbound batch that precedes it masks every number to its last four digits (a group keeps its identifying form, creator's number masked) and carries no message id or text; Baileys' own logging (`info`+, or `debug` under `WHATSAPP_DIAG_DEBUG=1`) is not masked by us.
 
 `catch_up` replays the last **5** messages from the other side and the last **5** of your own per chat, merged in time order, so your own texts never crowd out what the room said. In a mention-gated group it also shows what members said without addressing Claude (tagged "not addressed to Claude") - kept for context only, never routed or counted as unreplied. Your own hand-typed text is
 readable for **1 hour**; after that the line collapses to `<your name> replied (text expired)` —
@@ -154,11 +149,7 @@ Backfill goes exactly as far as WhatsApp's own offline queue: whatever was sent 
 was connected is delivered on the next reconnect and logged then; anything older than that queue
 is gone for good.
 
-Separately, `~/.whatsapp-channel/sent.jsonl` records only the **id and timestamp** of messages the
-plugin itself has sent — never the text, phone number, or chat. It exists because WhatsApp can
-re-deliver the plugin's own recent messages after a restart, and without this record they would
-look like replies you typed yourself, wrongly clearing a chat's unreplied list. It is pruned to
-24 hours and created with owner-only permissions.
+Separately, `~/.whatsapp-channel/sent.jsonl` (owner-only, pruned to 24 hours) records only the **id and timestamp** of the plugin's own sends — never text, number or chat — so a send WhatsApp re-delivers after a restart is not mistaken for a reply you typed.
 
 ## Photos & Media
 
@@ -268,9 +259,7 @@ holds the real connection:
 
 `refreshInterval` matters: without it Claude Code only re-runs the command
 when you type, so the segment can sit on the dim `WA:…` marker (or a stale
-role) until your next message. With it, the real `primary`/`secondary` shows
-within a few seconds of the server settling, whether or not you touch the
-keyboard.
+role) until your next message.
 
 Each server records which Claude Code session owns it, so the segment reads
 ownership rather than guessing at it: the script climbs its own parent chain

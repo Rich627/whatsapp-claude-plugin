@@ -20,11 +20,7 @@ export type GroupMeta = {
 // to keep out of a transcript). Built here, next to the label, so no caller
 // has to re-derive the rule and get it wrong - the old prose spec in
 // skills/access/SKILL.md did.
-export type Candidate = {
-  jid: string;
-  label: string;
-  description: string;
-};
+export type Candidate = { jid: string; label: string; description: string };
 
 // No live WhatsApp connection here (see access.ts's file header) and
 // deliberately no Baileys import just for its JID string utilities -
@@ -334,14 +330,16 @@ export function diffAccess(
   const nextGroups = new Set(Object.keys(next.groups ?? {}));
   const prevDms = new Set(prev.allowFrom ?? []);
   const nextDms = new Set(next.allowFrom ?? []);
+  const minus = (a: Set<string>, b: Set<string>) =>
+    [...a].filter((x) => !b.has(x)).sort();
   return {
     added: {
-      groups: [...nextGroups].filter((g) => !prevGroups.has(g)).sort(),
-      dms: [...nextDms].filter((d) => !prevDms.has(d)).sort(),
+      groups: minus(nextGroups, prevGroups),
+      dms: minus(nextDms, prevDms),
     },
     removed: {
-      groups: [...prevGroups].filter((g) => !nextGroups.has(g)).sort(),
-      dms: [...prevDms].filter((d) => !nextDms.has(d)).sort(),
+      groups: minus(prevGroups, nextGroups),
+      dms: minus(prevDms, nextDms),
     },
   };
 }

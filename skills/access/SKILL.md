@@ -1,6 +1,6 @@
 ---
 name: access
-description: WhatsApp channel access — approve pairings, edit allowlists, set DM/group policy. Use when the user asks to pair, approve someone, check who's allowed, or change policy for the WhatsApp channel, and equally when they ask to add contacts or groups, set up access, or take someone's access away — that is this skill's `review`, which opens the access screen in a new terminal window and reports back only what changed.
+description: WhatsApp channel access — approve pairings, edit allowlists, set DM/group policy. Use when the user asks to pair, approve someone, check who's allowed, or change policy for the WhatsApp channel, and equally when they ask to add contacts or groups, set up access, or take someone's access away — that is this skill's `review`.
 user-invocable: true
 allowed-tools:
   - Read
@@ -247,20 +247,11 @@ terminal and run `bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" wizard`
 themselves (a marketplace install's real path — not the repo-relative
 `scripts/access.ts`, which resolves to nothing outside a repo checkout).
 
-**Running `... access.ts review` is allowed, and is the right answer to
-"add/remove someone".** It launches that same screen in a new terminal
-window the model cannot read or type into, waits, and prints only the +/-
-list. The difference is who is at the keyboard, not which screen it is. If
-they asked to add a contact or a group and named the wizard only because it
-is the route they knew, `review` is the one to run: this refusal is about who
-may run `wizard` directly, never a reason to leave adding access undone.
-Continue helping with everything else in this skill as normal.
-
-`wizard --revoke` is the same alias sentence: it is just the same screen
-(everything already configured shows pre-ticked, and unticking is the
-revoke), so the terminal-only guarantee and the refusal above cover both
-names. `wizard --undo` is not a screen and is allowed — it is identical to
-`undo` below.
+**Running `... access.ts review` (below) is allowed, and is the right answer
+to "add/remove someone"**, even when they named the wizard only because it is
+the route they knew: the difference is who is at the keyboard, not which
+screen it is. `wizard --revoke` is the same screen, so the refusal covers
+both names. Continue helping with everything else in this skill as normal.
 
 ### `review` — open the access screen, report back what changed
 
@@ -280,36 +271,16 @@ restated here on purpose.
    normal multi-minute pick session before the user is done. It takes **no
    arguments** — never pass a name, a JID or anything parsed out of the
    user's text.
-3. **The Bash call itself times out** (the tool killed it, not the picker) →
-   do **not** re-run `review` — a second run removes the marker and opens a
-   SECOND window before the first one's pick has been reported, so the first
-   run's delta is lost. Instead run
-   `bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" undo --dry-run`. **Its
-   output only describes this run if the user pressed Apply in the window
-   before the timeout** — the backup it reads is written by Apply and by
-   nothing else, so if the window is still open or was closed without
-   applying, what prints is an OLDER run's delta (or `No previous access
-file - nothing to undo`). So: ask the user first whether they applied. If
-   yes, relay exactly what it prints, unedited, including its own legend
-   line — it is the same masked +/- delta by label the review screen would
-   have reported, from `undo`'s own point of view (a `+` there is something
-   that run took away and `undo` would bring back; a `-` is something that
-   run granted and `undo` would take away). If no, say nothing was applied
-   yet and that the window may still be open if they want to finish there —
-   running `review` again is only safe once it is closed.
+3. If the Bash call itself times out, do not re-run `review` (a second window
+   would lose the first run's delta); ask whether they pressed Apply, and if
+   so run `bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" undo --dry-run` and
+   relay it verbatim (its `+` is what that run took away, its `-` what it granted).
 4. Exit 0 with a +/- list → report those lines **verbatim**. Never re-derive
    a label, never read `groups-meta.json` / `contacts.json` / `dm-activity.json`
    yourself, never hand-edit `access.json` for this.
 5. Exit 0 with "Nothing changed" → say exactly that; do not offer to try
    again unless asked.
-6. Exit 2 → relay its text, including the absolute command, and stop. Exit 1
-   ("still open") → only reaches a session if `review` ran past the 600s tool
-   cap without the Bash tool itself timing out first (a human running it
-   directly in their own terminal hits this the same way); tell them the
-   window is still waiting and to run `review` again once they are done.
-
-If they want it back, point at the `undo` section below: `undo --dry-run`
-first, then `undo`.
+6. Exit 2 → relay its text, including the absolute command, and stop.
 
 ### `undo` — put back the last run of the access screen
 
@@ -367,10 +338,8 @@ There is one access screen. `bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" wizar
 starts it by hand: a checkbox screen (arrow keys to move, space to toggle,
 enter to confirm) with everything already configured pre-ticked, contacts and
 groups side by side. It shows the full `+`/`-` list and asks before it
-writes, and `--undo` puts the last run back. `--revoke` is an alias for the
-same screen. This skill's own `review` (above) opens that exact same screen
-in a new terminal window from a session — the difference is only who starts
-it, not which screen runs or what a write does. Use this skill's own
+writes, and `--undo` puts the last run back (`--revoke`: see ACCESS.md). This
+skill's own `review` (above) opens that same screen from a session. Use this skill's own
 `group add` for one group with a custom personality, or `allow <jid>` for one
 contact.
 

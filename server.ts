@@ -58,7 +58,6 @@ import {
 import { logContainsId } from "./lib/message-log-probe";
 import {
   awaitingReply,
-  keepDroppedForContext,
   keepLogLine,
   RECENT_LIMIT,
   recentBothSides,
@@ -104,9 +103,7 @@ const CONTACTS_FILE = join(STATE_DIR, "contacts.json");
 const GROUPS_META_FILE = join(STATE_DIR, "groups-meta.json");
 const DM_ACTIVITY_FILE = join(STATE_DIR, "dm-activity.json");
 const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
-// Durable half of trackSent: every message id THIS server sent, so a restart
-// or a >5 min drop cannot make a replayed own send look like the owner typing
-// on their phone (see isOwnerHandReply). Never contains an inbound id.
+// Every message id THIS server sent (see trackSent). Never an inbound id.
 const SENT_LOG = join(STATE_DIR, "sent.jsonl");
 const TASKS_FILE = join(STATE_DIR, "tasks.md");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
@@ -1006,9 +1003,9 @@ async function becomePrimary(): Promise<void> {
   if (!STATIC) setInterval(checkApprovals, 5000).unref();
   setInterval(pruneMessageLog, 60 * 60 * 1000).unref();
   // A promoted secondary loaded sent.jsonl at ITS boot; the primary it is
-  // replacing kept appending since. Re-read before the socket opens, or its
-  // replayed sends read as hand replies (the bug this file exists to close).
-  pruneSentLog();
+  // replacing kept appending since. Re-read (pruneMessageLog -> pruneSentLog)
+  // before the socket opens, or its replayed sends read as hand replies.
+  pruneMessageLog();
   await startIpcListener();
   await connectWhatsApp();
 }
@@ -1497,48 +1494,13 @@ async function refreshGroupsMeta(
   return groups;
 }
 
-// WhatsApp delivers the names the OWNER saved on their phone
-// (contactAction.fullName -> contacts.upsert, see
-// node_modules/@whiskeysockets/baileys/lib/Utils/chat-utils.js:667) exactly
-// once: during the app-state sync Baileys runs at PAIRING, and only while its
-// own syncState is Syncing (lib/Socket/chats.js:824-834). A server that paired
-// before this cache existed dropped that single delivery, and no reconnect
-// ever repeats it - leaving contacts.json full of notify-only entries that
-// nothing can resolve by saved name.
-//
-// Asking for a plain resync is not enough: the request carries the version
-// this device last synced to, and WhatsApp answers with only what changed
-// since - nothing, on an account that already synced (chats.js:376-384). A
-// FULL re-send happens only for a collection at version 0, which is why the
-// version is cleared first. That is Baileys' own recovery move, verbatim from
-// chats.js:437 ("removing and trying from scratch"), through the same
-// authState.keys API it uses (typed on the socket, Socket/index.d.ts:203):
-// this server never opens, reads or edits a file under .baileys_auth itself.
-//
-// Only critical_unblock_low, never all five collections: that is the one
-// carrying contactAction (chat-utils.js:440-449), and a snapshot re-fires
-// EVERY mutation in whatever collection it is asked for. The other four hold
-// archive/mute/pin/star/block/privacy state this task has no use for, and
-// replaying those would push a pile of chats.update/messages.delete events
-// through the listeners for nothing.
-//
-// The guard is the CACHE ON DISK, never an in-memory "already tried" flag: a
-// connect whose sync produced nothing retries on the next connect past the
-// cooldown below, a connect
-// after one that worked does not, and both of those survive a restart, which
-// a flag cannot. Nothing here writes contacts.json itself - the existing
-// contacts.upsert listener does, exactly as it does for Baileys' own sync.
-//
-// The cooldown is the same one refreshGroupsMeta's connect call site needs
-// and for the same reason: an owner whose phone has NO saved contacts (a
-// second number run just for this plugin) never satisfies the disk guard, and
-// a flaky-network reconnect storm (backoff caps at 30s) would otherwise
-// clear the version and pull a full snapshot on every single reconnect. A
-// restart still retries at once - the timestamp lives in memory only.
-const CONTACT_PATCH_COLLECTION = "critical_unblock_low" as const;
-const ADDRESS_BOOK_FLUSH_GRACE_MS = 2000;
-const ADDRESS_BOOK_FLUSH_WAIT_MS = 60_000;
-const ADDRESS_BOOK_SYNC_COOLDOWN_MS = GROUPS_META_CONNECT_COOLDOWN_MS;
+// Saved names arrive via contactAction -> contacts.upsert (baileys
+// lib/Utils/chat-utils.js:667) only during the pairing-time app-state sync
+// (lib/Socket/chats.js:824-834). A resync re-sends in full only for a
+// collection at version 0 (chats.js:376-384), so clear it first - Baileys'
+// own recovery move (chats.js:437) via its authState.keys API. Only
+// critical_unblock_low carries contactAction (chat-utils.js:440-449). Guard
+// is the cache on disk plus the reconnect-storm cooldown, never a flag.
 let addressBookSyncAttemptedAt = 0;
 
 async function syncSavedNamesOnce(
@@ -1547,7 +1509,7 @@ async function syncSavedNamesOnce(
   if (!CACHE_CONTACTS) return;
   reloadContactsMap();
   if (hasSavedName(contactsMap)) return;
-  if (Date.now() - addressBookSyncAttemptedAt < ADDRESS_BOOK_SYNC_COOLDOWN_MS)
+  if (Date.now() - addressBookSyncAttemptedAt < GROUPS_META_CONNECT_COOLDOWN_MS)
     return;
   addressBookSyncAttemptedAt = Date.now();
   // Typed on the rc.9 socket (Socket/index.d.ts:178); checked at runtime
@@ -1555,27 +1517,17 @@ async function syncSavedNamesOnce(
   // throwing inside the connection handler.
   if (typeof activeSock.resyncAppState !== "function") return;
   await activeSock.authState.keys.set({
-    "app-state-sync-version": { [CONTACT_PATCH_COLLECTION]: null },
+    "app-state-sync-version": { critical_unblock_low: null },
   });
-  await activeSock.resyncAppState([CONTACT_PATCH_COLLECTION], true);
-  // resyncAppState is wrapped in createBufferedFunction: the contacts.upsert
-  // events it produces are flushed AFTER the promise above resolves
-  // (Utils/event-buffer.js:135-141), and a 1,200-entry snapshot took 13 s to
-  // reach disk on the first live run, so counting right away always read the
-  // pre-sync number. Poll the disk until a saved name shows up, then log.
-  // ponytail: polled log line, not an event handshake - this only affects
-  // the accuracy of one log line, never the cache itself or the guard above.
-  const startedAt = Date.now();
-  const report = () => {
+  await activeSock.resyncAppState(["critical_unblock_low"], true);
+  // The contacts.upsert events flush AFTER the promise resolves
+  // (Utils/event-buffer.js:135-141; a 1,200-entry snapshot took 13 s), so
+  // count later. ponytail: one delayed log line, never the cache itself.
+  setTimeout(() => {
     reloadContactsMap();
     const saved = Object.values(contactsMap).filter((c) => c.name).length;
-    if (saved === 0 && Date.now() - startedAt < ADDRESS_BOOK_FLUSH_WAIT_MS) {
-      setTimeout(report, ADDRESS_BOOK_FLUSH_GRACE_MS);
-      return;
-    }
     logDiag(`${LOG_PREFIX}: address book synced: ${saved} saved name(s)\n`);
-  };
-  setTimeout(report, ADDRESS_BOOK_FLUSH_GRACE_MS);
+  }, 15_000);
 }
 
 async function resolveGroupName(groupJid: string): Promise<string> {
@@ -2012,28 +1964,26 @@ function chunk(
 
 // ─── Echo detection ────────────────────────────────────────────────────
 
-const sentMessages = new Map<string, number>();
-
 // 24h: an own send only needs to be recognisable for as long as WhatsApp
 // might replay it, which is well inside a day.
 const SENT_TTL_MS = 24 * 60 * 60 * 1000;
 
-function readSentLog(): string {
-  try {
-    return existsSync(SENT_LOG) ? readFileSync(SENT_LOG, "utf8") : "";
-  } catch {
-    return "";
-  }
-}
-
 // Boot: everything this server sent in the last 24h, across restarts.
 // `let` because pruneSentLog rebuilds it from what survives the rewrite.
-let durableSentIds = parseSentLog(readSentLog(), Date.now() - SENT_TTL_MS).ids;
+let durableSentIds = (() => {
+  try {
+    return parseSentLog(
+      existsSync(SENT_LOG) ? readFileSync(SENT_LOG, "utf8") : "",
+      Date.now() - SENT_TTL_MS,
+    ).ids;
+  } catch {
+    return new Set<string>();
+  }
+})();
 
 function trackSent(key: WAMessageKey): void {
   if (!key.id) return;
   const now = Date.now();
-  sentMessages.set(key.id, now);
   durableSentIds.add(key.id);
   // Never throws into a send: a failure here degrades to today's behaviour
   // (in-memory only), it must not turn a delivered message into an error.
@@ -2047,7 +1997,7 @@ function trackSent(key: WAMessageKey): void {
 }
 
 // Every send this server makes has to be tracked, not just the reply tool's:
-// isOwnerHandReply treats "fromMe and not in sentMessages" as the owner
+// handleMessage treats "fromMe and not sent by this server" as the owner
 // typing on their phone, and Baileys' event buffer delivers a batch under
 // its FIRST entry's type, so an own `append` sharing a window with an inbound
 // `notify` arrives as notify - untracked, it would be logged as a hand reply
@@ -2061,25 +2011,10 @@ async function sendTracked(
   return sent;
 }
 
-// The Map is the fast in-memory path (5 min); durableSentIds is the same fact read
-// back from sent.jsonl and therefore survives a restart. Either one is proof
-// this server sent it.
+// durableSentIds is sent.jsonl read back, so it survives a restart; it is
+// the only real test of "this server sent it" (see trackSent).
 function wasSentByServer(id: string | null | undefined): boolean {
-  return !!id && (sentMessages.has(id) || durableSentIds.has(id));
-}
-
-function isEcho(key: WAMessageKey): boolean {
-  if (key.fromMe) return true;
-  return wasSentByServer(key.id);
-}
-
-// isEcho's `fromMe` clause treats every message from this account as our own
-// echo — including the ones the owner types on their phone. wasSentByServer is
-// the only real test of "this server sent it" (see trackSent), so a fromMe
-// message that is NOT recorded there is the owner replying by hand.
-function isOwnerHandReply(key: WAMessageKey): boolean {
-  if (!key.fromMe) return false;
-  return !wasSentByServer(key.id);
+  return !!id && durableSentIds.has(id);
 }
 
 // Fork default (owner, 2026-08-26): the owner's own display name, never the
@@ -2088,13 +2023,6 @@ function isOwnerHandReply(key: WAMessageKey): boolean {
 function ownerDisplayName(): string {
   return safeName(sock?.user?.name)?.trim() || "You (by hand)";
 }
-
-setInterval(() => {
-  const cutoff = Date.now() - 5 * 60 * 1000;
-  for (const [id, ts] of sentMessages) {
-    if (ts < cutoff) sentMessages.delete(id);
-  }
-}, 60_000).unref();
 
 // ─── Message stores (bounded) ──────────────────────────────────────────
 
@@ -2156,17 +2084,6 @@ function persistMessage(entry: MessageLogEntry): void {
     appendFileSync(MESSAGE_LOG, JSON.stringify(entry) + "\n");
   } catch (err) {
     logDiag(`${LOG_PREFIX}: failed to persist message: ${err}\n`);
-  }
-}
-
-// The probe itself lives in lib/message-log-probe.ts, with its spoofing and
-// collision cases pinned by tests; this is only the fs wrapper.
-function isAlreadyLogged(id: string): boolean {
-  try {
-    if (!existsSync(MESSAGE_LOG)) return false;
-    return logContainsId(readFileSync(MESSAGE_LOG, "utf8"), id);
-  } catch {
-    return false;
   }
 }
 
@@ -2284,7 +2201,7 @@ function pruneSentLog(): void {
   try {
     if (!existsSync(SENT_LOG)) return;
     const { ids, lines } = parseSentLog(
-      readSentLog(),
+      readFileSync(SENT_LOG, "utf8"),
       Date.now() - SENT_TTL_MS,
     );
     durableSentIds = ids;
@@ -3512,27 +3429,18 @@ async function logOwnerHandReply(msg: WAMessage): Promise<void> {
   const text = extractText(msg.message);
   if (!text) return; // media-only / reaction / protocol message — see NOTE 3
 
-  // Idempotence guard, and a PARTIAL defence against replay. `sentMessages` is
-  // in-memory and pruned at 5 minutes, so after a restart or a long drop it no
-  // longer knows our own sends - and Baileys types a whole buffered batch by
-  // its FIRST entry (see trackSent), so a replayed own send can arrive as
-  // `notify` and reach here looking exactly like the owner typing. markReplied
-  // below would then flip EVERY unreplied inbound in this chat to replied and
-  // it would silently leave `unreplied`. Our sends persist under their real
-  // message id, so an id already in the log means replay.
-  //
-  // Since 0.22.0 the primary defence is durable: trackSent records every id
-  // this server sends in sent.jsonl (24h), so wasSentByServer catches a
-  // replayed own send before it ever reaches here — chunks 2..N of a long
-  // reply, the `/new` ack and the pairing notices included, none of which
-  // reach messages.jsonl. This check stays as the second line: it also makes
-  // logOwnerHandReply idempotent for an id we genuinely did log.
-  if (msg.key.id && isAlreadyLogged(msg.key.id)) return;
+  // Idempotence: an id already in the log is a replay (second line behind
+  // wasSentByServer), or markReplied would flip this chat's unreplied to replied.
+  try {
+    if (
+      msg.key.id &&
+      existsSync(MESSAGE_LOG) &&
+      logContainsId(readFileSync(MESSAGE_LOG, "utf8"), msg.key.id)
+    )
+      return;
+  } catch {}
 
-  const tsSec =
-    typeof msg.messageTimestamp === "number"
-      ? msg.messageTimestamp
-      : Number(msg.messageTimestamp ?? 0);
+  const tsSec = Number(msg.messageTimestamp ?? 0);
   const groupName = isGroup ? await resolveGroupName(chatId) : undefined;
 
   markReplied(chatId);
@@ -3553,9 +3461,12 @@ async function logOwnerHandReply(msg: WAMessage): Promise<void> {
 async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   if (!msg.message) return;
   if (!msg.key.remoteJid) return;
-  // MUST come before isEcho: its fromMe clause would swallow this again.
-  if (isOwnerHandReply(msg.key)) return logOwnerHandReply(msg);
-  if (isEcho(msg.key)) return;
+  // fromMe: our own echo, or the owner typing on their phone.
+  if (msg.key.fromMe) {
+    if (wasSentByServer(msg.key.id)) return;
+    return logOwnerHandReply(msg);
+  }
+  if (wasSentByServer(msg.key.id)) return;
 
   const remoteJid = msg.key.remoteJid;
   // Status updates / channel broadcasts aren't DMs or groups — treating them
@@ -3606,7 +3517,7 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
     // room when the owner wants to write to it. It is never routed, notified
     // or counted as unreplied - `routed: false` is what getUnreplied and the
     // catch_up counter key on. Every other drop reason stores nothing.
-    if (keepDroppedForContext(isGroup, result.reason)) {
+    if (isGroup && result.reason === "no-mention") {
       // Same content rule as the delivered path: real media becomes
       // "(image)" etc.; reactions, edits, revokes and poll updates carry no
       // content and are not kept.
@@ -4280,13 +4191,8 @@ async function connectWhatsApp(): Promise<void> {
           `decrypted=[${ev.messages.map((m) => (m.message ? "y" : "NULL")).join(",")}] ` +
           `from=[${ev.messages
             .map((m) => {
-              // Chat first, then the sender within it. Taking `participant ??
-              // remoteJid` would drop the group entirely for group traffic
-              // (participant always wins there) - which is the one thing this
-              // line was added to make visible. A missing jid stays legible
-              // rather than masking to bullets: "did it even get here?" is
-              // exactly the case where the absence IS the finding, and •••••
-              // would hide it as a short number.
+              // Chat first, then sender: `participant ?? remoteJid` would hide
+              // the group. A missing jid stays legible - the absence IS the finding.
               const chat = m.key?.remoteJid;
               const who = m.key?.participant;
               if (!chat) return who ? maskJid(String(who)) : "undefined";
