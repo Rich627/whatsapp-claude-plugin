@@ -3572,6 +3572,61 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   // because our passive lid-mapping.update listener missed it.
   await ensureLidResolved(senderJid);
 
+  // A voice/audio message carries no caption and no native WhatsApp
+  // @-mention — `text` is empty until it is transcribed. A mention-gated
+  // group would otherwise drop it on `text` alone before anyone finds out
+  // what was actually said, even when the recording opens with the wake
+  // word. Transcribe once, here, before the gate runs, so the mention check
+  // sees real content instead of nothing. Scoped tight to avoid wasted
+  // transcription: only when the drop is otherwise certain (group,
+  // requireMention on, no native mention already) and only for live
+  // messages, matching the `!backlog` guard the normal media path uses
+  // below.
+  let earlyAudioPath: string | undefined;
+  let earlyAudioTranscript: string | null | undefined;
+  if (isGroup && !backlog && sock) {
+    const groupPolicy = loadAccess().groups[remoteJid];
+    const groupAllowFrom = groupPolicy?.allowFrom ?? [];
+    const senderAllowed =
+      groupAllowFrom.length === 0 || isAllowedJid(senderJid, groupAllowFrom);
+    const alreadyMentioned = mentionedJids.some(
+      (jid) => ownJid && jidNormalizedUser(jid) === ownJid,
+    );
+    const media =
+      groupPolicy?.requireMention && senderAllowed
+        ? classifyMedia(msg.message)
+        : null;
+    if (
+      groupPolicy?.requireMention &&
+      senderAllowed &&
+      !alreadyMentioned &&
+      (media?.kind === "voice" || media?.kind === "audio")
+    ) {
+      try {
+        const buffer = (await downloadMediaMessage(
+          msg,
+          "buffer",
+          {},
+          { reuploadRequest: sock.updateMediaMessage, logger: silentLogger },
+        )) as Buffer;
+        const ext = mimeToExt(media.mime);
+        earlyAudioPath = join(
+          INBOX_DIR,
+          `${Date.now()}-${messageId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 16)}.${ext}`,
+        );
+        writeFileSync(earlyAudioPath, buffer);
+        earlyAudioTranscript = await transcribeAudio(earlyAudioPath);
+        if (earlyAudioTranscript) {
+          text = `[Voice message] ${earlyAudioTranscript}`;
+        }
+      } catch (err) {
+        logDiag(
+          `${LOG_PREFIX}: early voice transcribe (pre-gate) failed: ${err}\n`,
+        );
+      }
+    }
+  }
+
   // Gate check
   const result = gate(remoteJid, senderJid, text, mentionedJids, !backlog);
 
@@ -3743,27 +3798,13 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
         logDiag(`${LOG_PREFIX}: image download failed: ${err}\n`);
       }
     } else if (media.kind === "voice" || media.kind === "audio") {
-      // Eager download + transcribe voice/audio messages
-      try {
-        const buffer = (await downloadMediaMessage(
-          msg,
-          "buffer",
-          {},
-          {
-            reuploadRequest: sock!.updateMediaMessage,
-            logger: silentLogger,
-          },
-        )) as Buffer;
-        const ext = mimeToExt(media.mime);
-        const audioPath = join(
-          INBOX_DIR,
-          `${Date.now()}-${messageId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 16)}.${ext}`,
-        );
-        writeFileSync(audioPath, buffer);
-        const transcript = await transcribeAudio(audioPath);
-        if (transcript) {
-          // Replace text with transcript — Claude sees it as a regular text message
-          text = `[Voice message] ${transcript}`;
+      // Eager download + transcribe voice/audio messages. A mention-gated
+      // group already did this above (pre-gate, to decide whether the
+      // message was for us at all) — reuse that result instead of
+      // downloading and transcribing the same note twice.
+      if (earlyAudioPath !== undefined) {
+        if (earlyAudioTranscript) {
+          text = `[Voice message] ${earlyAudioTranscript}`;
         } else {
           attachment = {
             kind: media.kind,
@@ -3771,13 +3812,42 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
             ...(media.mime ? { mime: media.mime } : {}),
           };
         }
-      } catch (err) {
-        logDiag(`${LOG_PREFIX}: voice download/transcribe failed: ${err}\n`);
-        attachment = {
-          kind: media.kind,
-          file_id: messageId,
-          ...(media.mime ? { mime: media.mime } : {}),
-        };
+      } else {
+        try {
+          const buffer = (await downloadMediaMessage(
+            msg,
+            "buffer",
+            {},
+            {
+              reuploadRequest: sock!.updateMediaMessage,
+              logger: silentLogger,
+            },
+          )) as Buffer;
+          const ext = mimeToExt(media.mime);
+          const audioPath = join(
+            INBOX_DIR,
+            `${Date.now()}-${messageId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 16)}.${ext}`,
+          );
+          writeFileSync(audioPath, buffer);
+          const transcript = await transcribeAudio(audioPath);
+          if (transcript) {
+            // Replace text with transcript — Claude sees it as a regular text message
+            text = `[Voice message] ${transcript}`;
+          } else {
+            attachment = {
+              kind: media.kind,
+              file_id: messageId,
+              ...(media.mime ? { mime: media.mime } : {}),
+            };
+          }
+        } catch (err) {
+          logDiag(`${LOG_PREFIX}: voice download/transcribe failed: ${err}\n`);
+          attachment = {
+            kind: media.kind,
+            file_id: messageId,
+            ...(media.mime ? { mime: media.mime } : {}),
+          };
+        }
       }
     } else {
       // Lazy download for video, documents, stickers
