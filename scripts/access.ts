@@ -72,6 +72,7 @@ const PICKER_DONE_FILE = join(STATE_DIR, ".picker-done");
 
 const POLICIES = ["pairing", "allowlist", "disabled"];
 const SET_KEYS = [
+  "owner",
   "ackReaction",
   "replyToMode",
   "textChunkLimit",
@@ -263,9 +264,15 @@ function status(): void {
   const a = load();
   const meta = loadGroupsMeta();
   const now = Date.now();
+  // owner is printed with what it MEANS, not as a bare field: it is the one
+  // chat that receives command previews and can approve them, and a wrong one
+  // is otherwise invisible - the agent just waits on approvals nobody sees.
+  const owner = typeof a.owner === "string" ? a.owner : "";
   const lines = [
     `state dir:  ${STATE_DIR}`,
     `dmPolicy:   ${a.dmPolicy}`,
+    `owner:      ${owner || a.allowFrom[0] || "(none)"}${owner ? "" : "  (unstamped — falling back to allowFrom[0])"}`,
+    `            permission requests go here; change with "set owner <jid>"`,
     `allowFrom:  ${a.allowFrom.length} contact(s)`,
     ...a.allowFrom.map((jid) => `  - ${jid}`),
   ];
@@ -1053,6 +1060,13 @@ function set(key: string, rawValue: string): void {
     die("replyToMode must be off, first or all.");
   } else if (key === "chunkMode" && !["length", "newline"].includes(rawValue)) {
     die("chunkMode must be length or newline.");
+  } else if (key === "owner" && !rawValue.includes("@")) {
+    // A jid, not a bare number: this is the send target for every permission
+    // request, and a value WhatsApp cannot address silently sends approvals
+    // nowhere at all.
+    die(
+      "owner must be a JID, e.g. 886912345678@s.whatsapp.net.\nRun status to see the current one.",
+    );
   }
   a[key] = value;
   save(a);

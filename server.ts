@@ -59,6 +59,7 @@ import {
 import { cronMatches, parseCronSection } from "./lib/cron";
 import { extractMentions, extractText } from "./lib/inbound-message";
 import { logContainsId } from "./lib/message-log-probe";
+import { ownerStamp, parsePermissionReply } from "./lib/owner";
 import {
   awaitingReply,
   CONTEXT_TTL_MS,
@@ -986,9 +987,9 @@ function queueLockRetry(gen: number): void {
     // Winning the lock here during the grace window is the worst case in the
     // file: this process would promote, open a socket and start writing fresh
     // credentials, and then be killed mid-write by the grace timer's exit(0) —
-    // the exact corruption the grace window exists to prevent — leaving behind
-    // a lock file nothing releases (shutdown() has already run, and
-    // releaseSingletonLock() only ever fires once).
+    // the exact corruption the grace window exists to prevent. Another
+    // process cannot get there (shutdown holds the lock until the window
+    // ends); this guard is what stops OUR own armed tick from doing it.
     if (!retrying || gen !== retryGen || shuttingDown) return;
     // No backoff. Cheap when it matters (a clean primary exit
     // leaves no lock file, so this is one atomic create), but a primary that
@@ -1101,9 +1102,6 @@ function asCallToolResult(v: unknown, name: string): CallToolResult {
   };
 }
 
-// Permission-reply spec — 5 lowercase letters a-z minus 'l'. Case-insensitive.
-const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
-
 // ─── Access control ────────────────────────────────────────────────────
 
 type PendingEntry = {
@@ -1133,11 +1131,12 @@ type GroupPolicy = {
 type Access = {
   dmPolicy: "pairing" | "allowlist" | "disabled";
   allowFrom: string[];
-  // The jid of the WhatsApp account this device is linked to. Stamped from
-  // sock.user on every connect (see connection === "open"), never edited by
-  // hand and never inferred from allowFrom's order. Optional only so an
-  // access.json written before this field existed still parses; the first
-  // connect fills it in.
+  // The one chat permission requests are delivered to, and therefore the only
+  // chat that may answer them. Stamped once when absent (see ownerStamp and
+  // connection === "open") and never overwritten after that, so a deployment
+  // whose agent runs on a dedicated number can point it at the human.
+  // Optional only so an access.json written before this field existed still
+  // parses; the first connect fills it in.
   owner?: string;
   groups: Record<string, GroupPolicy>;
   pending: Record<string, PendingEntry>;
@@ -2652,15 +2651,14 @@ const mcp = new Server(
 );
 
 /** The single chat a permission request is delivered to, and therefore the
- *  only chat that can answer it. access.owner is stamped from the linked
- *  WhatsApp account on every connect, so it is the account this device belongs
- *  to. This used to be access.allowFrom[0] — plain insertion order, so a
- *  contact allowlisted before the server first connected received every
- *  command preview (up to 500 raw characters of the Bash command) and, being
- *  the bound chat, could approve it. The allowFrom[0] fallback covers only an
- *  access.json that has never been stamped, i.e. before the first connect of
- *  this version; it keeps the old behaviour rather than failing closed and
- *  silently swallowing permission requests. */
+ *  only chat that can answer it. access.owner is stamped once (see ownerStamp)
+ *  and settable by hand, so it is a decision rather than allowFrom[0]'s plain
+ *  insertion order — under which a contact allowlisted before the server first
+ *  connected received every command preview (up to 500 raw characters of the
+ *  Bash command) and, being the bound chat, could approve it. The allowFrom[0]
+ *  fallback covers only an access.json that has never been stamped, i.e.
+ *  static mode or before the first connect; it keeps the old behaviour rather
+ *  than failing closed and silently swallowing permission requests. */
 function permissionTarget(access: Access): string | undefined {
   return access.owner ?? access.allowFrom[0];
 }
@@ -2693,6 +2691,40 @@ function claimPermission(requestId: string, fromChatId: string): boolean {
     found = true;
   }
   return found;
+}
+
+// The "yes <id>" half of the approval flow, called from both inbound routes.
+// It has to run for the owner's own fromMe messages too: when the owner IS the
+// linked account the request is delivered to their note-to-self, where every
+// message carries fromMe, and the request text itself still advertises
+// "yes <id> to allow" — so that half did nothing and only the 👍 reaction
+// worked.
+//
+// Returns true only when an OUTSTANDING id was claimed from the chat the
+// request was delivered to. Everything else — an unmatched pattern, a stale
+// id, the right id from the wrong chat — returns false and the caller carries
+// on treating the message as ordinary text, because swallowing a real message
+// (sender sees a tick, agent never sees it) is worse than missing an approval.
+function tryClaimPermissionReply(
+  msg: WAMessage,
+  chatId: string,
+  text: string,
+): boolean {
+  const reply = parsePermissionReply(text);
+  if (!reply || !claimPermission(reply.requestId, chatId)) return false;
+  void mcp.notification({
+    method: "notifications/claude/channel/permission",
+    params: { request_id: reply.requestId, behavior: reply.behavior },
+  });
+  if (sock && msg.key.id) {
+    void sendTracked(chatId, {
+      react: {
+        text: reply.behavior === "allow" ? "✅" : "❌",
+        key: msg.key,
+      },
+    }).catch(() => {});
+  }
+  return true;
 }
 
 function formatPermissionPreview(
@@ -3498,10 +3530,10 @@ function shutdown(): void {
   if (shuttingDown) return;
   shuttingDown = true;
   logDiag(`${LOG_PREFIX}: shutting down\n`);
-  // Close the IPC listener BEFORE releasing the singleton lock: releasing
-  // first would open a window where another process can acquire the lock
-  // and start its own listener while this socket/pipe is still bound,
-  // widening the same clobber race startIpcListener() guards against.
+  // Close the IPC listener here, well before the singleton lock is released
+  // at the end of the grace window: a successor that acquires the lock starts
+  // its own listener, and it must never do that while this socket/pipe is
+  // still bound — the same clobber race startIpcListener() guards against.
   // Stops accepting and unlinks the Unix socket file.
   // Destroying the sockets explicitly is what gives a connected secondary its
   // instant disconnect: the exit below is no longer synchronous, so waiting
@@ -3518,7 +3550,6 @@ function shutdown(): void {
   try {
     rmSync(ROLE_FILE, { force: true });
   } catch {}
-  releaseSingletonLock();
   // The grace timer is the ONLY exit path. Baileys writes creds.update and
   // Signal key updates asynchronously; exiting synchronously right after
   // sock.end() aborted those mid-writeFile, which is what corrupted the auth
@@ -3527,7 +3558,20 @@ function shutdown(): void {
   // the same bug in a different costume. Nothing downstream may assume this
   // function returns only when the process is gone; every caller here is a
   // process/stdin event handler with no code after the call.
-  setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS);
+  setTimeout(() => {
+    // The lock is held for the whole window, not dropped at the top of
+    // shutdown. Another process's lock-retry ticks on its own PID every 3s
+    // and this process's shuttingDown flag means nothing to it: a lock freed
+    // early can be won while Baileys is still flushing, and then two
+    // processes have the same auth dir open for writing — exactly the
+    // corruption the window exists to prevent. The successor waits at most
+    // one retry tick. A crash rather than a clean exit leaves the lock file
+    // behind, which acquireSingletonLock's PID + start-time staleness check
+    // already reclaims.
+    releaseSingletonLock();
+    logDiag(`${LOG_PREFIX}: grace window elapsed; lock released, exiting\n`);
+    process.exit(0);
+  }, SHUTDOWN_GRACE_MS);
   try {
     sock?.end(undefined as any);
   } catch {}
@@ -3881,6 +3925,18 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   // fromMe: our own echo, or the owner typing on their phone.
   if (msg.key.fromMe) {
     if (wasSentByServer(msg.key.id)) return;
+    // Before the hand-reply path claims it. When the owner IS the linked
+    // account the permission request lands in their note-to-self, so their
+    // typed "yes <id>" arrives here rather than on the inbound route and was
+    // logged as ordinary chat instead of answering anything. Only a claimed
+    // id is taken; every other fromMe message, "yes xxxxx" included, still
+    // falls through to logOwnerHandReply so unreplied clears and catch_up
+    // shows it.
+    if (
+      !backlog &&
+      tryClaimPermissionReply(msg, msg.key.remoteJid, extractText(msg.message))
+    )
+      return;
     return logOwnerHandReply(msg);
   }
   if (wasSentByServer(msg.key.id)) return;
@@ -4010,33 +4066,12 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   // Ensure group config directory exists
   if (isGroup) ensureGroupDir(remoteJid);
 
-  // Permission reply intercept, only while that request id is outstanding:
-  // the pattern ("yes" + 5 letters) is reachable by ordinary chat, and
-  // swallowing a real message — sender sees a tick, agent never sees the
-  // text — is worse than missing an approval. On clients that never send
-  // permission requests, nothing is listening at all.
-  const permMatch = backlog ? null : PERMISSION_REPLY_RE.exec(text);
-  if (permMatch && claimPermission(permMatch[2]!.toLowerCase(), remoteJid)) {
-    void mcp.notification({
-      method: "notifications/claude/channel/permission",
-      params: {
-        request_id: permMatch[2]!.toLowerCase(),
-        behavior: permMatch[1]!.toLowerCase().startsWith("y")
-          ? "allow"
-          : "deny",
-      },
-    });
-    // Ack with reaction
-    if (sock && messageId) {
-      const emoji = permMatch[1]!.toLowerCase().startsWith("y")
-        ? "\u2705"
-        : "\u274C";
-      void sendTracked(remoteJid, {
-        react: { text: emoji, key: msg.key },
-      }).catch(() => {});
-    }
-    return;
-  }
+  // Permission reply intercept, only while that request id is outstanding.
+  // On clients that never send permission requests, nothing is listening at
+  // all. Skipped for backlog like every other block that ACTS: a "yes"
+  // replayed from while we were offline answers a request that died with the
+  // process that asked it.
+  if (!backlog && tryClaimPermissionReply(msg, remoteJid, text)) return;
 
   // Ack reaction
   if (!backlog && access.ackReaction && sock && messageId) {
@@ -4253,13 +4288,21 @@ let connectedAt = 0;
 // backoff, and say it out loud the first time so this degrades noisily instead
 // of silently.
 let reconnectThrows = 0;
+// Same convention as retryGen, for the same reason. connectWhatsApp can throw
+// AFTER creating the socket, and that socket's own close handler schedules a
+// reconnect too - so the throw's catch below and the close both arm a chain,
+// each of which re-arms itself forever, and the duplicate sockets show up as
+// 440 session conflicts. Every scheduling call takes the newest generation;
+// a timer whose generation is stale discards itself instead of firing.
+let reconnectGen = 0;
 function scheduleReconnect(delay: number): void {
+  const gen = ++reconnectGen;
   setTimeout(() => {
     // shutdown() calls sock.end(), which emits connection.update 'close' and
     // lands right back here. Now that the exit is deferred by a grace window,
     // that reconnect could actually fire and open a fresh socket - and start
     // writing creds - on the way out. It must not.
-    if (shuttingDown) return;
+    if (shuttingDown || gen !== reconnectGen) return;
     connectWhatsApp().catch((err) => {
       reconnectThrows++;
       reconnectAttempt++;
@@ -4560,6 +4603,10 @@ async function connectWhatsApp(): Promise<void> {
       if (ownJid && !STATIC) {
         const access = loadAccess();
         let accessChanged = false;
+        // Snapshot before the auto-add below, because ownerStamp's migration
+        // rule is about the allowlist the user built, not the one this connect
+        // is about to append ourselves to.
+        const allowFromBefore = access.allowFrom.slice();
         if (!isAllowedJid(ownJid, access.allowFrom)) {
           access.allowFrom.push(resolvedOwn);
           accessChanged = true;
@@ -4568,22 +4615,32 @@ async function connectWhatsApp(): Promise<void> {
             logDiag(`${LOG_PREFIX}: auto-locked to allowlist mode\n`);
           }
         }
-        // Stamped on every connect, not just the first: this is the account
-        // the device is linked to, which is the only defensible definition of
-        // "owner" here. Everything that used to mean allowFrom[0] reads this
-        // instead — array position was never ownership, it was insertion
-        // order, and a contact allowlisted before the first connect landed in
-        // front of the real owner.
-        if (access.owner !== resolvedOwn) {
-          access.owner = resolvedOwn;
+        // Stamped only when absent — see ownerStamp for why re-stamping every
+        // connect was a regression and why an install that already had an
+        // allowlist keeps the target it has been using.
+        const owner = ownerStamp(access.owner, allowFromBefore, resolvedOwn);
+        if (owner !== undefined && owner !== access.owner) {
+          access.owner = owner;
           accessChanged = true;
         }
         if (accessChanged) {
           saveAccess(access);
           logDiag(
-            `${LOG_PREFIX}: owner ${maskJid(resolvedOwn)} recorded and allowlisted\n`,
+            // Says only what this branch did. The owner it stamps is not
+            // always resolvedOwn any more, and the line below is the one that
+            // names the permission target.
+            `${LOG_PREFIX}: linked account ${maskJid(resolvedOwn)} allowlisted\n`,
           );
         }
+        // Unconditional, and on every connect: this names the chat that
+        // receives command previews and can approve them. A misdirected owner
+        // is otherwise invisible — the agent just waits on approvals nobody
+        // sees — and diag.log is the only forensic surface on an unattended
+        // host. `access status` prints the same jid interactively.
+        const target = permissionTarget(access);
+        logDiag(
+          `${LOG_PREFIX}: permission requests go to ${target ? maskJid(target) : "nobody (no owner and an empty allowlist)"}\n`,
+        );
       }
 
       // Initialize server-side cron jobs from group configs

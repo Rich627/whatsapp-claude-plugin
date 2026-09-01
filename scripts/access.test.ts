@@ -328,6 +328,32 @@ describe("policy", () => {
   });
 });
 
+// The chat permission requests go to. A dedicated-bot-number deployment has
+// to be able to point this at the human, and has to be able to SEE where it
+// points - a wrong value is otherwise silent, with the agent waiting on
+// approvals nobody receives.
+describe("owner", () => {
+  test("set owner takes a jid and refuses a bare number", () => {
+    const dir = freshStateDir();
+    const ok = run(dir, "set", "owner", "886912345678@s.whatsapp.net");
+    expect(ok.code).toBe(0);
+    expect(access(dir).owner).toBe("886912345678@s.whatsapp.net");
+    const bad = run(dir, "set", "owner", "886912345678");
+    expect(bad.code).toBe(1);
+    expect(access(dir).owner).toBe("886912345678@s.whatsapp.net"); // unchanged
+  });
+
+  test("status names the owner, and says when it is only a fallback", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "886900000000@s.whatsapp.net");
+    expect(run(dir, "status").out).toContain("unstamped");
+    run(dir, "set", "owner", "886912345678@s.whatsapp.net");
+    const out = run(dir, "status").out;
+    expect(out).toContain("owner:      886912345678@s.whatsapp.net");
+    expect(out).not.toContain("unstamped");
+  });
+});
+
 describe("pairing", () => {
   test("a wrong code approves nobody", () => {
     const dir = freshStateDir();

@@ -56,10 +56,14 @@ Arguments passed: `$ARGUMENTS`
 
 Missing file = `{dmPolicy:"pairing", allowFrom:[], groups:{}, pending:{}}`.
 
-`owner` is written by the server itself on every connect, from the WhatsApp
-account this device is linked to. It is where permission requests are sent and
-the only chat allowed to approve them. Never edit or remove it by hand — the
-next connect overwrites it anyway.
+`owner` is the one chat permission requests are sent to, and the only chat
+allowed to approve them. The server stamps it once when it is missing — the
+linked account on a fresh install, the existing `allowFrom[0]` on an install
+that already had an allowlist — and never touches it again, so a value set by
+hand survives every reconnect. Set it with `set owner <jid>`. That matters when
+the agent runs on a dedicated number: leave it pointing at the linked account
+and every permission request goes to that number's own note-to-self, where
+nobody sees it and the agent waits forever.
 
 ---
 
@@ -77,8 +81,10 @@ with no AI model involved.
 ### No args — status
 
 1. Read `~/.whatsapp-channel/access.json` (handle missing file).
-2. Show: dmPolicy, allowFrom count and list, pending count with codes +
-   sender IDs + age, groups count.
+2. Show: dmPolicy, `owner` (say what it is — the chat that receives permission
+   requests and can approve them; if the field is missing, say that
+   `allowFrom[0]` is standing in), allowFrom count and list, pending count with
+   codes + sender IDs + age, groups count.
 3. End with the two things a person can do next. Nothing else advertises
    them: a release note is seen once at most, and someone who has not read
    one cannot guess the word `review`. Print these two:
@@ -322,9 +328,11 @@ the group, not just reply in it.
 
 ### `set <key> <value>`
 
-Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
-`textChunkLimit`, `chunkMode`, `mentionPatterns`. Validate types:
+Delivery/UX config, plus `owner`. Supported keys: `owner`, `ackReaction`,
+`replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`. Validate
+types:
 
+- `owner`: a JID (must contain `@`) — the chat permission requests go to
 - `ackReaction`: string (emoji) or `""` to disable
 - `replyToMode`: `off` | `first` | `all`
 - `textChunkLimit`: number
