@@ -57,6 +57,23 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.23.0",
+      notes: [
+        "Fixed a message loss that was easy to mistake for the channel being asleep: a message that arrived within a fraction of a second of Claude sending a reply was filed as old backlog, so you got no notification, no ack, and any photo or voice note in it was never downloaded. It was likeliest right after a long reply, because each chunk reopened the window.",
+        "Fixed a second cause of a group going quiet while direct messages kept working: one unanswered group-metadata request from WhatsApp used to hang that group's messages indefinitely with nothing in the log. Metadata lookups are now bounded, and a group whose name cannot be fetched shows its id instead of falling silent.",
+        "A voice note no longer freezes the channel while it is transcribed. Transcription used to block everything - replies, cron jobs, the connection itself - for as long as it took, up to three minutes.",
+        "Approving a tool permission over WhatsApp is now tied to the chat the request was actually sent to, and that chat is an explicit setting rather than whichever contact happened to sort first. `access status` shows which chat receives permission requests and `access set owner <jid>` changes it. Existing setups keep the chat they already used.",
+        "Both approval routes now work when you run the agent from your own account's note-to-self, which previously accepted neither the 👍 reaction nor `yes <id>` despite the request message offering both.",
+        "An @-mention in a photo, video, or document caption now counts as addressing Claude. In a mention-gated group those messages were silently ignored even though their caption text was read.",
+        "Replying no longer marks messages that arrived while the reply was still uploading as answered - they stayed in the log but vanished from the unreplied count, so nobody ever came back to them.",
+        "Recurring tasks are more dependable: a schedule that could never match (`daily 25:00`, `every 90 min`) is now reported instead of silently ignored, a `config.md` saved with Windows line endings no longer yields zero jobs, and the scheduler no longer drifts far enough to skip a minute entirely.",
+        "You are now told when the phone unlinks the device. That left the channel dead to the outside world with only a line in the diagnostic log.",
+        "`inbox/` and the id-mapping cache are now aged out. Nothing pruned the inbox before, so every photo and voice note ever received stayed on disk. `doctor` reports their size along with the diagnostic log's, and checks that a configured watchdog notification hook actually exists.",
+        "Display names and group subjects chosen by other people are now stripped of characters that let them impersonate another speaker in what Claude reads.",
+        "If you copied the permissions block from USAGE.md, replace it: the tool ids in it were left over from the 0.20.0 rename and matched nothing, so every reply and reaction still asked for confirmation.",
+      ],
+    },
+    {
       version: "0.22.1",
       notes: [
         "Mention-gated groups can now opt out of context: `group add <jid> --no-context` restores the stricter meaning of mention gating for that group - nothing members say is stored unless Claude was addressed. Groups that never set it keep context, as 0.22.0 shipped.",
