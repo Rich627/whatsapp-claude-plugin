@@ -99,11 +99,11 @@ If you prefer to auto-allow only WhatsApp tools (instead of all tools), add to y
 {
   "permissions": {
     "allow": [
-      "mcp__plugin_whatsapp_claude_channel_whatsapp__reply",
-      "mcp__plugin_whatsapp_claude_channel_whatsapp__react",
-      "mcp__plugin_whatsapp_claude_channel_whatsapp__status",
-      "mcp__plugin_whatsapp_claude_channel_whatsapp__download_attachment",
-      "mcp__plugin_whatsapp_claude_channel_whatsapp__edit_message"
+      "mcp__plugin_whatsapp_channel_whatsapp__reply",
+      "mcp__plugin_whatsapp_channel_whatsapp__react",
+      "mcp__plugin_whatsapp_channel_whatsapp__status",
+      "mcp__plugin_whatsapp_channel_whatsapp__download_attachment",
+      "mcp__plugin_whatsapp_channel_whatsapp__edit_message"
     ]
   }
 }

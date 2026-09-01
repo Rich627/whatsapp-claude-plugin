@@ -33,7 +33,8 @@ import makeWASocket, {
   type proto,
 } from "@whiskeysockets/baileys";
 import { randomBytes, timingSafeEqual } from "crypto";
-import { execFileSync } from "child_process";
+import { execFile, execFileSync } from "child_process";
+import { promisify } from "util";
 import {
   readFileSync,
   writeFileSync,
@@ -58,6 +59,7 @@ import {
 import { logContainsId } from "./lib/message-log-probe";
 import {
   awaitingReply,
+  CONTEXT_TTL_MS,
   keepLogLine,
   RECENT_LIMIT,
   recentBothSides,
@@ -991,7 +993,7 @@ function queueLockRetry(gen: number): void {
     if (won) return queueLockRetry(gen);
     retrying = false;
     logDiag(`${LOG_PREFIX}: won the singleton lock; promoting to primary\n`);
-    void becomePrimary();
+    void promoteAndConnect();
   }, LOCK_RETRY_INTERVAL_MS).unref();
 }
 
@@ -1015,6 +1017,31 @@ async function becomePrimary(): Promise<void> {
   pruneMessageLog();
   await startIpcListener();
   await connectWhatsApp();
+}
+
+// becomePrimary() is the other entry point into connectWhatsApp, and it has
+// the same one-shot problem scheduleReconnect exists for: the process keeps
+// the singleton lock either way (isPrimary is set before the first await), so
+// a throw here without a retry leaves a lock-holding process that will never
+// connect and never yield. unhandledRejection only logs, so `void` alone would
+// bury it.
+async function promoteAndConnect(): Promise<void> {
+  try {
+    await becomePrimary();
+  } catch (err) {
+    reconnectAttempt++;
+    const next = Math.min(1000 * reconnectAttempt, 30000);
+    logDiag(
+      `${LOG_PREFIX}: promotion to primary failed: ${err}; retrying in ${next / 1000}s\n`,
+    );
+    if (AUTO_NOTIFY) {
+      notifySystem(
+        `WhatsApp promotion failed: ${err instanceof Error ? err.message : String(err)}. Retrying in ${next / 1000}s.`,
+        "promote-failed",
+      );
+    }
+    scheduleReconnect(next);
+  }
 }
 
 // The primary is same-user and token-verified, but this is still another
@@ -1484,8 +1511,12 @@ async function refreshGroupsMeta(
   const groups = Object.values(meta);
   let metaChanged = false;
   for (const g of groups) {
-    const name = g.subject || "(no name)";
-    if (g.subject) groupNameCache[g.id] = g.subject;
+    // Sanitized on the way into the cache, not on the way out: this is the
+    // other writer of groupNameCache, and the cron path reads that cache
+    // directly (see the group_name in runCronJob).
+    const subject = safeName(g.subject)?.trim();
+    const name = subject || "(no name)";
+    if (subject) groupNameCache[g.id] = subject;
     const existing = groupsMeta[g.id];
     const memberCount = g.participants?.length ?? 0;
     if (
@@ -1569,17 +1600,73 @@ async function syncSavedNamesOnce(
   }, 60_000);
 }
 
+// Bounds one promise without leaving the loser unhandled: the rejection
+// handler is attached to `p` itself, so a slow query that eventually fails
+// (Baileys' own defaultQueryTimeoutMs) can't surface as an unhandled rejection
+// long after we stopped waiting.
+function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${what} timed out after ${ms}ms`)),
+      ms,
+    );
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+// resolveGroupName is awaited on the group inbound path BEFORE the message is
+// persisted or notified, so an iq response that never comes used to hang that
+// group's messages forever while DMs kept working - the "groups go silent"
+// outage. Two bounds, because the failure has to degrade to "this group shows
+// as its jid", never to "this group goes quiet": a per-call timeout, and a
+// cooldown so the next hundred messages don't each pay it again.
+const GROUP_NAME_QUERY_TIMEOUT_MS = 10_000;
+const GROUP_NAME_RETRY_AFTER_MS = 5 * 60 * 1000;
+const groupNameFailedAt: Record<string, number> = {};
+
+// The subject is settable by any group admin and ends up in the `group_name`
+// attribute of the <channel …> envelope, in the message log and in tool
+// output, so it is sanitized ONCE here (and on the other write into
+// groupNameCache, in refreshGroupsMeta) rather than at each of the four
+// callers — every one of them feeds a rendered surface and wants the same
+// treatment, and a fifth caller added later would otherwise silently miss it.
 async function resolveGroupName(groupJid: string): Promise<string> {
   if (groupNameCache[groupJid]) return groupNameCache[groupJid];
+  const failedAt = groupNameFailedAt[groupJid];
+  if (failedAt && Date.now() - failedAt < GROUP_NAME_RETRY_AFTER_MS)
+    return groupJid;
   try {
     if (sock) {
-      const meta = await sock.groupMetadata(groupJid);
-      if (meta.subject) {
-        groupNameCache[groupJid] = meta.subject;
-        return meta.subject;
+      const meta = await withTimeout(
+        sock.groupMetadata(groupJid),
+        GROUP_NAME_QUERY_TIMEOUT_MS,
+        "groupMetadata",
+      );
+      const subject = safeName(meta.subject)?.trim();
+      if (subject) {
+        groupNameCache[groupJid] = subject;
+        delete groupNameFailedAt[groupJid];
+        return subject;
       }
     }
-  } catch {}
+  } catch (err) {
+    groupNameFailedAt[groupJid] = Date.now();
+    // The one line that distinguishes "this group is named by its jid because
+    // metadata stalled" from "nothing arrived at all". maskJid keeps a group
+    // jid identifiable (only a legacy jid's creator number is masked).
+    logDiag(
+      `${LOG_PREFIX}: group name lookup failed for ${maskJid(groupJid)}: ${err}\n`,
+    );
+  }
   return groupJid;
 }
 
@@ -2001,6 +2088,22 @@ function chunk(
               ? space
               : limit;
     }
+    // slice() counts UTF-16 code units, so a cut can land BETWEEN the two
+    // halves of a surrogate pair - an emoji or any astral character - and both
+    // chunks then carry a lone surrogate that renders as U+FFFD. Back the
+    // boundary off by one so the whole pair moves to the next chunk. Only the
+    // length-mode cut can hit this; a newline- or space-aligned cut is by
+    // construction on a BMP character. Known ceiling: a multi-codepoint emoji
+    // (ZWJ sequence, flag, skin tone) can still be split ACROSS chunks - that
+    // renders as two valid emoji rather than corruption, so it is left alone.
+    if (
+      cut > 1 &&
+      cut < rest.length &&
+      (rest.charCodeAt(cut - 1) & 0xfc00) === 0xd800 &&
+      (rest.charCodeAt(cut) & 0xfc00) === 0xdc00
+    ) {
+      cut--;
+    }
     out.push(rest.slice(0, cut));
     rest = rest.slice(cut).replace(/^\n+/, "");
   }
@@ -2262,7 +2365,6 @@ function pruneSentLog(): void {
  *  first, the same reason reloadContactsMap exists at all: scripts/access.ts
  *  mutates these files between our writes. */
 function pruneStrangerCaches(): void {
-  if (!CACHE_CONTACTS) return; // nothing persists anyway
   try {
     reloadContactsMap();
     reloadDmActivity();
@@ -2270,16 +2372,83 @@ function pruneStrangerCaches(): void {
     // Everyone with standing approval, in the key form both caches use.
     // Group allowFrom entries count too: someone approved for a group only
     // is still someone the owner named, not a stranger.
+    //
+    // Built BEFORE anything is deleted, and specifically before lidMap is
+    // touched: contactKey() resolves through lidMap, so pruning first would
+    // make this set forget the very people it exists to protect.
     const allowed = new Set<string>();
     for (const jid of access.allowFrom) allowed.add(contactKey(jid));
     for (const g of Object.values(access.groups))
       for (const jid of g.allowFrom ?? []) allowed.add(contactKey(jid));
     if (ownJid) allowed.add(contactKey(ownJid));
-    const changed = pruneStrangers(contactsMap, dmActivity, allowed);
-    if (changed.contacts) saveContactsMap();
-    if (changed.dms) saveDmActivity();
+    if (CACHE_CONTACTS) {
+      const changed = pruneStrangers(contactsMap, dmActivity, allowed);
+      if (changed.contacts) saveContactsMap();
+      if (changed.dms) saveDmActivity();
+    }
+    // Not under the CACHE_CONTACTS guard the two caches above sit behind:
+    // saveLidMap() has no such guard, so lid-map.json is written - and a
+    // refused stranger's identifier retained - whatever the contact-cache
+    // setting is. An empty `allowed` means access.json is missing or
+    // unreadable, not that nobody is allowed; never wipe the map on that.
+    if (allowed.size > 0 && pruneLidMap(allowed)) saveLidMap();
   } catch (err) {
     logDiag(`${LOG_PREFIX}: stranger-cache prune failed: ${err}\n`);
+  }
+}
+
+/** lid-map.json is the third stranger cache and the only one that grew
+ *  forever. Same rule pruneStrangers applies to a contact: keep it if the
+ *  owner named this person, or if they are still inside the stranger TTL
+ *  (dmActivity has already been aged by the call above, so anything left in
+ *  it is recent).
+ *
+ *  One lookup covers both directions of the mapping: contactKey(lid) resolves
+ *  through lidMap and lands on exactly contactKey(pn), so an allowlist that
+ *  names the contact by either form matches the same key. Dropping an entry is
+ *  in any case recoverable - ensureLidResolved re-derives it from Baileys'
+ *  own signal store on the next message. */
+function pruneLidMap(allowed: ReadonlySet<string>): boolean {
+  let changed = false;
+  for (const [lid, pn] of Object.entries(lidMap)) {
+    const key = contactKey(pn);
+    if (allowed.has(key)) continue;
+    if (key in dmActivity) continue;
+    delete lidMap[lid];
+    changed = true;
+  }
+  return changed;
+}
+
+/** Every eagerly-downloaded image and voice note from every allowed chat lands
+ *  in inbox/ and nothing ever removed it, so any group member could fill the
+ *  disk one photo at a time. Same window as a context log line
+ *  (CONTEXT_TTL_MS): once the line that references the file is gone, the file
+ *  is unreachable anyway. Rides the same hourly tick as pruneMessageLog.
+ *
+ *  Deliberately narrow: only regular files, only direct children of INBOX_DIR
+ *  (no recursion, so a directory someone drops in there is left alone rather
+ *  than walked), and every path is rebuilt with join(INBOX_DIR, name) from a
+ *  readdir entry, so nothing outside INBOX_DIR is reachable from here. */
+function pruneInbox(): void {
+  try {
+    const cutoff = Date.now() - CONTEXT_TTL_MS;
+    let removed = 0;
+    for (const name of readdirSync(INBOX_DIR)) {
+      const path = join(INBOX_DIR, name);
+      try {
+        const st = statSync(path);
+        if (!st.isFile()) continue;
+        if (st.mtimeMs >= cutoff) continue;
+        rmSync(path, { force: true });
+        removed++;
+      } catch {}
+    }
+    if (removed) {
+      logDiag(`${LOG_PREFIX}: pruned ${removed} stale inbox file(s)\n`);
+    }
+  } catch (err) {
+    logDiag(`${LOG_PREFIX}: inbox prune failed: ${err}\n`);
   }
 }
 
@@ -2290,6 +2459,7 @@ function pruneMessageLog(): void {
   // that are never logged).
   pruneSentLog();
   pruneStrangerCaches();
+  pruneInbox();
   try {
     if (!existsSync(MESSAGE_LOG)) return;
     // Two lifetimes, decided in lib/message-view.ts: a routed inbound is a
@@ -2396,18 +2566,31 @@ const mcp = new Server(
 );
 
 // Permission relay — forward to all allowlisted DMs.
-// Track permission request message IDs for emoji-based approval
-const permissionMessageMap = new Map<string, string>(); // messageId → requestId
+// Track permission request message IDs for emoji-based approval.
+// chatId is the jid the request was actually DELIVERED to (access.allowFrom[0],
+// the owner). Approving a tool call is the most privileged thing this channel
+// can do, so it is bound to that one chat: an approval arriving from any other
+// chat — a group the owner also allowlisted, a second contact — is not an
+// approval, it is someone answering a question they were never asked.
+const permissionMessageMap = new Map<
+  string,
+  { requestId: string; chatId: string }
+>(); // messageId → the request and who was asked
 
-// Was this request id one we asked about and are still waiting on? Claims it
-// if so, so a repeated reply is treated as ordinary chat.
-function claimPermission(requestId: string): boolean {
+// Was this request id one we asked about, and did the answer come back from
+// the chat we asked? Claims it if so, so a repeated reply is treated as
+// ordinary chat. An id that matches but arrived from the wrong chat is NOT
+// claimed and NOT deleted — the real owner can still answer it.
+function claimPermission(requestId: string, fromChatId: string): boolean {
   let found = false;
-  for (const [messageId, id] of permissionMessageMap) {
-    if (id === requestId) {
-      permissionMessageMap.delete(messageId);
-      found = true;
-    }
+  for (const [messageId, entry] of permissionMessageMap) {
+    if (entry.requestId !== requestId) continue;
+    // isAllowedJid, not ===: the same person reaches us as @lid or as a phone
+    // jid depending on the path, and this is the file's one normalizing
+    // comparison. Single-element list, so this is "is fromChatId that chat".
+    if (!isAllowedJid(fromChatId, [entry.chatId])) continue;
+    permissionMessageMap.delete(messageId);
+    found = true;
   }
   return found;
 }
@@ -2488,7 +2671,10 @@ mcp.setNotificationHandler(
         // No expiry: Claude Code waits on a permission request indefinitely,
         // so a "yes <id>" must be honoured whenever it arrives. The entry is
         // removed when claimed; an unanswered one costs a few bytes.
-        permissionMessageMap.set(sent.key.id, request_id);
+        permissionMessageMap.set(sent.key.id, {
+          requestId: request_id,
+          chatId: owner,
+        });
         trackSent(sent.key);
       }
     }
@@ -3064,7 +3250,9 @@ const handleToolCall = async (req: {
         const lines = groups.map((g) => {
           const allowed = g.id in access.groups;
           const roster = !!access.groups[g.id]?.roster;
-          const name = g.subject || "(no name)";
+          // Same reason as resolveGroupName: an admin-settable subject is
+          // rendered into text the model reads.
+          const name = safeName(g.subject)?.trim() || "(no name)";
           const flags = `${allowed ? "✓" : "+"}${roster ? "R" : ""}`;
           return `${flags} ${name}\n    ${g.id}${allowed ? "" : "  (NOT allowlisted)"}`;
         });
@@ -3122,7 +3310,7 @@ const handleToolCall = async (req: {
           content: [
             {
               type: "text",
-              text: `${lines.length} member(s) of ${meta.subject || chat_id}:\n${lines.join("\n")}`,
+              text: `${lines.length} member(s) of ${safeName(meta.subject)?.trim() || chat_id}:\n${lines.join("\n")}`,
             },
           ],
         };
@@ -3177,8 +3365,16 @@ for (const n of pendingSecondaryNotifications.splice(0)) {
 
 // ─── Shutdown ──────────────────────────────────────────────────────────
 
+// Long enough for Baileys' in-flight creds/key writes to land, short enough
+// that a terminal closing doesn't feel hung.
+const SHUTDOWN_GRACE_MS = 2000;
+
 let shuttingDown = false;
 function shutdown(): void {
+  // Re-entrant by design: stdin emits 'end' and then 'close', and both are
+  // wired here. Must stay a plain return - forcing the exit on the second
+  // entry would make the 'close' that always follows 'end' cancel the grace
+  // window this function exists for.
   if (shuttingDown) return;
   shuttingDown = true;
   logDiag(`${LOG_PREFIX}: shutting down\n`);
@@ -3186,25 +3382,35 @@ function shutdown(): void {
   // first would open a window where another process can acquire the lock
   // and start its own listener while this socket/pipe is still bound,
   // widening the same clobber race startIpcListener() guards against.
-  // Stops accepting and unlinks the Unix socket file. Any open connection is
-  // torn down by the process.exit(0) three lines down, which is what gives a
-  // connected secondary its instant disconnect.
-  // process.exit(0) below is unconditional and synchronous, so the OS closes
-  // every secondarySockets fd instantly and each connected secondary gets its
-  // own close event — no explicit destroy loop needed, that would be dead
-  // code on every path through this function.
+  // Stops accepting and unlinks the Unix socket file.
+  // Destroying the sockets explicitly is what gives a connected secondary its
+  // instant disconnect: the exit below is no longer synchronous, so waiting
+  // for the OS to close these fds would leave a secondary hanging for the
+  // whole grace window.
   try {
     ipcServer?.close();
   } catch {}
+  for (const s of secondarySockets) {
+    try {
+      s.destroy();
+    } catch {}
+  }
   try {
     rmSync(ROLE_FILE, { force: true });
   } catch {}
   releaseSingletonLock();
-  setTimeout(() => process.exit(0), 2000);
+  // The grace timer is the ONLY exit path. Baileys writes creds.update and
+  // Signal key updates asynchronously; exiting synchronously right after
+  // sock.end() aborted those mid-writeFile, which is what corrupted the auth
+  // dir and forced a re-pair. Not unref'd - an unref'd timer would not hold
+  // the loop open and the process could exit before it ever fires, which is
+  // the same bug in a different costume. Nothing downstream may assume this
+  // function returns only when the process is gone; every caller here is a
+  // process/stdin event handler with no code after the call.
+  setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS);
   try {
     sock?.end(undefined as any);
   } catch {}
-  process.exit(0);
 }
 process.stdin.on("end", shutdown);
 process.stdin.on("close", shutdown);
@@ -3263,6 +3469,24 @@ setInterval(() => {
 const noop = () => {};
 const DIAG_DEBUG = process.env.WHATSAPP_DIAG_DEBUG === "1";
 
+// Baileys logs raw jids — a failed decryption names the sender, and that
+// sender may be a stranger the gate is about to refuse. diag.log is a file on
+// disk that outlives the session, and this file's own rule (see the inbound
+// upsert log) is that no refused stranger's real number is ever written there.
+// So every serialized Baileys line goes through the same maskJid the rest of
+// the file uses, which keeps group/broadcast jids identifiable (they name a
+// channel, not a person) and masks @s.whatsapp.net / @lid outright.
+//
+// Matches jid-SHAPED tokens only. Known misses: a bare phone number logged
+// with no domain, and digits embedded in a pushName or an error string. Those
+// have not been observed in Baileys' own output, and widening this to "any
+// long digit run" would mangle timestamps, message ids and version numbers.
+const JID_IN_TEXT_RE =
+  /[\w.:+-]+@(?:s\.whatsapp\.net|lid|c\.us|g\.us|broadcast|newsletter)/g;
+function maskJidsInText(s: string): string {
+  return s.replace(JID_IN_TEXT_RE, (jid) => maskJid(jid));
+}
+
 const baileysLine = (lvl: string) => (a: any, b?: any) => {
   let head: string;
   try {
@@ -3270,9 +3494,8 @@ const baileysLine = (lvl: string) => (a: any, b?: any) => {
   } catch {
     head = String(a);
   }
-  logDiag(
-    `${LOG_PREFIX} baileys[${lvl}]: ${head}${b === undefined ? "" : ` :: ${b}`}\n`,
-  );
+  const line = `${head}${b === undefined ? "" : ` :: ${b}`}`;
+  logDiag(`${LOG_PREFIX} baileys[${lvl}]: ${maskJidsInText(line)}\n`);
 };
 
 const silentLogger: any = {
@@ -3400,7 +3623,14 @@ async function transcribeCloud(
   }
 }
 
-function transcribeLocal(filePath: string): string | null {
+// execFile, not execFileSync: this runs on the inbound message path with a
+// 180s timeout, and the synchronous form froze the whole event loop for up to
+// three minutes per voice message - no MCP responses, no IPC, no cron ticks,
+// no Baileys frames, nothing. Still argv-based ([filePath], never a shell
+// string), which is what keeps a filename injection-proof.
+const execFileAsync = promisify(execFile);
+
+async function transcribeLocal(filePath: string): Promise<string | null> {
   if (!existsSync(WHISPER_SCRIPT)) {
     if (!whisperMissingWarned) {
       whisperMissingWarned = true;
@@ -3412,21 +3642,25 @@ function transcribeLocal(filePath: string): string | null {
     return null;
   }
   try {
-    const result = execFileSync(WHISPER_SCRIPT, [filePath], {
+    const { stdout } = await execFileAsync(WHISPER_SCRIPT, [filePath], {
       timeout: WHISPER_TIMEOUT_MS,
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
       maxBuffer: 10 * 1024 * 1024,
     });
-    const trimmed = result.trim();
+    const trimmed = stdout.trim();
     if (!trimmed) {
       logDiag(`${LOG_PREFIX}: whisper returned empty output for ${filePath}\n`);
       return null;
     }
     return trimmed;
   } catch (err: unknown) {
-    const e = err as NodeJS.ErrnoException & {
-      status?: number | null;
+    // Same failure information, different carrier: execFile's rejection puts
+    // the EXIT CODE on `code` (a number) where execFileSync used `status`, and
+    // a timeout shows up as killed/SIGTERM. Both shapes are matched so the
+    // existing log lines keep saying the same thing.
+    const e = err as Error & {
+      code?: string | number | null;
+      killed?: boolean;
       signal?: string | null;
       stderr?: Buffer | string;
       stdout?: Buffer | string;
@@ -3435,12 +3669,12 @@ function transcribeLocal(filePath: string): string | null {
     const parts: string[] = [
       `${LOG_PREFIX}: whisper transcription failed for ${filePath}`,
     ];
-    if (e.signal === "SIGTERM" || e.code === "ETIMEDOUT") {
+    if (e.killed || e.signal === "SIGTERM" || e.code === "ETIMEDOUT") {
       parts.push(
         `timed out after ${WHISPER_TIMEOUT_MS}ms (override with WHISPER_TIMEOUT_MS env var; first run downloads the model)`,
       );
-    } else if (typeof e.status === "number") {
-      parts.push(`exit ${e.status}`);
+    } else if (typeof e.code === "number") {
+      parts.push(`exit ${e.code}`);
     } else if (e.code) {
       parts.push(`error code ${e.code}`);
     }
@@ -3464,6 +3698,30 @@ async function transcribeAudio(filePath: string): Promise<string | null> {
 
 function safeName(s: string | undefined | null): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, "_");
+}
+
+// pushName is profile text the SENDER sets, and it lands in the `user=`
+// attribute of the <channel …> envelope and in the message log. Unsanitized it
+// can close that attribute or the tag itself. Empty after stripping (a name
+// made only of those characters) is no name at all — fall back to the
+// phone-part, which is what this file already uses when pushName is absent.
+function displaySenderName(
+  pushName: string | undefined | null,
+  senderJid: string,
+): string {
+  return safeName(pushName)?.trim() || senderJid.split("@")[0];
+}
+
+// Envelope integrity, NOT general escaping. Message bodies reach the model
+// inside <channel source="whatsapp" …>, so a body containing the literal
+// "</channel" could close that tag early — everything after it would then read
+// as the session's own text instead of as quoted, untrusted chat. Only those
+// two sequences are neutralized; `<` and `>` everywhere else are left exactly
+// as typed, because people legitimately send code and the body is already
+// understood to be untrusted input. The zero-width space renders identically
+// to the sender's original while making the tag inert.
+function neutralizeChannelTag(s: string): string {
+  return s.replace(/<(\/?)channel/gi, "<\u200B$1channel");
 }
 
 // The owner replied on their phone. Log it for the chats the agent is already
@@ -3601,9 +3859,9 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
         persistMessage({
           id: messageId,
           chat_id: remoteJid,
-          user: msg.pushName ?? senderJid.split("@")[0],
+          user: displaySenderName(msg.pushName, senderJid),
           user_id: senderJid,
-          text: kept,
+          text: neutralizeChannelTag(kept),
           ts: new Date(timestamp * 1000).toISOString(),
           replied: true,
           direction: "in",
@@ -3672,7 +3930,7 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   // text — is worse than missing an approval. On clients that never send
   // permission requests, nothing is listening at all.
   const permMatch = backlog ? null : PERMISSION_REPLY_RE.exec(text);
-  if (permMatch && claimPermission(permMatch[2]!.toLowerCase())) {
+  if (permMatch && claimPermission(permMatch[2]!.toLowerCase(), remoteJid)) {
     void mcp.notification({
       method: "notifications/claude/channel/permission",
       params: {
@@ -3791,11 +4049,15 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   }
 
   // Extract sender display info
-  const senderName = msg.pushName ?? senderJid.split("@")[0];
+  const senderName = displaySenderName(msg.pushName, senderJid);
   const senderPhone = senderJid.split("@")[0];
 
-  // Determine content text
-  const contentText = text || (media ? `(${media.kind})` : "");
+  // Determine content text. Neutralized once, here, so the notification, the
+  // secondaries' copy and the on-disk log all carry byte-identical text - the
+  // same invariant the notifyParams comment below states.
+  const contentText = neutralizeChannelTag(
+    text || (media ? `(${media.kind})` : ""),
+  );
   if (!contentText && !imagePath && !attachment) return;
 
   // Check for reply context
@@ -3810,7 +4072,7 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   persistMessage({
     id: messageId,
     chat_id: remoteJid,
-    user: msg.pushName ?? senderJid.split("@")[0],
+    user: senderName,
     user_id: senderJid,
     text: contentText,
     ts: new Date(timestamp * 1000).toISOString(),
@@ -3873,6 +4135,73 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
 // ─── Baileys connection with retry ─────────────────────────────────────
 
 let reconnectAttempt = 0;
+
+// Epoch ms of the moment the CURRENT socket reached 'open'. 0 until the first
+// connect. This is the only honest dividing line between "this was waiting for
+// us while we were offline" and "this just arrived": anything stamped before
+// we connected cannot have been delivered live to this socket. See
+// isOfflineBacklog and the messages.upsert handler for why ev.type alone is
+// not that line.
+let connectedAt = 0;
+
+// A live message merged into an "append" batch is still live. Baileys buffers
+// events for ~100ms and flushes ALL buffered message upserts as ONE
+// messages.upsert whose `type` is taken from the FIRST entry only
+// (Utils/event-buffer.js), and every outbound send re-upserts its own echo as
+// 'append' (Socket/messages-send.js) — so any genuine inbound landing within
+// that window of one of our own chunks used to be silently demoted to backlog:
+// no notification, no broadcast, no ack, no media download.
+//
+// Direction of the guard matters: this may only ever UPGRADE a misclassified
+// message to live, never downgrade a real backlog message. So every uncertain
+// case (no timestamp, never connected) stays backlog, which is exactly
+// today's behaviour. The 60s tolerance is for clock skew between WhatsApp's
+// stamp and our clock; it bounds the worst case to acting on a message at
+// most a minute stale, versus hours for true offline backlog.
+// connectWhatsApp is the ONLY thing that arms the next reconnect - it installs
+// the connection.update handler that schedules it - so a throw out of a
+// scheduled attempt (a corrupt auth dir, an FS error, a failed version fetch)
+// used to end reconnection permanently while the process stayed alive AND kept
+// holding the singleton lock: `status` says "reconnecting" forever and no
+// other terminal can take over. Catch it, reschedule with the same capped
+// backoff, and say it out loud the first time so this degrades noisily instead
+// of silently.
+let reconnectThrows = 0;
+function scheduleReconnect(delay: number): void {
+  setTimeout(() => {
+    // shutdown() calls sock.end(), which emits connection.update 'close' and
+    // lands right back here. Now that the exit is deferred by a grace window,
+    // that reconnect could actually fire and open a fresh socket - and start
+    // writing creds - on the way out. It must not.
+    if (shuttingDown) return;
+    connectWhatsApp().catch((err) => {
+      reconnectThrows++;
+      reconnectAttempt++;
+      const next = Math.min(1000 * reconnectAttempt, 30000);
+      logDiag(
+        `${LOG_PREFIX}: connect attempt failed: ${err}; retrying in ${next / 1000}s\n`,
+      );
+      // First failure of a streak only: the backoff caps at 30s, so notifying
+      // every time would be a notification every half minute for as long as
+      // the fault lasts. reconnectThrows is cleared on the next 'open'.
+      if (AUTO_NOTIFY && reconnectThrows === 1) {
+        notifySystem(
+          `WhatsApp could not reconnect: ${err instanceof Error ? err.message : String(err)}. Retrying every ${next / 1000}s.`,
+          "reconnect-failed",
+        );
+      }
+      scheduleReconnect(next);
+    });
+  }, delay);
+}
+
+const BACKLOG_SKEW_TOLERANCE_MS = 60_000;
+function isOfflineBacklog(msg: WAMessage): boolean {
+  if (!connectedAt) return true;
+  const tsMs = toEpochMs(msg.messageTimestamp);
+  if (tsMs === undefined || !tsMs) return true;
+  return tsMs < connectedAt - BACKLOG_SKEW_TOLERANCE_MS;
+}
 
 let pairingCodeRequested = false;
 let lastPairingCode = "";
@@ -3977,7 +4306,11 @@ async function connectWhatsApp(): Promise<void> {
     printQRInTerminal: !PHONE_NUMBER, // QR only if no phone number set
     logger: silentLogger,
     browser: ["Mac OS", "Chrome", "145.0.0"],
-    defaultQueryTimeoutMs: undefined,
+    // Baileys' own default, restored explicitly. `undefined` disables the
+    // timeout entirely, which turns a single dropped iq response into a query
+    // that never settles - and every awaited query behind it (see
+    // resolveGroupName) hangs with it.
+    defaultQueryTimeoutMs: 60_000,
     generateHighQualityLinkPreview: false,
     syncFullHistory: false,
     markOnlineOnConnect: false,
@@ -4122,6 +4455,11 @@ async function connectWhatsApp(): Promise<void> {
 
     if (connection === "open") {
       reconnectAttempt = 0;
+      reconnectThrows = 0;
+      // Stamped before anything else in this branch: isOfflineBacklog treats
+      // 0 as "never connected → everything is backlog", so the window where
+      // this is unset must be as short as possible.
+      connectedAt = Date.now();
       pairingCodeRequested = false;
       ownJid = jidNormalizedUser(sock!.user?.id ?? "");
       // Baileys never emits a lid-mapping.update for our own account, yet
@@ -4233,7 +4571,7 @@ async function connectWhatsApp(): Promise<void> {
         logDiag(
           `${LOG_PREFIX}: pairing in progress, retrying in ${delay / 1000}s\n`,
         );
-        setTimeout(connectWhatsApp, delay);
+        scheduleReconnect(delay);
         return;
       }
 
@@ -4245,7 +4583,7 @@ async function connectWhatsApp(): Promise<void> {
           ? " (session conflict — another instance may be using this auth)"
           : "";
       logDiag(`${LOG_PREFIX}: reconnecting in ${delay / 1000}s${detail}\n`);
-      setTimeout(connectWhatsApp, delay);
+      scheduleReconnect(delay);
     }
   });
 
@@ -4280,11 +4618,18 @@ async function connectWhatsApp(): Promise<void> {
       // same gate so the log (and catch_up) has them, but as BACKLOG: no
       // live notification, no media download, no pairing reply - a replay
       // must never make this server act on a message that is hours old.
-      const backlog = ev.type === "append";
-      if (!backlog && ev.type !== "notify") return;
+      //
+      // ev.type gates the BATCH, but it cannot decide each message: Baileys'
+      // event buffer merges every buffered upsert into one event and takes
+      // `type` from the first entry alone, so one 'append' echo of our own
+      // send drags genuine live inbounds in behind it. Backlog is therefore
+      // decided per message, against when this socket connected — see
+      // isOfflineBacklog.
+      const appendBatch = ev.type === "append";
+      if (!appendBatch && ev.type !== "notify") return;
       for (const msg of ev.messages) {
         try {
-          await handleMessage(msg, backlog);
+          await handleMessage(msg, appendBatch && isOfflineBacklog(msg));
         } catch (err) {
           logDiag(`${LOG_PREFIX}: message handler error: ${err}\n`);
         }
@@ -4292,28 +4637,56 @@ async function connectWhatsApp(): Promise<void> {
     },
   );
 
-  // Handle emoji reactions on permission request messages
+  // Handle emoji reactions on permission request messages.
+  //
+  // Two keys, only one of them trustworthy. `key` here is
+  // content.reactionMessage.key — the REACTED-TO key, copied verbatim out of
+  // the sender's own stanza (Utils/process-message.js), so its id and fromMe
+  // are whatever the sender chose to put there: anyone who can send us a
+  // reaction can name any message id, including a permission request they
+  // never saw. `reaction.key` is the reaction message's OWN key, stamped by
+  // WhatsApp (remoteJid = the chat it arrived in, participant = the sender in
+  // a group), and is the only authenticated identity available here.
+  // fromMe on the attacker-controlled key is kept only as a cheap early-out;
+  // the reactor check below is what actually decides.
   sock.ev.on(
     "messages.reaction" as any,
-    async (reactions: { key: WAMessageKey; reaction: { text: string } }[]) => {
+    async (
+      reactions: {
+        key: WAMessageKey;
+        reaction: { text: string; key?: WAMessageKey };
+      }[],
+    ) => {
       for (const { key, reaction } of reactions) {
         if (!key.id || key.fromMe) continue;
-        const requestId = permissionMessageMap.get(key.id);
-        if (!requestId) continue;
+        const pending = permissionMessageMap.get(key.id);
+        if (!pending) continue;
         const emoji = reaction.text;
         const isApprove = ["👍", "✅", "👌", "🆗"].includes(emoji);
         const isDeny = ["👎", "❌", "🚫", "✋"].includes(emoji);
         if (!isApprove && !isDeny) continue;
+        const reactorJid =
+          reaction.key?.participant ?? reaction.key?.remoteJid ?? "";
+        // Same normalizing comparison claimPermission uses, for the same
+        // reason: the owner reaches us as @lid or as a phone jid depending on
+        // the path. A mismatch is dropped WITHOUT deleting the entry, so the
+        // owner's own reaction still works afterwards.
+        if (!reactorJid || !isAllowedJid(reactorJid, [pending.chatId])) {
+          logDiag(
+            `${LOG_PREFIX}: ignored permission reaction from ${reactorJid ? maskJid(reactorJid) : "unknown"} (not the chat we asked)\n`,
+          );
+          continue;
+        }
         permissionMessageMap.delete(key.id);
         void mcp.notification({
           method: "notifications/claude/channel/permission",
           params: {
-            request_id: requestId,
+            request_id: pending.requestId,
             behavior: isApprove ? "allow" : "deny",
           },
         });
         logDiag(
-          `${LOG_PREFIX}: permission ${requestId} ${isApprove ? "approved" : "denied"} via reaction ${emoji}\n`,
+          `${LOG_PREFIX}: permission ${pending.requestId} ${isApprove ? "approved" : "denied"} via reaction ${emoji}\n`,
         );
       }
     },
@@ -4322,7 +4695,10 @@ async function connectWhatsApp(): Promise<void> {
 
 if (!CONFLICT) {
   logDiag(`${LOG_PREFIX}: starting\n`);
-  await becomePrimary();
+  // Same wrapper as the lock-retry promotion: a first connect that throws must
+  // leave a live retry chain behind, not a lock-holding process that never
+  // reconnects.
+  await promoteAndConnect();
 } else if (ipcRelay) {
   logDiag(
     `${LOG_PREFIX}: relaying tool calls to the primary (pid ${CONFLICT.pid})\n`,

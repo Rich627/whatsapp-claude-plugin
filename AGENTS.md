@@ -49,7 +49,7 @@ WhatsApp (phone) ←─ Baileys ─→ MCP Server (server.ts) ←─ stdio ─�
   transcription → 4096-char chunking in `length` or `newline` mode per
   `access.json`'s `chunkMode`), per-group personality loading, cron parser (reads the
   `## Cron Jobs` section — exactly that heading — in each group's `config.md`).
-- **`skills/`** — user-facing commands: `/whatsapp-claude-channel:setup`,
+- **`skills/`** — user-facing commands: `/whatsapp-channel:setup`,
   `:configure`, `:access`.
 - **`hooks/hooks.json`** → `hooks-handlers/session-start.sh` — onboarding detection at
   session start.
@@ -84,13 +84,13 @@ WhatsApp (phone) ←─ Baileys ─→ MCP Server (server.ts) ←─ stdio ─�
 
 All in `docs/governance/`:
 
-| Situation | Read |
-| --- | --- |
-| Delegating work to subagents, or choosing model/effort for one | `C-model-dispatch.md` |
-| Deciding: am I done? escalate? ask the user? is my approach wrong? | `D-judgment-rubric.md` |
-| Writing a subagent prompt (search / implement / refactor / research / review) | `E-dispatch-templates.md` |
-| You learned a lesson, hit a new failure mode, or want to edit governance files | `F-maintenance-protocol.md` |
-| Session start on substantial work, or when disoriented | `G-letter-to-future-sessions.md` and `A-diagnosis.md` |
+| Situation                                                                      | Read                                                  |
+| ------------------------------------------------------------------------------ | ----------------------------------------------------- |
+| Delegating work to subagents, or choosing model/effort for one                 | `C-model-dispatch.md`                                 |
+| Deciding: am I done? escalate? ask the user? is my approach wrong?             | `D-judgment-rubric.md`                                |
+| Writing a subagent prompt (search / implement / refactor / research / review)  | `E-dispatch-templates.md`                             |
+| You learned a lesson, hit a new failure mode, or want to edit governance files | `F-maintenance-protocol.md`                           |
+| Session start on substantial work, or when disoriented                         | `G-letter-to-future-sessions.md` and `A-diagnosis.md` |
 
 These files are the operating system for this environment, written deliberately on
 2026-07-03 to make future sessions reliable. Don't casually override them; change them

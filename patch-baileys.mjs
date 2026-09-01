@@ -21,6 +21,14 @@ const baileys = join(
   "lib",
 );
 
+// Set (non-zero exitCode) only when a patch target has genuinely vanished -
+// i.e. neither the pre-patch nor the post-patch text is present, so we can't
+// tell whether the fix is already in place. Re-running after a successful
+// patch (or against an install that's already patched) always lands in the
+// "already patched" branch below and never touches this - a fresh install
+// must stay green.
+let unapplied = 0;
+
 function patch(file, find, replace, label) {
   const path = join(baileys, file);
   if (!existsSync(path)) {
@@ -33,12 +41,16 @@ function patch(file, find, replace, label) {
       console.log(`  ok: ${label} (already patched)`);
     } else {
       console.log(
-        `  warn: ${label} — pattern not found, may need manual review`,
+        `  ERROR: ${label} — pattern not found in ${file}; patch NOT applied (baileys version likely changed, needs manual review)`,
       );
+      unapplied++;
     }
     return;
   }
-  src = src.replace(find, replace);
+  // replaceAll: some patch targets appear more than once in the file, and a
+  // silent "only the first occurrence got patched" is exactly the kind of
+  // invisible partial-patch this rework exists to prevent.
+  src = src.replaceAll(find, replace);
   writeFileSync(path, src);
   console.log(`  patched: ${label}`);
 }
@@ -46,10 +58,15 @@ function patch(file, find, replace, label) {
 console.log("patching baileys rc.9...");
 
 // Patch 1: passive: true → passive: false
+// Matched together with the following `pull: true,` line (not just
+// "passive: true" alone): the same file also has an unrelated
+// `passive: false` site (generateRegistrationNode) that would otherwise make
+// the "already patched" check below indistinguishable from "target vanished"
+// for this specific patch.
 patch(
   "Utils/validate-connection.js",
-  "passive: true",
-  "passive: false",
+  "passive: true,\n        pull: true,",
+  "passive: false,\n        pull: true,",
   "passive flag",
 );
 
@@ -83,5 +100,22 @@ patch(
   "1034074495",
   "WA Web version (generics)",
 );
+
+if (unapplied > 0) {
+  console.error(
+    [
+      "",
+      "=== patch-baileys: PATCH(ES) NOT APPLIED ===",
+      `${unapplied} patch(es) above could not be applied - their target text was not found,`,
+      "and the already-patched text wasn't found either. This most likely means",
+      "@whiskeysockets/baileys was upgraded and patch-baileys.mjs needs updating for the",
+      "new source. Running unpatched (e.g. without the passive:false device_removed fix)",
+      "is a real outage risk - do not ignore this.",
+      "==============================================",
+      "",
+    ].join("\n"),
+  );
+  process.exitCode = 1;
+}
 
 console.log("done.");

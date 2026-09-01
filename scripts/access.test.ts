@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -730,7 +731,11 @@ describe("review", () => {
     expect(res.out).toContain("wizard");
     // Proves the launcher itself was run under process.execPath with its own
     // (space-containing) path as a single argv element, not split by a shell.
-    expect(res.out).toContain(`SELF=${launcher}`);
+    // Compared via realpath: on macOS `tmpdir()` resolves through the
+    // /var -> /private/var symlink, so the child's reported argv[1] (fully
+    // resolved by the OS) can legitimately differ from `launcher`'s literal
+    // string while still being the very same, unsplit path.
+    expect(res.out).toContain(`SELF=${realpathSync(launcher)}`);
     expect(res.out).toContain(
       "Opening the access screen in a new terminal window. Pick there; I only see what changed.",
     );
