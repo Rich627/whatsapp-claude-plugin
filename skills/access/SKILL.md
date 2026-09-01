@@ -39,6 +39,7 @@ Arguments passed: `$ARGUMENTS`
 ```json
 {
   "dmPolicy": "pairing",
+  "owner": "<jid>",
   "allowFrom": ["<jid>", ...],
   "groups": {
     "<groupJid>": { "requireMention": true, "allowFrom": [], "roster": false }
@@ -54,6 +55,11 @@ Arguments passed: `$ARGUMENTS`
 ```
 
 Missing file = `{dmPolicy:"pairing", allowFrom:[], groups:{}, pending:{}}`.
+
+`owner` is written by the server itself on every connect, from the WhatsApp
+account this device is linked to. It is where permission requests are sent and
+the only chat allowed to approve them. Never edit or remove it by hand — the
+next connect overwrites it anyway.
 
 ---
 

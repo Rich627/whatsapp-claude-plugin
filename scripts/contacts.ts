@@ -168,7 +168,10 @@ export function pruneStrangers(
   for (const [key, entry] of Object.entries(contacts)) {
     if (entry.name) continue; // saved on the phone - never forgotten here
     if (allowedKeys.has(key)) continue;
-    if (key in dmActivity) continue; // activity younger than the TTL (above)
+    // Object.hasOwn, not `in`: dmActivity comes straight from JSON.parse and
+    // still has Object.prototype, so a contact keyed "constructor" would look
+    // permanently active and never age out.
+    if (Object.hasOwn(dmActivity, key)) continue; // younger than the TTL (above)
     delete contacts[key];
     contactsChanged = true;
   }

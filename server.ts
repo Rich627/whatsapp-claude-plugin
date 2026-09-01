@@ -56,6 +56,8 @@ import {
   normalizeMentionJids,
   mentionsForChunk,
 } from "./lib/mentions";
+import { cronMatches, parseCronSection } from "./lib/cron";
+import { extractMentions, extractText } from "./lib/inbound-message";
 import { logContainsId } from "./lib/message-log-probe";
 import {
   awaitingReply,
@@ -1098,6 +1100,12 @@ type GroupPolicy = {
 type Access = {
   dmPolicy: "pairing" | "allowlist" | "disabled";
   allowFrom: string[];
+  // The jid of the WhatsApp account this device is linked to. Stamped from
+  // sock.user on every connect (see connection === "open"), never edited by
+  // hand and never inferred from allowFrom's order. Optional only so an
+  // access.json written before this field existed still parses; the first
+  // connect fills it in.
+  owner?: string;
   groups: Record<string, GroupPolicy>;
   pending: Record<string, PendingEntry>;
   mentionPatterns?: string[];
@@ -1115,17 +1123,49 @@ function defaultAccess(): Access {
 const MAX_CHUNK_LIMIT = 4096; // practical limit for readability
 const MAX_ATTACHMENT_BYTES = 16 * 1024 * 1024; // WhatsApp 16MB media limit
 
+// Home-relative directories nothing legitimate is ever attached from. This is
+// a speed bump, NOT a sandbox: every other readable file on this machine is
+// still sendable, and widening it into a filesystem allowlist is a product
+// decision, not a bug fix. The real boundary is the access allowlist — only a
+// chat that passed assertAllowedChat can ask for an attachment at all.
+const SENSITIVE_HOME_DIRS = [".ssh", ".aws", ".gnupg"];
+
+function realDir(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
 function assertSendable(f: string): void {
-  let real, stateReal: string;
+  let real: string;
   try {
     real = realpathSync(f);
-    stateReal = realpathSync(STATE_DIR);
   } catch {
-    return;
+    // Fail closed. Returning here used to ALLOW the send, which made every
+    // check below skippable by handing in a path that doesn't resolve. The
+    // one caller stats the file immediately afterwards, so a genuinely
+    // sendable file always resolves — refusing costs nothing legitimate.
+    throw new Error(`refusing to send unresolvable path: ${f}`);
   }
+  // AUTH_DIR lives under STATE_DIR, so the credential store is covered by
+  // this same check rather than needing its own entry below.
+  const stateReal = realDir(STATE_DIR);
   const inbox = join(stateReal, "inbox");
   if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
     throw new Error(`refusing to send channel state: ${f}`);
+  }
+  const home = realDir(homedir());
+  for (const d of SENSITIVE_HOME_DIRS) {
+    const dir = realDir(join(home, d));
+    if (real === dir || real.startsWith(dir + sep)) {
+      throw new Error(`refusing to send credential file: ${f}`);
+    }
+  }
+  const base = basename(real);
+  if (base === ".env" || base.startsWith(".env.")) {
+    throw new Error(`refusing to send credential file: ${f}`);
   }
 }
 
@@ -1136,6 +1176,7 @@ function readAccessFile(): Access {
     return {
       dmPolicy: parsed.dmPolicy ?? "pairing",
       allowFrom: parsed.allowFrom ?? [],
+      owner: parsed.owner,
       groups: parsed.groups ?? {},
       pending: parsed.pending ?? {},
       mentionPatterns: parsed.mentionPatterns,
@@ -1179,7 +1220,12 @@ function loadAccess(): Access {
 function assertAllowedChat(chat_id: string): void {
   const access = loadAccess();
   if (isAllowedJid(chat_id, access.allowFrom)) return;
-  if (chat_id in access.groups) return;
+  // Object.hasOwn, never `in`: access.groups is JSON.parse'd but still carries
+  // Object.prototype, so `"constructor" in access.groups` is true and a chat
+  // named after any prototype member would authorize itself here. Nothing
+  // downstream re-checks the allowlist — send-time failure for such a jid is
+  // luck, not a guarantee.
+  if (Object.hasOwn(access.groups, chat_id)) return;
   throw new Error(
     `chat ${chat_id} is not allowlisted — add via /whatsapp-channel:access`,
   );
@@ -1207,26 +1253,47 @@ function saveLidMap(): void {
 }
 
 function recordLidMapping(lid: string, pn: string): void {
-  const nLid = jidNormalizedUser(lid);
-  const nPn = jidNormalizedUser(pn);
-  if (lidMap[nLid] !== nPn) {
-    lidMap[nLid] = nPn;
-    saveLidMap();
+  recordLidMappings([[lid, pn]]);
+}
+
+/** Batch form. Same work as recordLidMapping, but each of the three files is
+ *  reloaded and rewritten at most once for the whole batch instead of once per
+ *  pair. group_roster called the single-pair form inside a .map() over every
+ *  participant, so a large group was thousands of synchronous whole-file
+ *  rewrites with the event loop stalled for all of them. Behaviour for a
+ *  one-pair call is unchanged: the reloads still happen unconditionally, the
+ *  saves still happen only when something actually changed. */
+function recordLidMappings(pairs: Iterable<[string, string]>): void {
+  const normalized: Array<[string, string]> = [];
+  let lidChanged = false;
+  for (const [lid, pn] of pairs) {
+    const nLid = jidNormalizedUser(lid);
+    const nPn = jidNormalizedUser(pn);
+    if (lidMap[nLid] !== nPn) {
+      lidMap[nLid] = nPn;
+      lidChanged = true;
+    }
+    normalized.push([nLid, nPn]);
   }
+  if (normalized.length === 0) return;
+  if (lidChanged) saveLidMap();
   // Centralized here, not at each caller: a contact cached under its raw
   // @lid key (before this resolution was known) needs to move to the
-  // phone key contactKey() will compute from now on, no matter which of
-  // this function's two callers (the passive lid-mapping.update event, or
-  // ensureLidResolved's active fallback) is the one that actually learned
-  // the mapping.
+  // phone key contactKey() will compute from now on, no matter which
+  // caller (the passive lid-mapping.update event, ensureLidResolved's
+  // active fallback, or group_roster's batch) actually learned the mapping.
   reloadContactsMap();
-  if (migrateContactKey(contactsMap, nLid, nPn)) {
-    saveContactsMap();
+  let contactsChanged = false;
+  for (const [nLid, nPn] of normalized) {
+    if (migrateContactKey(contactsMap, nLid, nPn)) contactsChanged = true;
   }
+  if (contactsChanged) saveContactsMap();
   reloadDmActivity();
-  if (migrateDmActivity(nLid, nPn)) {
-    saveDmActivity();
+  let dmsChanged = false;
+  for (const [nLid, nPn] of normalized) {
+    if (migrateDmActivity(nLid, nPn)) dmsChanged = true;
   }
+  if (dmsChanged) saveDmActivity();
 }
 
 function resolveToPhone(jid: string): string {
@@ -1840,6 +1907,9 @@ function isMentioned(
   return false;
 }
 
+// Sends already started and not yet settled, keyed by senderId — see the loop.
+const approvalsInFlight = new Set<string>();
+
 // The /whatsapp-channel:access skill drops a file at approved/<senderId>.
 function checkApprovals(): void {
   let files: string[];
@@ -1858,10 +1928,23 @@ function checkApprovals(): void {
   if (!sock) return;
 
   for (const senderId of files) {
+    // The marker is still deleted only when the send settles — that is what
+    // keeps a dropped connection from eating the pairing confirmation, see
+    // above. But this runs every 5s and a queued send outlives a tick, so the
+    // same marker was re-fired on every pass and the contact got "Paired!"
+    // once per tick until it landed. In memory only: after a restart the
+    // marker is still on disk and the send is retried, exactly as intended.
+    if (approvalsInFlight.has(senderId)) continue;
+    approvalsInFlight.add(senderId);
     const file = join(APPROVED_DIR, senderId);
+    const settled = () => approvalsInFlight.delete(senderId);
     void sendTracked(senderId, { text: "Paired! Say hi to Claude." }).then(
-      () => rmSync(file, { force: true }),
+      () => {
+        settled();
+        rmSync(file, { force: true });
+      },
       (err) => {
+        settled();
         logDiag(`${LOG_PREFIX}: failed to send approval confirm: ${err}\n`);
         rmSync(file, { force: true });
       },
@@ -1878,92 +1961,24 @@ type CronJob = {
   lastFired?: number;
 };
 
-function parseCronField(field: string, now: number, max: number): boolean {
-  if (field === "*") return true;
-  for (const part of field.split(",")) {
-    if (part.includes("/")) {
-      const [, step] = part.split("/");
-      if (now % parseInt(step) === 0) return true;
-    } else if (part.includes("-")) {
-      const [lo, hi] = part.split("-").map(Number);
-      if (now >= lo && now <= hi) return true;
-    } else {
-      if (now === parseInt(part)) return true;
-    }
-  }
-  return false;
-}
-
-function cronMatches(expr: string, date: Date): boolean {
-  const [min, hr, dom, mon, dow] = expr.trim().split(/\s+/);
-  return (
-    parseCronField(min, date.getMinutes(), 59) &&
-    parseCronField(hr, date.getHours(), 23) &&
-    parseCronField(dom, date.getDate(), 31) &&
-    parseCronField(mon, date.getMonth() + 1, 12) &&
-    parseCronField(dow, date.getDay(), 6)
-  );
-}
-
-function to24Hour(hr: number, ampm: string | undefined): number {
-  const p = (ampm ?? "").toLowerCase();
-  if (p === "pm" && hr < 12) return hr + 12;
-  if (p === "am" && hr === 12) return 0;
-  return hr;
-}
-
+// parseCronField / cronMatches / parseCronSection live in ./lib/cron.ts so the
+// schedule grammar is unit testable without this file's connect-on-import
+// side effects. Only the parts that need the world stay here.
 function loadGroupCrons(): CronJob[] {
   const jobs: CronJob[] = [];
   const access = loadAccess();
   for (const groupJid of Object.keys(access.groups)) {
     const cfgPath = groupConfigPath(groupJid);
     try {
-      const content = readFileSync(cfgPath, "utf8");
-      const cronSection = content.match(
-        /## Cron Jobs\n([\s\S]*?)(?=\n## |\n# |$)/,
-      );
-      if (!cronSection) continue;
-      // Parse lines like: - **Name**: description (cron: "expr")
-      // Or: - **Name**: cron expr — description
-      const lines = cronSection[1]
-        .split("\n")
-        .filter((l) => l.startsWith("- "));
-      for (const line of lines) {
-        // Match cron expressions in the line
-        const cronMatch = line.match(/(?:每|every)\s*(\d+)\s*(?:分鐘|分|min)/i);
-        const dailyMatch = line.match(
-          /(?:每天|daily)\s*(\d{1,2}):?(\d{2})?\s*(am|pm)?/i,
+      const parsed = parseCronSection(readFileSync(cfgPath, "utf8"));
+      for (const job of parsed.jobs) jobs.push({ groupJid, ...job });
+      // Loud, not silent: an expression that can never fire (25:00, ":70",
+      // "every 90 min") used to be accepted and then simply never run, which
+      // is indistinguishable from the server being broken.
+      for (const err of parsed.errors) {
+        logDiag(
+          `${LOG_PREFIX}: ignoring unschedulable cron in ${maskJid(groupJid)}/config.md: ${err}\n`,
         );
-        const twiceMatch = line.match(
-          /(?:每天|daily)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:&|和|,)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i,
-        );
-
-        let cronExpr = "";
-        const desc = line.replace(/^-\s*\*\*[^*]+\*\*:?\s*/, "").trim();
-
-        if (twiceMatch) {
-          // Two times per day — create two entries. Each time's am/pm marker
-          // is captured next to that time, not inferred from the whole line
-          // (a line like "daily 1pm & 6am" previously mis-parsed both times
-          // off a single line-wide "includes pm" check).
-          const h1 = to24Hour(parseInt(twiceMatch[1]), twiceMatch[3]);
-          const m1 = parseInt(twiceMatch[2] || "0");
-          const h2 = to24Hour(parseInt(twiceMatch[4]), twiceMatch[6]);
-          const m2 = parseInt(twiceMatch[5] || "0");
-          jobs.push({ groupJid, cron: `${m1} ${h1} * * *`, prompt: desc });
-          jobs.push({ groupJid, cron: `${m2} ${h2} * * *`, prompt: desc });
-          continue;
-        } else if (dailyMatch) {
-          const hr = to24Hour(parseInt(dailyMatch[1]), dailyMatch[3]);
-          const min = parseInt(dailyMatch[2] || "0");
-          cronExpr = `${min} ${hr} * * *`;
-        } else if (cronMatch) {
-          cronExpr = `*/${cronMatch[1]} * * * *`;
-        }
-
-        if (cronExpr && desc) {
-          jobs.push({ groupJid, cron: cronExpr, prompt: desc });
-        }
       }
     } catch {}
   }
@@ -1981,13 +1996,18 @@ function initServerCrons(): void {
   }
 }
 
-// Check crons every minute
+// Three times a minute, not once. A timer never fires early, only late, so a
+// 60_000 interval drifts forward a little on every tick and eventually skips a
+// minute number outright — that minute's job then never fires at all, silently.
+// Any event-loop stall guarantees it. The per-job lastFired dedupe below keys
+// on the minute number itself, so the extra ticks cost one cronMatches() call
+// each and can never double-fire a job within the same minute.
+const CRON_TICK_MS = 20_000;
 setInterval(() => {
   if (!sock || serverCrons.length === 0) return;
   const now = new Date();
   for (const job of serverCrons) {
     if (!cronMatches(job.cron, now)) continue;
-    // Prevent double-firing within the same minute
     const minuteKey = Math.floor(now.getTime() / 60000);
     if (job.lastFired === minuteKey) continue;
     job.lastFired = minuteKey;
@@ -2017,7 +2037,7 @@ setInterval(() => {
         logDiag(`${LOG_PREFIX}: cron notification failed: ${err}\n`);
       });
   }
-}, 60_000).unref();
+}, CRON_TICK_MS).unref();
 
 // ─── Markdown → WhatsApp format conversion ────────────────────────────
 
@@ -2236,14 +2256,22 @@ function persistMessage(entry: MessageLogEntry): void {
   }
 }
 
-function markReplied(chat_id: string): void {
-  // Rewrite the log, marking all unreplied messages for this chat as replied
+/** Marks this chat's unreplied lines as replied. `onlyIds` narrows that to a
+ *  snapshot the caller took BEFORE it started sending: the `reply` tool awaits
+ *  every chunk and up to 16MB of uploads before it gets here, and without the
+ *  snapshot a message that arrived during those awaits was flipped to replied
+ *  by a reply that could not possibly have answered it — gone from unreplied
+ *  and catch_up, answered by nobody. Callers with no await between deciding to
+ *  reply and calling this (logOwnerHandReply) pass nothing and keep the
+ *  original whole-chat meaning. */
+function markReplied(chat_id: string, onlyIds?: ReadonlySet<string>): void {
   try {
     if (!existsSync(MESSAGE_LOG)) return;
     const lines = readFileSync(MESSAGE_LOG, "utf8").split("\n").filter(Boolean);
     const updated = lines.map((line) => {
       try {
         const entry = JSON.parse(line) as MessageLogEntry;
+        if (onlyIds && !onlyIds.has(entry.id)) return line;
         if (entry.chat_id === chat_id && !entry.replied) {
           entry.replied = true;
           return JSON.stringify(entry);
@@ -2413,7 +2441,7 @@ function pruneLidMap(allowed: ReadonlySet<string>): boolean {
   for (const [lid, pn] of Object.entries(lidMap)) {
     const key = contactKey(pn);
     if (allowed.has(key)) continue;
-    if (key in dmActivity) continue;
+    if (Object.hasOwn(dmActivity, key)) continue;
     delete lidMap[lid];
     changed = true;
   }
@@ -2565,13 +2593,27 @@ const mcp = new Server(
   },
 );
 
-// Permission relay — forward to all allowlisted DMs.
+/** The single chat a permission request is delivered to, and therefore the
+ *  only chat that can answer it. access.owner is stamped from the linked
+ *  WhatsApp account on every connect, so it is the account this device belongs
+ *  to. This used to be access.allowFrom[0] — plain insertion order, so a
+ *  contact allowlisted before the server first connected received every
+ *  command preview (up to 500 raw characters of the Bash command) and, being
+ *  the bound chat, could approve it. The allowFrom[0] fallback covers only an
+ *  access.json that has never been stamped, i.e. before the first connect of
+ *  this version; it keeps the old behaviour rather than failing closed and
+ *  silently swallowing permission requests. */
+function permissionTarget(access: Access): string | undefined {
+  return access.owner ?? access.allowFrom[0];
+}
+
+// Permission relay — forward to the owner's DM only.
 // Track permission request message IDs for emoji-based approval.
-// chatId is the jid the request was actually DELIVERED to (access.allowFrom[0],
-// the owner). Approving a tool call is the most privileged thing this channel
-// can do, so it is bound to that one chat: an approval arriving from any other
-// chat — a group the owner also allowlisted, a second contact — is not an
-// approval, it is someone answering a question they were never asked.
+// chatId is the jid the request was actually DELIVERED to (permissionTarget).
+// Approving a tool call is the most privileged thing this channel can do, so
+// it is bound to that one chat: an approval arriving from any other chat — a
+// group the owner also allowlisted, a second contact — is not an approval, it
+// is someone answering a question they were never asked.
 const permissionMessageMap = new Map<
   string,
   { requestId: string; chatId: string }
@@ -2660,8 +2702,7 @@ mcp.setNotificationHandler(
       `${preview}\n\n` +
       `👍 react or "yes ${request_id}" to allow\n` +
       `👎 react or "no ${request_id}" to deny`;
-    // Send to the first allowlisted contact (owner) only, to avoid spam
-    const owner = access.allowFrom[0];
+    const owner = permissionTarget(access);
     if (sock && owner) {
       const sent = await sock.sendMessage(owner, { text }).catch((e) => {
         logDiag(`permission_request send to ${maskJid(owner)} failed: ${e}\n`);
@@ -2881,6 +2922,15 @@ const handleToolCall = async (req: {
         assertAllowedChat(chat_id);
         if (!sock) throw new Error("WhatsApp not connected");
 
+        // Taken before the first await in this handler, not after the send:
+        // see markReplied. Anything that lands in this chat from here on is
+        // NOT covered by this reply and must stay unreplied.
+        const repliedIds = new Set(
+          getUnreplied()
+            .filter((m) => m.chat_id === chat_id)
+            .map((m) => m.id),
+        );
+
         const mentionJids = normalizeMentionJids(
           rawMentions.filter((m) => !isAllToken(m)),
           lidMap,
@@ -3017,7 +3067,7 @@ const handleToolCall = async (req: {
           }
         }
 
-        markReplied(chat_id);
+        markReplied(chat_id, repliedIds);
 
         // Log the outbound reply for catch_up — full original text once, not per chunk
         const outText =
@@ -3248,7 +3298,7 @@ const handleToolCall = async (req: {
         }
         groups.sort((a, b) => (a.subject ?? "").localeCompare(b.subject ?? ""));
         const lines = groups.map((g) => {
-          const allowed = g.id in access.groups;
+          const allowed = Object.hasOwn(access.groups, g.id);
           const roster = !!access.groups[g.id]?.roster;
           // Same reason as resolveGroupName: an admin-settable subject is
           // rendered into text the model reads.
@@ -3282,20 +3332,27 @@ const handleToolCall = async (req: {
           );
         }
         const meta = await sock.groupMetadata(chat_id);
+        // resolveToPhone(p.id) only resolves through OUR OWN passively-
+        // populated lidMap (see its own comment) - a participant we've
+        // never exchanged a lid-mapping.update event with (never spoken)
+        // falls back to the raw LID jid unresolved, so both the name
+        // lookup and the mask below would key/show the LID's own digits
+        // instead of the phone number. groupMetadata() already returns
+        // each participant's phoneNumber directly (Baileys resolves this
+        // as part of the roster fetch itself, no event needed) - prefer
+        // that, and feed it back into lidMap so later lookups elsewhere
+        // (allowlist matching, other tools) benefit too, not just this one.
+        // Collected and applied in ONE batch before the render loop below:
+        // done per participant, a big group meant thousands of synchronous
+        // whole-file rewrites with the event loop stalled throughout.
+        recordLidMappings(
+          meta.participants.flatMap((p) =>
+            p.phoneNumber && isLidUser(p.id)
+              ? [[p.id, p.phoneNumber] as [string, string]]
+              : [],
+          ),
+        );
         const lines = meta.participants.map((p) => {
-          // resolveToPhone(p.id) only resolves through OUR OWN passively-
-          // populated lidMap (see its own comment) - a participant we've
-          // never exchanged a lid-mapping.update event with (never spoken)
-          // falls back to the raw LID jid unresolved, so both the name
-          // lookup and the mask below would key/show the LID's own digits
-          // instead of the phone number. groupMetadata() already returns
-          // each participant's phoneNumber directly (Baileys resolves this
-          // as part of the roster fetch itself, no event needed) - prefer
-          // that, and feed it back into lidMap so later lookups elsewhere
-          // (allowlist matching, other tools) benefit too, not just this one.
-          if (p.phoneNumber && isLidUser(p.id)) {
-            recordLidMapping(p.id, p.phoneNumber);
-          }
           const phone = p.phoneNumber ?? resolveToPhone(p.id);
           const name = contactName(contactsMap, contactKey(phone));
           // .notify (self-reported) commonly defaults to the person's own
@@ -3513,22 +3570,9 @@ const silentLogger: any = {
 
 // ─── WhatsApp connection ───────────────────────────────────────────────
 
-function extractText(msg: proto.IMessage | null | undefined): string {
-  if (!msg) return "";
-  return (
-    msg.conversation ??
-    msg.extendedTextMessage?.text ??
-    msg.imageMessage?.caption ??
-    msg.videoMessage?.caption ??
-    msg.documentMessage?.caption ??
-    ""
-  );
-}
-
-function extractMentions(msg: proto.IMessage | null | undefined): string[] {
-  return (msg?.extendedTextMessage?.contextInfo?.mentionedJid ??
-    []) as string[];
-}
+// extractText / extractMentions live in ./lib/inbound-message.ts so the pair
+// stays testable and, more importantly, stays in step with each other — see
+// that file's header for the bug that separating them caused.
 
 type MediaInfo = {
   kind: string;
@@ -4473,15 +4517,29 @@ async function connectWhatsApp(): Promise<void> {
       // Auto-add owner to allowlist on first connection
       if (ownJid && !STATIC) {
         const access = loadAccess();
+        let accessChanged = false;
         if (!isAllowedJid(ownJid, access.allowFrom)) {
           access.allowFrom.push(resolvedOwn);
+          accessChanged = true;
           if (access.dmPolicy === "pairing" && access.allowFrom.length > 0) {
             access.dmPolicy = "allowlist";
             logDiag(`${LOG_PREFIX}: auto-locked to allowlist mode\n`);
           }
+        }
+        // Stamped on every connect, not just the first: this is the account
+        // the device is linked to, which is the only defensible definition of
+        // "owner" here. Everything that used to mean allowFrom[0] reads this
+        // instead — array position was never ownership, it was insertion
+        // order, and a contact allowlisted before the first connect landed in
+        // front of the real owner.
+        if (access.owner !== resolvedOwn) {
+          access.owner = resolvedOwn;
+          accessChanged = true;
+        }
+        if (accessChanged) {
           saveAccess(access);
           logDiag(
-            `${LOG_PREFIX}: auto-added owner ${maskJid(resolvedOwn)} to allowlist\n`,
+            `${LOG_PREFIX}: owner ${maskJid(resolvedOwn)} recorded and allowlisted\n`,
           );
         }
       }
@@ -4555,12 +4613,22 @@ async function connectWhatsApp(): Promise<void> {
       logDiag(`${LOG_PREFIX}: disconnected (reason: ${reason})\n`);
 
       if (statusCode === DisconnectReason.loggedOut) {
-        // Device was unlinked — auth is invalid
-        logDiag(
-          `${LOG_PREFIX}: logged out — auth invalid.\n` +
-            `  Run /whatsapp-channel:configure reset-auth to clear and re-pair.\n`,
-        );
-        // Don't auto-delete auth — let user decide
+        // Device was unlinked — auth is invalid and there is no reconnect
+        // that can fix it. This is the one close that ends the channel for
+        // good, and it used to write a single diag line and return: nothing
+        // reached the terminal, so the channel was dead to the outside world
+        // with nobody told. Every other lifecycle event here notifies.
+        const loggedOutMsg = [
+          `WhatsApp is disconnected: this device was unlinked from the phone.`,
+          `No reconnect can recover this — the stored credentials are dead.`,
+          ``,
+          `To get the channel back:`,
+          `  /whatsapp-channel:configure reset-auth`,
+          `  → then re-pair by scanning/entering the code on the phone.`,
+        ].join("\n");
+        logDiag(`${LOG_PREFIX}: ${loggedOutMsg}\n`);
+        // Deliberately NOT deleting AUTH_DIR — that stays the user's call.
+        if (AUTO_NOTIFY) notifySystem(loggedOutMsg, "logged-out");
         return;
       }
 

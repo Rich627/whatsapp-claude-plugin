@@ -44,7 +44,7 @@ WhatsApp (phone) ←─ Baileys ─→ MCP Server (server.ts) ←─ stdio ─�
   `react`, `download_attachment`, `edit_message`, `status`, `unreplied`, `catch_up`,
   `list_groups`.
   Also contains: access-control engine (DM policies `pairing`/`allowlist`/`disabled`,
-  group policies, pairing codes with 5-min TTL, LID↔phone mapping), message pipeline
+  group policies, pairing codes with 1-hour TTL, LID↔phone mapping), message pipeline
   (access gate → routing → mention detection → text/media extraction → optional
   transcription → 4096-char chunking in `length` or `newline` mode per
   `access.json`'s `chunkMode`), per-group personality loading, cron parser (reads the
