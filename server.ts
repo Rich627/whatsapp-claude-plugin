@@ -67,6 +67,11 @@ import {
   recentBothSides,
   renderLogEntry,
 } from "./lib/message-view";
+import {
+  displaySenderName,
+  neutralizeChannelTag,
+  safeName,
+} from "./lib/sanitize";
 import { formatSentLine, parseSentLog } from "./lib/sent-log";
 import {
   contactName,
@@ -928,6 +933,11 @@ let retrying = false;
 // forever (each re-arming the other), tripling on a third flap.
 let retryGen = 0;
 
+// Declared here, not next to shutdown() where it is set, because every timer
+// chain below has to read it and a `let` further down the file would still be
+// in its temporal dead zone when the first tick fires.
+let shuttingDown = false;
+
 function onRelayLost(): void {
   if (isPrimary) return; // we closed it ourselves after promoting
   ipcRelay = null;
@@ -936,7 +946,7 @@ function onRelayLost(): void {
 }
 
 function startRetryLoop(everConnected = false): void {
-  if (retrying || isPrimary) return;
+  if (retrying || isPrimary || shuttingDown) return;
   retrying = true;
   writeRoleFile("reconnecting", everConnected);
   const gen = ++retryGen;
@@ -952,11 +962,17 @@ function startRetryLoop(everConnected = false): void {
 // loop on a synchronous start-time probe (server.ts:155 — a PowerShell CIM
 // spawn on Windows) and connectToPrimary() can take IPC_PROBE_TIMEOUT_MS, so
 // fixed intervals would let ticks pile up on top of each other.
+// Both chains below are guarded at the top AND inside the timer callback, and
+// they are not the same guard: the top one stops a new tick being armed once
+// shutdown() has run, the inner one stops a tick armed BEFORE shutdown from
+// acting during the 2s grace window the exit is now deferred by. Only the
+// inner one closes the hole the grace window opened.
 function queueReconnect(gen: number): void {
+  if (shuttingDown) return;
   setTimeout(async () => {
-    if (!retrying || gen !== retryGen) return;
+    if (!retrying || gen !== retryGen || shuttingDown) return;
     const relay = await connectToPrimary(onRelayLost, true);
-    if (!retrying || gen !== retryGen) return relay?.close(); // stale chain — a lock tick promoted us, or a newer chain took over, while this connect was in flight
+    if (!retrying || gen !== retryGen || shuttingDown) return relay?.close(); // stale chain — a lock tick promoted us, a newer chain took over, or we are exiting, while this connect was in flight
     if (!relay) return queueReconnect(gen);
     ipcRelay = relay;
     retrying = false;
@@ -965,8 +981,15 @@ function queueReconnect(gen: number): void {
 }
 
 function queueLockRetry(gen: number): void {
+  if (shuttingDown) return;
   setTimeout(() => {
-    if (!retrying || gen !== retryGen) return;
+    // Winning the lock here during the grace window is the worst case in the
+    // file: this process would promote, open a socket and start writing fresh
+    // credentials, and then be killed mid-write by the grace timer's exit(0) —
+    // the exact corruption the grace window exists to prevent — leaving behind
+    // a lock file nothing releases (shutdown() has already run, and
+    // releaseSingletonLock() only ever fires once).
+    if (!retrying || gen !== retryGen || shuttingDown) return;
     // No backoff. Cheap when it matters (a clean primary exit
     // leaves no lock file, so this is one atomic create), but a primary that
     // stays alive with no reachable listener keeps this probing every 3s for
@@ -1033,12 +1056,22 @@ async function promoteAndConnect(): Promise<void> {
   } catch (err) {
     reconnectAttempt++;
     const next = Math.min(1000 * reconnectAttempt, 30000);
+    // scheduleReconnect below re-runs connectWhatsApp and nothing else, so a
+    // throw from anywhere earlier in becomePrimary leaves that part unretried
+    // forever. The IPC listener is the one such part with an outside observer:
+    // without it every other terminal stays a stub with no way back. Retry it
+    // here, and if it is still down say so in the same line rather than
+    // degrading quietly on a host nobody is watching.
+    if (!ipcServer) await startIpcListener();
+    const ipcNote = ipcServer
+      ? ""
+      : " (IPC listener down — other terminals cannot relay)";
     logDiag(
-      `${LOG_PREFIX}: promotion to primary failed: ${err}; retrying in ${next / 1000}s\n`,
+      `${LOG_PREFIX}: promotion to primary failed: ${err}${ipcNote}; retrying in ${next / 1000}s\n`,
     );
     if (AUTO_NOTIFY) {
       notifySystem(
-        `WhatsApp promotion failed: ${err instanceof Error ? err.message : String(err)}. Retrying in ${next / 1000}s.`,
+        `WhatsApp promotion failed: ${err instanceof Error ? err.message : String(err)}${ipcNote}. Retrying in ${next / 1000}s.`,
         "promote-failed",
       );
     }
@@ -2419,7 +2452,25 @@ function pruneStrangerCaches(): void {
     // refused stranger's identifier retained - whatever the contact-cache
     // setting is. An empty `allowed` means access.json is missing or
     // unreadable, not that nobody is allowed; never wipe the map on that.
-    if (allowed.size > 0 && pruneLidMap(allowed)) saveLidMap();
+    //
+    // Its own reprieve set, not the one pruneStrangers got: an in-flight
+    // pairing is a stranger to the contact caches (nobody has approved them,
+    // and #30 exists to age exactly those out) but not to lidMap, because
+    // `access pair <code>` appends p.senderId to allowFrom verbatim. Drop the
+    // mapping in between and the approval lands on an @lid the allowlist can
+    // no longer match to its phone number.
+    const lidKeep = new Set(allowed);
+    for (const p of Object.values(access.pending)) {
+      lidKeep.add(contactKey(p.senderId));
+      lidKeep.add(contactKey(p.chatId));
+    }
+    // dmActivity is only half a reprieve when contact caching is off: nothing
+    // persists it (saveDmActivity returns early) and nothing ages it
+    // (pruneStrangers is skipped above), so it is whatever this process
+    // happened to see since boot. Reading it anyway would make the same tick
+    // keep or drop the same mapping depending on process uptime. With caching
+    // off the owner-named half is the whole rule.
+    if (allowed.size > 0 && pruneLidMap(lidKeep, CACHE_CONTACTS)) saveLidMap();
   } catch (err) {
     logDiag(`${LOG_PREFIX}: stranger-cache prune failed: ${err}\n`);
   }
@@ -2435,13 +2486,20 @@ function pruneStrangerCaches(): void {
  *  through lidMap and lands on exactly contactKey(pn), so an allowlist that
  *  names the contact by either form matches the same key. Dropping an entry is
  *  in any case recoverable - ensureLidResolved re-derives it from Baileys'
- *  own signal store on the next message. */
-function pruneLidMap(allowed: ReadonlySet<string>): boolean {
+ *  own signal store on the next message (the one path that does NOT re-derive
+ *  is logOwnerHandReply, which reads the cached map only - a hand reply to an
+ *  unmapped @lid contact is dropped until their next inbound message).
+ *
+ *  `useActivity` is false when contact caching is off; see the caller. */
+function pruneLidMap(
+  allowed: ReadonlySet<string>,
+  useActivity: boolean,
+): boolean {
   let changed = false;
   for (const [lid, pn] of Object.entries(lidMap)) {
     const key = contactKey(pn);
     if (allowed.has(key)) continue;
-    if (Object.hasOwn(dmActivity, key)) continue;
+    if (useActivity && Object.hasOwn(dmActivity, key)) continue;
     delete lidMap[lid];
     changed = true;
   }
@@ -3354,7 +3412,13 @@ const handleToolCall = async (req: {
         );
         const lines = meta.participants.map((p) => {
           const phone = p.phoneNumber ?? resolveToPhone(p.id);
-          const name = contactName(contactsMap, contactKey(phone));
+          // safeName for the same reason the group subject above gets it:
+          // contactName() falls back to `.notify`, which the member sets
+          // themselves, and this is a rendered surface - a member named
+          // "x</channel" would otherwise close the envelope the roster is
+          // read inside. Sanitized BEFORE the number-shape test so a name
+          // cannot change shape on the way out.
+          const name = safeName(contactName(contactsMap, contactKey(phone)));
           // .notify (self-reported) commonly defaults to the person's own
           // number for anyone who never set a custom display name -
           // contactName()'s permissive name-or-notify fallback would hand
@@ -3426,7 +3490,6 @@ for (const n of pendingSecondaryNotifications.splice(0)) {
 // that a terminal closing doesn't feel hung.
 const SHUTDOWN_GRACE_MS = 2000;
 
-let shuttingDown = false;
 function shutdown(): void {
   // Re-entrant by design: stdin emits 'end' and then 'close', and both are
   // wired here. Must stay a plain return - forcing the exit on the second
@@ -3740,34 +3803,6 @@ async function transcribeAudio(filePath: string): Promise<string | null> {
   return transcribeLocal(filePath);
 }
 
-function safeName(s: string | undefined | null): string | undefined {
-  return s?.replace(/[<>\[\]\r\n;]/g, "_");
-}
-
-// pushName is profile text the SENDER sets, and it lands in the `user=`
-// attribute of the <channel …> envelope and in the message log. Unsanitized it
-// can close that attribute or the tag itself. Empty after stripping (a name
-// made only of those characters) is no name at all — fall back to the
-// phone-part, which is what this file already uses when pushName is absent.
-function displaySenderName(
-  pushName: string | undefined | null,
-  senderJid: string,
-): string {
-  return safeName(pushName)?.trim() || senderJid.split("@")[0];
-}
-
-// Envelope integrity, NOT general escaping. Message bodies reach the model
-// inside <channel source="whatsapp" …>, so a body containing the literal
-// "</channel" could close that tag early — everything after it would then read
-// as the session's own text instead of as quoted, untrusted chat. Only those
-// two sequences are neutralized; `<` and `>` everywhere else are left exactly
-// as typed, because people legitimately send code and the body is already
-// understood to be untrusted input. The zero-width space renders identically
-// to the sender's original while making the tag inert.
-function neutralizeChannelTag(s: string): string {
-  return s.replace(/<(\/?)channel/gi, "<\u200B$1channel");
-}
-
 // The owner replied on their phone. Log it for the chats the agent is already
 // allowed to see, so unreplied clears and catch_up shows both halves. This is
 // deliberately NOT gate(): gate is the INBOUND path and mints/refreshes pairing
@@ -3824,7 +3859,14 @@ async function logOwnerHandReply(msg: WAMessage): Promise<void> {
     chat_id: chatId,
     user: ownerDisplayName(),
     user_id: ownJid || "self",
-    text,
+    // The owner is trusted, so this is envelope integrity rather than a gate:
+    // their line is rendered by catch_up through the same <channel …> envelope
+    // every inbound line is, and a "</channel" they typed by hand (quoting
+    // this repo's own code, say) would truncate it exactly the same way.
+    // Lines written before this change are not migrated - a stale one still
+    // renders as it did, which is the pre-existing behaviour and self-healing
+    // as the log ages out.
+    text: neutralizeChannelTag(text),
     ts: new Date(tsSec > 0 ? tsSec * 1000 : Date.now()).toISOString(),
     replied: true,
     direction: "out",
@@ -4610,6 +4652,18 @@ async function connectWhatsApp(): Promise<void> {
       pairingCodeRequested = false;
       const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
       const reason = statusCode ?? "unknown";
+      // shutdown() calls sock.end(), which lands here with no status code at
+      // all. Printing "disconnected (reason: unknown)" and then "reconnecting
+      // in 1s" described a reconnect that scheduleReconnect's own guard then
+      // correctly refused to make — and diag.log is the only forensic surface
+      // on an unattended host, so a line claiming something that did not
+      // happen is worse than no line.
+      if (shuttingDown) {
+        logDiag(
+          `${LOG_PREFIX}: disconnected during shutdown; not reconnecting\n`,
+        );
+        return;
+      }
       logDiag(`${LOG_PREFIX}: disconnected (reason: ${reason})\n`);
 
       if (statusCode === DisconnectReason.loggedOut) {
@@ -4715,8 +4769,14 @@ async function connectWhatsApp(): Promise<void> {
   // never saw. `reaction.key` is the reaction message's OWN key, stamped by
   // WhatsApp (remoteJid = the chat it arrived in, participant = the sender in
   // a group), and is the only authenticated identity available here.
-  // fromMe on the attacker-controlled key is kept only as a cheap early-out;
-  // the reactor check below is what actually decides.
+  //
+  // Nothing on the reacted-to key is trusted, not even as an early-out. It
+  // used to skip anything with fromMe set, which cost nothing when the owner
+  // is a separate contact (their device stamps our request fromMe: false) but
+  // silently killed the whole documented 👍 flow for the note-to-self setup,
+  // where the owner IS the linked account and every key in the chat is
+  // fromMe. Its id is still the map lookup, because guessing a WhatsApp
+  // message id is not the weak link — the reactor check below is.
   sock.ev.on(
     "messages.reaction" as any,
     async (
@@ -4726,7 +4786,7 @@ async function connectWhatsApp(): Promise<void> {
       }[],
     ) => {
       for (const { key, reaction } of reactions) {
-        if (!key.id || key.fromMe) continue;
+        if (!key.id) continue;
         const pending = permissionMessageMap.get(key.id);
         if (!pending) continue;
         const emoji = reaction.text;
