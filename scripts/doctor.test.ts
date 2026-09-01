@@ -1,8 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// Creates a sparse file of an exact byte size without writing real data, so
+// boundary tests at hundreds of MB run instantly and cost near-zero disk.
+function writeSized(path: string, bytes: number): void {
+  closeSync(openSync(path, "w"));
+  truncateSync(path, bytes);
+}
 
 const DOCTOR = join(import.meta.dir, "doctor.ts");
 
@@ -221,5 +235,99 @@ describe("optional features", () => {
     expect(out).toContain(
       "run /whatsapp-channel:setup to install auto-recovery",
     );
+  });
+});
+
+describe("notify hook", () => {
+  function withWatchdog(dir: string): void {
+    writeFileSync(join(dir, "watchdog.sh"), "#!/bin/bash\n");
+    execFileSync("chmod", ["+x", join(dir, "watchdog.sh")]);
+  }
+  test("watchdog installed, no notify hook → INFO, falls back to local", () => {
+    const dir = freshStateDir();
+    withWatchdog(dir);
+    const out = runDoctor(dir);
+    expect(out).toContain("[INFO] watchdog: no notify hook at");
+    expect(out).toContain(
+      "alerts fall back to a local macOS notification only",
+    );
+  });
+  test("notify hook present but not executable → WARN with chmod fix", () => {
+    const dir = freshStateDir();
+    withWatchdog(dir);
+    writeFileSync(join(dir, "notify-hook.sh"), "#!/bin/bash\necho hi\n");
+    const out = runDoctor(dir);
+    expect(out).toContain("[WARN] watchdog: notify hook");
+    expect(out).toContain("not executable");
+    expect(out).toContain("fix[safe]: chmod +x");
+  });
+  test("notify hook present and executable → PASS", () => {
+    const dir = freshStateDir();
+    withWatchdog(dir);
+    const hook = join(dir, "notify-hook.sh");
+    writeFileSync(hook, "#!/bin/bash\necho hi\n");
+    execFileSync("chmod", ["+x", hook]);
+    const out = runDoctor(dir);
+    expect(out).toContain("[PASS] watchdog: notify hook");
+    expect(out).toContain("present and executable");
+  });
+  test("no watchdog installed → notify hook is not checked at all", () => {
+    const dir = freshStateDir();
+    writeFileSync(join(dir, "notify-hook.sh"), "#!/bin/bash\n");
+    const out = runDoctor(dir);
+    expect(out).not.toContain("notify hook");
+  });
+});
+
+describe("disk-usage", () => {
+  test("all three files absent → INFO only", () => {
+    const out = runDoctor(freshStateDir());
+    expect(out).toContain("[INFO] disk-usage: inbox/ does not exist yet");
+    expect(out).toContain("[INFO] disk-usage: diag.log does not exist yet");
+    expect(out).toContain("[INFO] disk-usage: lid-map.json does not exist yet");
+  });
+
+  test("inbox just at the WARN threshold → PASS", () => {
+    const dir = freshStateDir();
+    mkdirSync(join(dir, "inbox"), { recursive: true });
+    writeSized(join(dir, "inbox", "a.jpg"), 500_000_000); // == threshold, not over
+    const out = runDoctor(dir);
+    expect(out).toContain("[PASS] disk-usage: inbox/: 1 file(s), 500.0 MB");
+  });
+  test("inbox one byte over the WARN threshold → WARN", () => {
+    const dir = freshStateDir();
+    mkdirSync(join(dir, "inbox"), { recursive: true });
+    writeSized(join(dir, "inbox", "a.jpg"), 500_000_001);
+    const out = runDoctor(dir);
+    expect(out).toContain("[WARN] disk-usage: inbox/ holds 1 file(s)");
+    expect(out).toContain("never been automatically pruned");
+  });
+
+  test("diag.log just at the WARN threshold → PASS", () => {
+    const dir = freshStateDir();
+    writeSized(join(dir, "diag.log"), 10_000_000);
+    const out = runDoctor(dir);
+    expect(out).toContain("[PASS] disk-usage: diag.log: 10.0 MB");
+  });
+  test("diag.log one byte over the WARN threshold → WARN", () => {
+    const dir = freshStateDir();
+    writeSized(join(dir, "diag.log"), 10_000_001);
+    const out = runDoctor(dir);
+    expect(out).toContain("[WARN] disk-usage: diag.log is 10.0 MB");
+    expect(out).toContain("self-truncation cap");
+  });
+
+  test("lid-map.json just at the WARN threshold → PASS", () => {
+    const dir = freshStateDir();
+    writeSized(join(dir, "lid-map.json"), 2_000_000);
+    const out = runDoctor(dir);
+    expect(out).toContain("[PASS] disk-usage: lid-map.json: 2.0 MB");
+  });
+  test("lid-map.json one byte over the WARN threshold → WARN", () => {
+    const dir = freshStateDir();
+    writeSized(join(dir, "lid-map.json"), 2_000_001);
+    const out = runDoctor(dir);
+    expect(out).toContain("[WARN] disk-usage: lid-map.json is 2.0 MB");
+    expect(out).toContain("larger than a normal contact list");
   });
 });

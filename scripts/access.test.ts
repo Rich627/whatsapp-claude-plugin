@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -324,6 +325,32 @@ describe("policy", () => {
     const bad = run(dir, "policy", "wide-open");
     expect(bad.code).toBe(1);
     expect(access(dir).dmPolicy).toBe("disabled"); // unchanged
+  });
+});
+
+// The chat permission requests go to. A dedicated-bot-number deployment has
+// to be able to point this at the human, and has to be able to SEE where it
+// points - a wrong value is otherwise silent, with the agent waiting on
+// approvals nobody receives.
+describe("owner", () => {
+  test("set owner takes a jid and refuses a bare number", () => {
+    const dir = freshStateDir();
+    const ok = run(dir, "set", "owner", "886912345678@s.whatsapp.net");
+    expect(ok.code).toBe(0);
+    expect(access(dir).owner).toBe("886912345678@s.whatsapp.net");
+    const bad = run(dir, "set", "owner", "886912345678");
+    expect(bad.code).toBe(1);
+    expect(access(dir).owner).toBe("886912345678@s.whatsapp.net"); // unchanged
+  });
+
+  test("status names the owner, and says when it is only a fallback", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "886900000000@s.whatsapp.net");
+    expect(run(dir, "status").out).toContain("unstamped");
+    run(dir, "set", "owner", "886912345678@s.whatsapp.net");
+    const out = run(dir, "status").out;
+    expect(out).toContain("owner:      886912345678@s.whatsapp.net");
+    expect(out).not.toContain("unstamped");
   });
 });
 
@@ -730,7 +757,11 @@ describe("review", () => {
     expect(res.out).toContain("wizard");
     // Proves the launcher itself was run under process.execPath with its own
     // (space-containing) path as a single argv element, not split by a shell.
-    expect(res.out).toContain(`SELF=${launcher}`);
+    // Compared via realpath: on macOS `tmpdir()` resolves through the
+    // /var -> /private/var symlink, so the child's reported argv[1] (fully
+    // resolved by the OS) can legitimately differ from `launcher`'s literal
+    // string while still being the very same, unsplit path.
+    expect(res.out).toContain(`SELF=${realpathSync(launcher)}`);
     expect(res.out).toContain(
       "Opening the access screen in a new terminal window. Pick there; I only see what changed.",
     );

@@ -21,6 +21,7 @@ import {
   accessSync,
   constants,
   existsSync,
+  readdirSync,
   readFileSync,
   statSync,
 } from "node:fs";
@@ -37,7 +38,25 @@ const MESSAGE_LOG = join(STATE_DIR, "messages.jsonl");
 const GROUPS_DIR = join(STATE_DIR, "groups");
 const WHISPER_SCRIPT = join(homedir(), "whisper-transcribe.sh"); // hardcoded by server.ts
 const WATCHDOG_SCRIPT = join(STATE_DIR, "watchdog.sh");
+const NOTIFY_HOOK = join(STATE_DIR, "notify-hook.sh"); // fixed path watchdog.sh looks for (NOTIFY_HOOK var in its header)
+const INBOX_DIR = join(STATE_DIR, "inbox");
+const DIAG_LOG_FILE = join(STATE_DIR, "diag.log");
+const LID_MAP_FILE = join(STATE_DIR, "lid-map.json");
 const MSG_STALE_SECS = 600; // mirrors scripts/watchdog.sh MSG_STALE_SECS
+// inbox/ has historically had no automatic pruning at all — every downloaded
+// image/voice note from every allowed chat accumulates forever. A few MB per
+// attachment means steady moderate use stays well under this; crossing it
+// signals real risk of eating the disk unnoticed.
+const INBOX_WARN_BYTES = 500_000_000; // 500 MB
+// Half of server.ts's own DIAG_MAX_BYTES (20 MB) self-truncation cap — past
+// this point diag.log is filling fast enough to hit that reset soon, which
+// erases whatever evidence is flooding it before anyone reads it.
+const DIAG_LOG_WARN_BYTES = 10_000_000; // 10 MB
+// lid-map.json entries are short JID-pair strings (~80-150 bytes with JSON
+// overhead); 2 MB implies roughly 15-20k cached contacts, far past what a
+// real contact/group list produces — a sign the stranger-aging prune isn't
+// keeping it bounded on this machine.
+const LID_MAP_WARN_BYTES = 2_000_000; // 2 MB
 
 type Severity = "PASS" | "INFO" | "WARN" | "ERROR";
 type Fix = { kind: "safe" | "manual"; text: string };
@@ -505,6 +524,127 @@ function checkWatchdog(): void {
     "watchdog",
     `installed at ${WATCHDOG_SCRIPT} (${executable ? "executable" : "NOT executable — chmod +x it"}, ${inCrontab ? "referenced in crontab" : "not in crontab — add a */2 entry per the script header"})`,
   );
+
+  // watchdog.sh looks for a notify hook at this exact fixed path (its
+  // NOTIFY_HOOK var, set in the header) — there is no separate "enabled"
+  // flag, so the file's presence there IS the configuration. A hook that
+  // exists but can't run means auth/net/stuck-agent alerts silently fall
+  // back to a local macOS notification only — nobody gets paged remotely.
+  if (!existsSync(NOTIFY_HOOK)) {
+    report(
+      "INFO",
+      "watchdog",
+      `no notify hook at ${NOTIFY_HOOK} (optional) — alerts fall back to a local macOS notification only`,
+    );
+    return;
+  }
+  try {
+    accessSync(NOTIFY_HOOK, constants.X_OK);
+    report(
+      "PASS",
+      "watchdog",
+      `notify hook ${NOTIFY_HOOK} present and executable`,
+    );
+  } catch {
+    report(
+      "WARN",
+      "watchdog",
+      `notify hook ${NOTIFY_HOOK} exists but is not executable — watchdog alerts will silently fall back to a local notification instead of paging out`,
+      { kind: "safe", text: `chmod +x ${NOTIFY_HOOK}` },
+    );
+  }
+}
+
+function bytesToMb(bytes: number): string {
+  return (bytes / 1_000_000).toFixed(1);
+}
+
+function checkDiskUsage(): void {
+  // inbox/ — every downloaded attachment, no automatic pruning at all.
+  if (!existsSync(INBOX_DIR)) {
+    report(
+      "INFO",
+      "disk-usage",
+      "inbox/ does not exist yet — no attachments downloaded",
+    );
+  } else {
+    let totalBytes = 0;
+    let fileCount = 0;
+    try {
+      for (const name of readdirSync(INBOX_DIR)) {
+        try {
+          const st = statSync(join(INBOX_DIR, name));
+          if (st.isFile()) {
+            totalBytes += st.size;
+            fileCount++;
+          }
+        } catch {
+          /* file vanished mid-scan; skip */
+        }
+      }
+    } catch (err) {
+      report("WARN", "disk-usage", `could not read inbox/: ${err}`);
+      totalBytes = -1;
+    }
+    if (totalBytes >= 0) {
+      const mb = bytesToMb(totalBytes);
+      if (totalBytes > INBOX_WARN_BYTES) {
+        report(
+          "WARN",
+          "disk-usage",
+          `inbox/ holds ${fileCount} file(s), ${mb} MB — it has never been automatically pruned and can grow without bound`,
+          {
+            kind: "manual",
+            text: `Review and clear old attachments you no longer need, e.g.: find ${INBOX_DIR} -type f -mtime +7 -delete`,
+          },
+        );
+      } else {
+        report("PASS", "disk-usage", `inbox/: ${fileCount} file(s), ${mb} MB`);
+      }
+    }
+  }
+
+  // diag.log — self-truncates at 20 MB (server.ts's DIAG_MAX_BYTES), but a
+  // fast-filling log means something is repeatedly failing and the evidence
+  // is about to be wiped by that reset.
+  if (!existsSync(DIAG_LOG_FILE)) {
+    report("INFO", "disk-usage", "diag.log does not exist yet");
+  } else {
+    const bytes = statSync(DIAG_LOG_FILE).size;
+    const mb = bytesToMb(bytes);
+    if (bytes > DIAG_LOG_WARN_BYTES) {
+      report(
+        "WARN",
+        "disk-usage",
+        `diag.log is ${mb} MB — approaching the server's own 20 MB self-truncation cap; something may be logging repeatedly`,
+        { kind: "manual", text: `tail -100 ${DIAG_LOG_FILE}` },
+      );
+    } else {
+      report("PASS", "disk-usage", `diag.log: ${mb} MB`);
+    }
+  }
+
+  // lid-map.json — the LID↔phone contact cache; unbounded growth here means
+  // every stranger who ever messaged is still cached.
+  if (!existsSync(LID_MAP_FILE)) {
+    report("INFO", "disk-usage", "lid-map.json does not exist yet");
+  } else {
+    const bytes = statSync(LID_MAP_FILE).size;
+    const mb = bytesToMb(bytes);
+    if (bytes > LID_MAP_WARN_BYTES) {
+      report(
+        "WARN",
+        "disk-usage",
+        `lid-map.json is ${mb} MB — larger than a normal contact list; likely accumulating stale stranger entries`,
+        {
+          kind: "manual",
+          text: `Inspect ${LID_MAP_FILE}; if it is mostly stale strangers, back it up and remove it — the server re-derives entries as needed.`,
+        },
+      );
+    } else {
+      report("PASS", "disk-usage", `lid-map.json: ${mb} MB`);
+    }
+  }
 }
 
 // ── main ────────────────────────────────────────────────────────────────
@@ -518,6 +658,7 @@ if (checkStateDir()) {
   checkTranscription();
   checkGroupConfigs(acc);
   checkWatchdog();
+  checkDiskUsage();
 }
 out.push(
   `SUMMARY: ${counts.ERROR} error, ${counts.WARN} warn, ${counts.INFO} info, ${counts.PASS} pass`,

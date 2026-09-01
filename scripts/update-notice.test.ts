@@ -122,6 +122,25 @@ describe("update-notice.ts", () => {
     expect(ctx).toContain(`updated to v${PLUGIN_VERSION}`);
   });
 
+  // Mechanizes AGENTS.md's Hard Rule 1 ("version bump on every push"), which
+  // was prose-only before this: plugin.json and marketplace.json's
+  // plugins[0].version must move together, or `plugin update` silently
+  // no-ops for users stuck on the stale one. marketplace.json ALSO has a
+  // top-level `version` (the marketplace's own) - deliberately not compared
+  // here, since it tracks something else entirely.
+  test("plugin.json's version matches marketplace.json's plugins[0].version", () => {
+    const marketplace = JSON.parse(
+      readFileSync(
+        join(import.meta.dir, "..", ".claude-plugin", "marketplace.json"),
+        "utf8",
+      ),
+    );
+    const listedVersion = marketplace.plugins?.find(
+      (p: { name?: string }) => p.name === "whatsapp-channel",
+    )?.version;
+    expect(listedVersion).toBe(PLUGIN_VERSION);
+  });
+
   test("skipped entirely in static mode (env var) — no output, no write", () => {
     const dir = mkdtempSync(join(tmpdir(), "wa-notice-static-env-"));
     writeFileSync(join(dir, ".last-seen-version"), "0.1.0");

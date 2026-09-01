@@ -33,7 +33,8 @@ import makeWASocket, {
   type proto,
 } from "@whiskeysockets/baileys";
 import { randomBytes, timingSafeEqual } from "crypto";
-import { execFileSync } from "child_process";
+import { execFile, execFileSync } from "child_process";
+import { promisify } from "util";
 import {
   readFileSync,
   writeFileSync,
@@ -55,14 +56,23 @@ import {
   normalizeMentionJids,
   mentionsForChunk,
 } from "./lib/mentions";
+import { cronMatches, parseCronSection } from "./lib/cron";
+import { extractMentions, extractText } from "./lib/inbound-message";
 import { logContainsId } from "./lib/message-log-probe";
+import { ownerStamp, parsePermissionReply } from "./lib/owner";
 import {
   awaitingReply,
+  CONTEXT_TTL_MS,
   keepLogLine,
   RECENT_LIMIT,
   recentBothSides,
   renderLogEntry,
 } from "./lib/message-view";
+import {
+  displaySenderName,
+  neutralizeChannelTag,
+  safeName,
+} from "./lib/sanitize";
 import { formatSentLine, parseSentLog } from "./lib/sent-log";
 import {
   contactName,
@@ -924,6 +934,11 @@ let retrying = false;
 // forever (each re-arming the other), tripling on a third flap.
 let retryGen = 0;
 
+// Declared here, not next to shutdown() where it is set, because every timer
+// chain below has to read it and a `let` further down the file would still be
+// in its temporal dead zone when the first tick fires.
+let shuttingDown = false;
+
 function onRelayLost(): void {
   if (isPrimary) return; // we closed it ourselves after promoting
   ipcRelay = null;
@@ -932,7 +947,7 @@ function onRelayLost(): void {
 }
 
 function startRetryLoop(everConnected = false): void {
-  if (retrying || isPrimary) return;
+  if (retrying || isPrimary || shuttingDown) return;
   retrying = true;
   writeRoleFile("reconnecting", everConnected);
   const gen = ++retryGen;
@@ -948,11 +963,17 @@ function startRetryLoop(everConnected = false): void {
 // loop on a synchronous start-time probe (server.ts:155 — a PowerShell CIM
 // spawn on Windows) and connectToPrimary() can take IPC_PROBE_TIMEOUT_MS, so
 // fixed intervals would let ticks pile up on top of each other.
+// Both chains below are guarded at the top AND inside the timer callback, and
+// they are not the same guard: the top one stops a new tick being armed once
+// shutdown() has run, the inner one stops a tick armed BEFORE shutdown from
+// acting during the 2s grace window the exit is now deferred by. Only the
+// inner one closes the hole the grace window opened.
 function queueReconnect(gen: number): void {
+  if (shuttingDown) return;
   setTimeout(async () => {
-    if (!retrying || gen !== retryGen) return;
+    if (!retrying || gen !== retryGen || shuttingDown) return;
     const relay = await connectToPrimary(onRelayLost, true);
-    if (!retrying || gen !== retryGen) return relay?.close(); // stale chain — a lock tick promoted us, or a newer chain took over, while this connect was in flight
+    if (!retrying || gen !== retryGen || shuttingDown) return relay?.close(); // stale chain — a lock tick promoted us, a newer chain took over, or we are exiting, while this connect was in flight
     if (!relay) return queueReconnect(gen);
     ipcRelay = relay;
     retrying = false;
@@ -961,8 +982,15 @@ function queueReconnect(gen: number): void {
 }
 
 function queueLockRetry(gen: number): void {
+  if (shuttingDown) return;
   setTimeout(() => {
-    if (!retrying || gen !== retryGen) return;
+    // Winning the lock here during the grace window is the worst case in the
+    // file: this process would promote, open a socket and start writing fresh
+    // credentials, and then be killed mid-write by the grace timer's exit(0) —
+    // the exact corruption the grace window exists to prevent. Another
+    // process cannot get there (shutdown holds the lock until the window
+    // ends); this guard is what stops OUR own armed tick from doing it.
+    if (!retrying || gen !== retryGen || shuttingDown) return;
     // No backoff. Cheap when it matters (a clean primary exit
     // leaves no lock file, so this is one atomic create), but a primary that
     // stays alive with no reachable listener keeps this probing every 3s for
@@ -991,7 +1019,7 @@ function queueLockRetry(gen: number): void {
     if (won) return queueLockRetry(gen);
     retrying = false;
     logDiag(`${LOG_PREFIX}: won the singleton lock; promoting to primary\n`);
-    void becomePrimary();
+    void promoteAndConnect();
   }, LOCK_RETRY_INTERVAL_MS).unref();
 }
 
@@ -1017,6 +1045,41 @@ async function becomePrimary(): Promise<void> {
   await connectWhatsApp();
 }
 
+// becomePrimary() is the other entry point into connectWhatsApp, and it has
+// the same one-shot problem scheduleReconnect exists for: the process keeps
+// the singleton lock either way (isPrimary is set before the first await), so
+// a throw here without a retry leaves a lock-holding process that will never
+// connect and never yield. unhandledRejection only logs, so `void` alone would
+// bury it.
+async function promoteAndConnect(): Promise<void> {
+  try {
+    await becomePrimary();
+  } catch (err) {
+    reconnectAttempt++;
+    const next = Math.min(1000 * reconnectAttempt, 30000);
+    // scheduleReconnect below re-runs connectWhatsApp and nothing else, so a
+    // throw from anywhere earlier in becomePrimary leaves that part unretried
+    // forever. The IPC listener is the one such part with an outside observer:
+    // without it every other terminal stays a stub with no way back. Retry it
+    // here, and if it is still down say so in the same line rather than
+    // degrading quietly on a host nobody is watching.
+    if (!ipcServer) await startIpcListener();
+    const ipcNote = ipcServer
+      ? ""
+      : " (IPC listener down — other terminals cannot relay)";
+    logDiag(
+      `${LOG_PREFIX}: promotion to primary failed: ${err}${ipcNote}; retrying in ${next / 1000}s\n`,
+    );
+    if (AUTO_NOTIFY) {
+      notifySystem(
+        `WhatsApp promotion failed: ${err instanceof Error ? err.message : String(err)}${ipcNote}. Retrying in ${next / 1000}s.`,
+        "promote-failed",
+      );
+    }
+    scheduleReconnect(next);
+  }
+}
+
 // The primary is same-user and token-verified, but this is still another
 // process's JSON. A result that is not shaped like a CallToolResult must not
 // reach the MCP client as one.
@@ -1038,9 +1101,6 @@ function asCallToolResult(v: unknown, name: string): CallToolResult {
     isError: true,
   };
 }
-
-// Permission-reply spec — 5 lowercase letters a-z minus 'l'. Case-insensitive.
-const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
 
 // ─── Access control ────────────────────────────────────────────────────
 
@@ -1071,6 +1131,13 @@ type GroupPolicy = {
 type Access = {
   dmPolicy: "pairing" | "allowlist" | "disabled";
   allowFrom: string[];
+  // The one chat permission requests are delivered to, and therefore the only
+  // chat that may answer them. Stamped once when absent (see ownerStamp and
+  // connection === "open") and never overwritten after that, so a deployment
+  // whose agent runs on a dedicated number can point it at the human.
+  // Optional only so an access.json written before this field existed still
+  // parses; the first connect fills it in.
+  owner?: string;
   groups: Record<string, GroupPolicy>;
   pending: Record<string, PendingEntry>;
   mentionPatterns?: string[];
@@ -1088,17 +1155,49 @@ function defaultAccess(): Access {
 const MAX_CHUNK_LIMIT = 4096; // practical limit for readability
 const MAX_ATTACHMENT_BYTES = 16 * 1024 * 1024; // WhatsApp 16MB media limit
 
+// Home-relative directories nothing legitimate is ever attached from. This is
+// a speed bump, NOT a sandbox: every other readable file on this machine is
+// still sendable, and widening it into a filesystem allowlist is a product
+// decision, not a bug fix. The real boundary is the access allowlist — only a
+// chat that passed assertAllowedChat can ask for an attachment at all.
+const SENSITIVE_HOME_DIRS = [".ssh", ".aws", ".gnupg"];
+
+function realDir(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
 function assertSendable(f: string): void {
-  let real, stateReal: string;
+  let real: string;
   try {
     real = realpathSync(f);
-    stateReal = realpathSync(STATE_DIR);
   } catch {
-    return;
+    // Fail closed. Returning here used to ALLOW the send, which made every
+    // check below skippable by handing in a path that doesn't resolve. The
+    // one caller stats the file immediately afterwards, so a genuinely
+    // sendable file always resolves — refusing costs nothing legitimate.
+    throw new Error(`refusing to send unresolvable path: ${f}`);
   }
+  // AUTH_DIR lives under STATE_DIR, so the credential store is covered by
+  // this same check rather than needing its own entry below.
+  const stateReal = realDir(STATE_DIR);
   const inbox = join(stateReal, "inbox");
   if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
     throw new Error(`refusing to send channel state: ${f}`);
+  }
+  const home = realDir(homedir());
+  for (const d of SENSITIVE_HOME_DIRS) {
+    const dir = realDir(join(home, d));
+    if (real === dir || real.startsWith(dir + sep)) {
+      throw new Error(`refusing to send credential file: ${f}`);
+    }
+  }
+  const base = basename(real);
+  if (base === ".env" || base.startsWith(".env.")) {
+    throw new Error(`refusing to send credential file: ${f}`);
   }
 }
 
@@ -1109,6 +1208,7 @@ function readAccessFile(): Access {
     return {
       dmPolicy: parsed.dmPolicy ?? "pairing",
       allowFrom: parsed.allowFrom ?? [],
+      owner: parsed.owner,
       groups: parsed.groups ?? {},
       pending: parsed.pending ?? {},
       mentionPatterns: parsed.mentionPatterns,
@@ -1152,7 +1252,12 @@ function loadAccess(): Access {
 function assertAllowedChat(chat_id: string): void {
   const access = loadAccess();
   if (isAllowedJid(chat_id, access.allowFrom)) return;
-  if (chat_id in access.groups) return;
+  // Object.hasOwn, never `in`: access.groups is JSON.parse'd but still carries
+  // Object.prototype, so `"constructor" in access.groups` is true and a chat
+  // named after any prototype member would authorize itself here. Nothing
+  // downstream re-checks the allowlist — send-time failure for such a jid is
+  // luck, not a guarantee.
+  if (Object.hasOwn(access.groups, chat_id)) return;
   throw new Error(
     `chat ${chat_id} is not allowlisted — add via /whatsapp-channel:access`,
   );
@@ -1180,26 +1285,47 @@ function saveLidMap(): void {
 }
 
 function recordLidMapping(lid: string, pn: string): void {
-  const nLid = jidNormalizedUser(lid);
-  const nPn = jidNormalizedUser(pn);
-  if (lidMap[nLid] !== nPn) {
-    lidMap[nLid] = nPn;
-    saveLidMap();
+  recordLidMappings([[lid, pn]]);
+}
+
+/** Batch form. Same work as recordLidMapping, but each of the three files is
+ *  reloaded and rewritten at most once for the whole batch instead of once per
+ *  pair. group_roster called the single-pair form inside a .map() over every
+ *  participant, so a large group was thousands of synchronous whole-file
+ *  rewrites with the event loop stalled for all of them. Behaviour for a
+ *  one-pair call is unchanged: the reloads still happen unconditionally, the
+ *  saves still happen only when something actually changed. */
+function recordLidMappings(pairs: Iterable<[string, string]>): void {
+  const normalized: Array<[string, string]> = [];
+  let lidChanged = false;
+  for (const [lid, pn] of pairs) {
+    const nLid = jidNormalizedUser(lid);
+    const nPn = jidNormalizedUser(pn);
+    if (lidMap[nLid] !== nPn) {
+      lidMap[nLid] = nPn;
+      lidChanged = true;
+    }
+    normalized.push([nLid, nPn]);
   }
+  if (normalized.length === 0) return;
+  if (lidChanged) saveLidMap();
   // Centralized here, not at each caller: a contact cached under its raw
   // @lid key (before this resolution was known) needs to move to the
-  // phone key contactKey() will compute from now on, no matter which of
-  // this function's two callers (the passive lid-mapping.update event, or
-  // ensureLidResolved's active fallback) is the one that actually learned
-  // the mapping.
+  // phone key contactKey() will compute from now on, no matter which
+  // caller (the passive lid-mapping.update event, ensureLidResolved's
+  // active fallback, or group_roster's batch) actually learned the mapping.
   reloadContactsMap();
-  if (migrateContactKey(contactsMap, nLid, nPn)) {
-    saveContactsMap();
+  let contactsChanged = false;
+  for (const [nLid, nPn] of normalized) {
+    if (migrateContactKey(contactsMap, nLid, nPn)) contactsChanged = true;
   }
+  if (contactsChanged) saveContactsMap();
   reloadDmActivity();
-  if (migrateDmActivity(nLid, nPn)) {
-    saveDmActivity();
+  let dmsChanged = false;
+  for (const [nLid, nPn] of normalized) {
+    if (migrateDmActivity(nLid, nPn)) dmsChanged = true;
   }
+  if (dmsChanged) saveDmActivity();
 }
 
 function resolveToPhone(jid: string): string {
@@ -1484,8 +1610,12 @@ async function refreshGroupsMeta(
   const groups = Object.values(meta);
   let metaChanged = false;
   for (const g of groups) {
-    const name = g.subject || "(no name)";
-    if (g.subject) groupNameCache[g.id] = g.subject;
+    // Sanitized on the way into the cache, not on the way out: this is the
+    // other writer of groupNameCache, and the cron path reads that cache
+    // directly (see the group_name in runCronJob).
+    const subject = safeName(g.subject)?.trim();
+    const name = subject || "(no name)";
+    if (subject) groupNameCache[g.id] = subject;
     const existing = groupsMeta[g.id];
     const memberCount = g.participants?.length ?? 0;
     if (
@@ -1569,17 +1699,73 @@ async function syncSavedNamesOnce(
   }, 60_000);
 }
 
+// Bounds one promise without leaving the loser unhandled: the rejection
+// handler is attached to `p` itself, so a slow query that eventually fails
+// (Baileys' own defaultQueryTimeoutMs) can't surface as an unhandled rejection
+// long after we stopped waiting.
+function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${what} timed out after ${ms}ms`)),
+      ms,
+    );
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+// resolveGroupName is awaited on the group inbound path BEFORE the message is
+// persisted or notified, so an iq response that never comes used to hang that
+// group's messages forever while DMs kept working - the "groups go silent"
+// outage. Two bounds, because the failure has to degrade to "this group shows
+// as its jid", never to "this group goes quiet": a per-call timeout, and a
+// cooldown so the next hundred messages don't each pay it again.
+const GROUP_NAME_QUERY_TIMEOUT_MS = 10_000;
+const GROUP_NAME_RETRY_AFTER_MS = 5 * 60 * 1000;
+const groupNameFailedAt: Record<string, number> = {};
+
+// The subject is settable by any group admin and ends up in the `group_name`
+// attribute of the <channel …> envelope, in the message log and in tool
+// output, so it is sanitized ONCE here (and on the other write into
+// groupNameCache, in refreshGroupsMeta) rather than at each of the four
+// callers — every one of them feeds a rendered surface and wants the same
+// treatment, and a fifth caller added later would otherwise silently miss it.
 async function resolveGroupName(groupJid: string): Promise<string> {
   if (groupNameCache[groupJid]) return groupNameCache[groupJid];
+  const failedAt = groupNameFailedAt[groupJid];
+  if (failedAt && Date.now() - failedAt < GROUP_NAME_RETRY_AFTER_MS)
+    return groupJid;
   try {
     if (sock) {
-      const meta = await sock.groupMetadata(groupJid);
-      if (meta.subject) {
-        groupNameCache[groupJid] = meta.subject;
-        return meta.subject;
+      const meta = await withTimeout(
+        sock.groupMetadata(groupJid),
+        GROUP_NAME_QUERY_TIMEOUT_MS,
+        "groupMetadata",
+      );
+      const subject = safeName(meta.subject)?.trim();
+      if (subject) {
+        groupNameCache[groupJid] = subject;
+        delete groupNameFailedAt[groupJid];
+        return subject;
       }
     }
-  } catch {}
+  } catch (err) {
+    groupNameFailedAt[groupJid] = Date.now();
+    // The one line that distinguishes "this group is named by its jid because
+    // metadata stalled" from "nothing arrived at all". maskJid keeps a group
+    // jid identifiable (only a legacy jid's creator number is masked).
+    logDiag(
+      `${LOG_PREFIX}: group name lookup failed for ${maskJid(groupJid)}: ${err}\n`,
+    );
+  }
   return groupJid;
 }
 
@@ -1753,6 +1939,9 @@ function isMentioned(
   return false;
 }
 
+// Sends already started and not yet settled, keyed by senderId — see the loop.
+const approvalsInFlight = new Set<string>();
+
 // The /whatsapp-channel:access skill drops a file at approved/<senderId>.
 function checkApprovals(): void {
   let files: string[];
@@ -1771,10 +1960,23 @@ function checkApprovals(): void {
   if (!sock) return;
 
   for (const senderId of files) {
+    // The marker is still deleted only when the send settles — that is what
+    // keeps a dropped connection from eating the pairing confirmation, see
+    // above. But this runs every 5s and a queued send outlives a tick, so the
+    // same marker was re-fired on every pass and the contact got "Paired!"
+    // once per tick until it landed. In memory only: after a restart the
+    // marker is still on disk and the send is retried, exactly as intended.
+    if (approvalsInFlight.has(senderId)) continue;
+    approvalsInFlight.add(senderId);
     const file = join(APPROVED_DIR, senderId);
+    const settled = () => approvalsInFlight.delete(senderId);
     void sendTracked(senderId, { text: "Paired! Say hi to Claude." }).then(
-      () => rmSync(file, { force: true }),
+      () => {
+        settled();
+        rmSync(file, { force: true });
+      },
       (err) => {
+        settled();
         logDiag(`${LOG_PREFIX}: failed to send approval confirm: ${err}\n`);
         rmSync(file, { force: true });
       },
@@ -1791,92 +1993,24 @@ type CronJob = {
   lastFired?: number;
 };
 
-function parseCronField(field: string, now: number, max: number): boolean {
-  if (field === "*") return true;
-  for (const part of field.split(",")) {
-    if (part.includes("/")) {
-      const [, step] = part.split("/");
-      if (now % parseInt(step) === 0) return true;
-    } else if (part.includes("-")) {
-      const [lo, hi] = part.split("-").map(Number);
-      if (now >= lo && now <= hi) return true;
-    } else {
-      if (now === parseInt(part)) return true;
-    }
-  }
-  return false;
-}
-
-function cronMatches(expr: string, date: Date): boolean {
-  const [min, hr, dom, mon, dow] = expr.trim().split(/\s+/);
-  return (
-    parseCronField(min, date.getMinutes(), 59) &&
-    parseCronField(hr, date.getHours(), 23) &&
-    parseCronField(dom, date.getDate(), 31) &&
-    parseCronField(mon, date.getMonth() + 1, 12) &&
-    parseCronField(dow, date.getDay(), 6)
-  );
-}
-
-function to24Hour(hr: number, ampm: string | undefined): number {
-  const p = (ampm ?? "").toLowerCase();
-  if (p === "pm" && hr < 12) return hr + 12;
-  if (p === "am" && hr === 12) return 0;
-  return hr;
-}
-
+// parseCronField / cronMatches / parseCronSection live in ./lib/cron.ts so the
+// schedule grammar is unit testable without this file's connect-on-import
+// side effects. Only the parts that need the world stay here.
 function loadGroupCrons(): CronJob[] {
   const jobs: CronJob[] = [];
   const access = loadAccess();
   for (const groupJid of Object.keys(access.groups)) {
     const cfgPath = groupConfigPath(groupJid);
     try {
-      const content = readFileSync(cfgPath, "utf8");
-      const cronSection = content.match(
-        /## Cron Jobs\n([\s\S]*?)(?=\n## |\n# |$)/,
-      );
-      if (!cronSection) continue;
-      // Parse lines like: - **Name**: description (cron: "expr")
-      // Or: - **Name**: cron expr — description
-      const lines = cronSection[1]
-        .split("\n")
-        .filter((l) => l.startsWith("- "));
-      for (const line of lines) {
-        // Match cron expressions in the line
-        const cronMatch = line.match(/(?:每|every)\s*(\d+)\s*(?:分鐘|分|min)/i);
-        const dailyMatch = line.match(
-          /(?:每天|daily)\s*(\d{1,2}):?(\d{2})?\s*(am|pm)?/i,
+      const parsed = parseCronSection(readFileSync(cfgPath, "utf8"));
+      for (const job of parsed.jobs) jobs.push({ groupJid, ...job });
+      // Loud, not silent: an expression that can never fire (25:00, ":70",
+      // "every 90 min") used to be accepted and then simply never run, which
+      // is indistinguishable from the server being broken.
+      for (const err of parsed.errors) {
+        logDiag(
+          `${LOG_PREFIX}: ignoring unschedulable cron in ${maskJid(groupJid)}/config.md: ${err}\n`,
         );
-        const twiceMatch = line.match(
-          /(?:每天|daily)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:&|和|,)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i,
-        );
-
-        let cronExpr = "";
-        const desc = line.replace(/^-\s*\*\*[^*]+\*\*:?\s*/, "").trim();
-
-        if (twiceMatch) {
-          // Two times per day — create two entries. Each time's am/pm marker
-          // is captured next to that time, not inferred from the whole line
-          // (a line like "daily 1pm & 6am" previously mis-parsed both times
-          // off a single line-wide "includes pm" check).
-          const h1 = to24Hour(parseInt(twiceMatch[1]), twiceMatch[3]);
-          const m1 = parseInt(twiceMatch[2] || "0");
-          const h2 = to24Hour(parseInt(twiceMatch[4]), twiceMatch[6]);
-          const m2 = parseInt(twiceMatch[5] || "0");
-          jobs.push({ groupJid, cron: `${m1} ${h1} * * *`, prompt: desc });
-          jobs.push({ groupJid, cron: `${m2} ${h2} * * *`, prompt: desc });
-          continue;
-        } else if (dailyMatch) {
-          const hr = to24Hour(parseInt(dailyMatch[1]), dailyMatch[3]);
-          const min = parseInt(dailyMatch[2] || "0");
-          cronExpr = `${min} ${hr} * * *`;
-        } else if (cronMatch) {
-          cronExpr = `*/${cronMatch[1]} * * * *`;
-        }
-
-        if (cronExpr && desc) {
-          jobs.push({ groupJid, cron: cronExpr, prompt: desc });
-        }
       }
     } catch {}
   }
@@ -1894,13 +2028,18 @@ function initServerCrons(): void {
   }
 }
 
-// Check crons every minute
+// Three times a minute, not once. A timer never fires early, only late, so a
+// 60_000 interval drifts forward a little on every tick and eventually skips a
+// minute number outright — that minute's job then never fires at all, silently.
+// Any event-loop stall guarantees it. The per-job lastFired dedupe below keys
+// on the minute number itself, so the extra ticks cost one cronMatches() call
+// each and can never double-fire a job within the same minute.
+const CRON_TICK_MS = 20_000;
 setInterval(() => {
   if (!sock || serverCrons.length === 0) return;
   const now = new Date();
   for (const job of serverCrons) {
     if (!cronMatches(job.cron, now)) continue;
-    // Prevent double-firing within the same minute
     const minuteKey = Math.floor(now.getTime() / 60000);
     if (job.lastFired === minuteKey) continue;
     job.lastFired = minuteKey;
@@ -1930,7 +2069,7 @@ setInterval(() => {
         logDiag(`${LOG_PREFIX}: cron notification failed: ${err}\n`);
       });
   }
-}, 60_000).unref();
+}, CRON_TICK_MS).unref();
 
 // ─── Markdown → WhatsApp format conversion ────────────────────────────
 
@@ -2000,6 +2139,22 @@ function chunk(
             : space > 0
               ? space
               : limit;
+    }
+    // slice() counts UTF-16 code units, so a cut can land BETWEEN the two
+    // halves of a surrogate pair - an emoji or any astral character - and both
+    // chunks then carry a lone surrogate that renders as U+FFFD. Back the
+    // boundary off by one so the whole pair moves to the next chunk. Only the
+    // length-mode cut can hit this; a newline- or space-aligned cut is by
+    // construction on a BMP character. Known ceiling: a multi-codepoint emoji
+    // (ZWJ sequence, flag, skin tone) can still be split ACROSS chunks - that
+    // renders as two valid emoji rather than corruption, so it is left alone.
+    if (
+      cut > 1 &&
+      cut < rest.length &&
+      (rest.charCodeAt(cut - 1) & 0xfc00) === 0xd800 &&
+      (rest.charCodeAt(cut) & 0xfc00) === 0xdc00
+    ) {
+      cut--;
     }
     out.push(rest.slice(0, cut));
     rest = rest.slice(cut).replace(/^\n+/, "");
@@ -2133,14 +2288,22 @@ function persistMessage(entry: MessageLogEntry): void {
   }
 }
 
-function markReplied(chat_id: string): void {
-  // Rewrite the log, marking all unreplied messages for this chat as replied
+/** Marks this chat's unreplied lines as replied. `onlyIds` narrows that to a
+ *  snapshot the caller took BEFORE it started sending: the `reply` tool awaits
+ *  every chunk and up to 16MB of uploads before it gets here, and without the
+ *  snapshot a message that arrived during those awaits was flipped to replied
+ *  by a reply that could not possibly have answered it — gone from unreplied
+ *  and catch_up, answered by nobody. Callers with no await between deciding to
+ *  reply and calling this (logOwnerHandReply) pass nothing and keep the
+ *  original whole-chat meaning. */
+function markReplied(chat_id: string, onlyIds?: ReadonlySet<string>): void {
   try {
     if (!existsSync(MESSAGE_LOG)) return;
     const lines = readFileSync(MESSAGE_LOG, "utf8").split("\n").filter(Boolean);
     const updated = lines.map((line) => {
       try {
         const entry = JSON.parse(line) as MessageLogEntry;
+        if (onlyIds && !onlyIds.has(entry.id)) return line;
         if (entry.chat_id === chat_id && !entry.replied) {
           entry.replied = true;
           return JSON.stringify(entry);
@@ -2262,7 +2425,6 @@ function pruneSentLog(): void {
  *  first, the same reason reloadContactsMap exists at all: scripts/access.ts
  *  mutates these files between our writes. */
 function pruneStrangerCaches(): void {
-  if (!CACHE_CONTACTS) return; // nothing persists anyway
   try {
     reloadContactsMap();
     reloadDmActivity();
@@ -2270,16 +2432,108 @@ function pruneStrangerCaches(): void {
     // Everyone with standing approval, in the key form both caches use.
     // Group allowFrom entries count too: someone approved for a group only
     // is still someone the owner named, not a stranger.
+    //
+    // Built BEFORE anything is deleted, and specifically before lidMap is
+    // touched: contactKey() resolves through lidMap, so pruning first would
+    // make this set forget the very people it exists to protect.
     const allowed = new Set<string>();
     for (const jid of access.allowFrom) allowed.add(contactKey(jid));
     for (const g of Object.values(access.groups))
       for (const jid of g.allowFrom ?? []) allowed.add(contactKey(jid));
     if (ownJid) allowed.add(contactKey(ownJid));
-    const changed = pruneStrangers(contactsMap, dmActivity, allowed);
-    if (changed.contacts) saveContactsMap();
-    if (changed.dms) saveDmActivity();
+    if (CACHE_CONTACTS) {
+      const changed = pruneStrangers(contactsMap, dmActivity, allowed);
+      if (changed.contacts) saveContactsMap();
+      if (changed.dms) saveDmActivity();
+    }
+    // Not under the CACHE_CONTACTS guard the two caches above sit behind:
+    // saveLidMap() has no such guard, so lid-map.json is written - and a
+    // refused stranger's identifier retained - whatever the contact-cache
+    // setting is. An empty `allowed` means access.json is missing or
+    // unreadable, not that nobody is allowed; never wipe the map on that.
+    //
+    // Its own reprieve set, not the one pruneStrangers got: an in-flight
+    // pairing is a stranger to the contact caches (nobody has approved them,
+    // and #30 exists to age exactly those out) but not to lidMap, because
+    // `access pair <code>` appends p.senderId to allowFrom verbatim. Drop the
+    // mapping in between and the approval lands on an @lid the allowlist can
+    // no longer match to its phone number.
+    const lidKeep = new Set(allowed);
+    for (const p of Object.values(access.pending)) {
+      lidKeep.add(contactKey(p.senderId));
+      lidKeep.add(contactKey(p.chatId));
+    }
+    // dmActivity is only half a reprieve when contact caching is off: nothing
+    // persists it (saveDmActivity returns early) and nothing ages it
+    // (pruneStrangers is skipped above), so it is whatever this process
+    // happened to see since boot. Reading it anyway would make the same tick
+    // keep or drop the same mapping depending on process uptime. With caching
+    // off the owner-named half is the whole rule.
+    if (allowed.size > 0 && pruneLidMap(lidKeep, CACHE_CONTACTS)) saveLidMap();
   } catch (err) {
     logDiag(`${LOG_PREFIX}: stranger-cache prune failed: ${err}\n`);
+  }
+}
+
+/** lid-map.json is the third stranger cache and the only one that grew
+ *  forever. Same rule pruneStrangers applies to a contact: keep it if the
+ *  owner named this person, or if they are still inside the stranger TTL
+ *  (dmActivity has already been aged by the call above, so anything left in
+ *  it is recent).
+ *
+ *  One lookup covers both directions of the mapping: contactKey(lid) resolves
+ *  through lidMap and lands on exactly contactKey(pn), so an allowlist that
+ *  names the contact by either form matches the same key. Dropping an entry is
+ *  in any case recoverable - ensureLidResolved re-derives it from Baileys'
+ *  own signal store on the next message (the one path that does NOT re-derive
+ *  is logOwnerHandReply, which reads the cached map only - a hand reply to an
+ *  unmapped @lid contact is dropped until their next inbound message).
+ *
+ *  `useActivity` is false when contact caching is off; see the caller. */
+function pruneLidMap(
+  allowed: ReadonlySet<string>,
+  useActivity: boolean,
+): boolean {
+  let changed = false;
+  for (const [lid, pn] of Object.entries(lidMap)) {
+    const key = contactKey(pn);
+    if (allowed.has(key)) continue;
+    if (useActivity && Object.hasOwn(dmActivity, key)) continue;
+    delete lidMap[lid];
+    changed = true;
+  }
+  return changed;
+}
+
+/** Every eagerly-downloaded image and voice note from every allowed chat lands
+ *  in inbox/ and nothing ever removed it, so any group member could fill the
+ *  disk one photo at a time. Same window as a context log line
+ *  (CONTEXT_TTL_MS): once the line that references the file is gone, the file
+ *  is unreachable anyway. Rides the same hourly tick as pruneMessageLog.
+ *
+ *  Deliberately narrow: only regular files, only direct children of INBOX_DIR
+ *  (no recursion, so a directory someone drops in there is left alone rather
+ *  than walked), and every path is rebuilt with join(INBOX_DIR, name) from a
+ *  readdir entry, so nothing outside INBOX_DIR is reachable from here. */
+function pruneInbox(): void {
+  try {
+    const cutoff = Date.now() - CONTEXT_TTL_MS;
+    let removed = 0;
+    for (const name of readdirSync(INBOX_DIR)) {
+      const path = join(INBOX_DIR, name);
+      try {
+        const st = statSync(path);
+        if (!st.isFile()) continue;
+        if (st.mtimeMs >= cutoff) continue;
+        rmSync(path, { force: true });
+        removed++;
+      } catch {}
+    }
+    if (removed) {
+      logDiag(`${LOG_PREFIX}: pruned ${removed} stale inbox file(s)\n`);
+    }
+  } catch (err) {
+    logDiag(`${LOG_PREFIX}: inbox prune failed: ${err}\n`);
   }
 }
 
@@ -2290,6 +2544,7 @@ function pruneMessageLog(): void {
   // that are never logged).
   pruneSentLog();
   pruneStrangerCaches();
+  pruneInbox();
   try {
     if (!existsSync(MESSAGE_LOG)) return;
     // Two lifetimes, decided in lib/message-view.ts: a routed inbound is a
@@ -2395,21 +2650,81 @@ const mcp = new Server(
   },
 );
 
-// Permission relay — forward to all allowlisted DMs.
-// Track permission request message IDs for emoji-based approval
-const permissionMessageMap = new Map<string, string>(); // messageId → requestId
+/** The single chat a permission request is delivered to, and therefore the
+ *  only chat that can answer it. access.owner is stamped once (see ownerStamp)
+ *  and settable by hand, so it is a decision rather than allowFrom[0]'s plain
+ *  insertion order — under which a contact allowlisted before the server first
+ *  connected received every command preview (up to 500 raw characters of the
+ *  Bash command) and, being the bound chat, could approve it. The allowFrom[0]
+ *  fallback covers only an access.json that has never been stamped, i.e.
+ *  static mode or before the first connect; it keeps the old behaviour rather
+ *  than failing closed and silently swallowing permission requests. */
+function permissionTarget(access: Access): string | undefined {
+  return access.owner ?? access.allowFrom[0];
+}
 
-// Was this request id one we asked about and are still waiting on? Claims it
-// if so, so a repeated reply is treated as ordinary chat.
-function claimPermission(requestId: string): boolean {
+// Permission relay — forward to the owner's DM only.
+// Track permission request message IDs for emoji-based approval.
+// chatId is the jid the request was actually DELIVERED to (permissionTarget).
+// Approving a tool call is the most privileged thing this channel can do, so
+// it is bound to that one chat: an approval arriving from any other chat — a
+// group the owner also allowlisted, a second contact — is not an approval, it
+// is someone answering a question they were never asked.
+const permissionMessageMap = new Map<
+  string,
+  { requestId: string; chatId: string }
+>(); // messageId → the request and who was asked
+
+// Was this request id one we asked about, and did the answer come back from
+// the chat we asked? Claims it if so, so a repeated reply is treated as
+// ordinary chat. An id that matches but arrived from the wrong chat is NOT
+// claimed and NOT deleted — the real owner can still answer it.
+function claimPermission(requestId: string, fromChatId: string): boolean {
   let found = false;
-  for (const [messageId, id] of permissionMessageMap) {
-    if (id === requestId) {
-      permissionMessageMap.delete(messageId);
-      found = true;
-    }
+  for (const [messageId, entry] of permissionMessageMap) {
+    if (entry.requestId !== requestId) continue;
+    // isAllowedJid, not ===: the same person reaches us as @lid or as a phone
+    // jid depending on the path, and this is the file's one normalizing
+    // comparison. Single-element list, so this is "is fromChatId that chat".
+    if (!isAllowedJid(fromChatId, [entry.chatId])) continue;
+    permissionMessageMap.delete(messageId);
+    found = true;
   }
   return found;
+}
+
+// The "yes <id>" half of the approval flow, called from both inbound routes.
+// It has to run for the owner's own fromMe messages too: when the owner IS the
+// linked account the request is delivered to their note-to-self, where every
+// message carries fromMe, and the request text itself still advertises
+// "yes <id> to allow" — so that half did nothing and only the 👍 reaction
+// worked.
+//
+// Returns true only when an OUTSTANDING id was claimed from the chat the
+// request was delivered to. Everything else — an unmatched pattern, a stale
+// id, the right id from the wrong chat — returns false and the caller carries
+// on treating the message as ordinary text, because swallowing a real message
+// (sender sees a tick, agent never sees it) is worse than missing an approval.
+function tryClaimPermissionReply(
+  msg: WAMessage,
+  chatId: string,
+  text: string,
+): boolean {
+  const reply = parsePermissionReply(text);
+  if (!reply || !claimPermission(reply.requestId, chatId)) return false;
+  void mcp.notification({
+    method: "notifications/claude/channel/permission",
+    params: { request_id: reply.requestId, behavior: reply.behavior },
+  });
+  if (sock && msg.key.id) {
+    void sendTracked(chatId, {
+      react: {
+        text: reply.behavior === "allow" ? "✅" : "❌",
+        key: msg.key,
+      },
+    }).catch(() => {});
+  }
+  return true;
 }
 
 function formatPermissionPreview(
@@ -2477,8 +2792,7 @@ mcp.setNotificationHandler(
       `${preview}\n\n` +
       `👍 react or "yes ${request_id}" to allow\n` +
       `👎 react or "no ${request_id}" to deny`;
-    // Send to the first allowlisted contact (owner) only, to avoid spam
-    const owner = access.allowFrom[0];
+    const owner = permissionTarget(access);
     if (sock && owner) {
       const sent = await sock.sendMessage(owner, { text }).catch((e) => {
         logDiag(`permission_request send to ${maskJid(owner)} failed: ${e}\n`);
@@ -2488,7 +2802,10 @@ mcp.setNotificationHandler(
         // No expiry: Claude Code waits on a permission request indefinitely,
         // so a "yes <id>" must be honoured whenever it arrives. The entry is
         // removed when claimed; an unanswered one costs a few bytes.
-        permissionMessageMap.set(sent.key.id, request_id);
+        permissionMessageMap.set(sent.key.id, {
+          requestId: request_id,
+          chatId: owner,
+        });
         trackSent(sent.key);
       }
     }
@@ -2695,6 +3012,15 @@ const handleToolCall = async (req: {
         assertAllowedChat(chat_id);
         if (!sock) throw new Error("WhatsApp not connected");
 
+        // Taken before the first await in this handler, not after the send:
+        // see markReplied. Anything that lands in this chat from here on is
+        // NOT covered by this reply and must stay unreplied.
+        const repliedIds = new Set(
+          getUnreplied()
+            .filter((m) => m.chat_id === chat_id)
+            .map((m) => m.id),
+        );
+
         const mentionJids = normalizeMentionJids(
           rawMentions.filter((m) => !isAllToken(m)),
           lidMap,
@@ -2831,7 +3157,7 @@ const handleToolCall = async (req: {
           }
         }
 
-        markReplied(chat_id);
+        markReplied(chat_id, repliedIds);
 
         // Log the outbound reply for catch_up — full original text once, not per chunk
         const outText =
@@ -3062,9 +3388,11 @@ const handleToolCall = async (req: {
         }
         groups.sort((a, b) => (a.subject ?? "").localeCompare(b.subject ?? ""));
         const lines = groups.map((g) => {
-          const allowed = g.id in access.groups;
+          const allowed = Object.hasOwn(access.groups, g.id);
           const roster = !!access.groups[g.id]?.roster;
-          const name = g.subject || "(no name)";
+          // Same reason as resolveGroupName: an admin-settable subject is
+          // rendered into text the model reads.
+          const name = safeName(g.subject)?.trim() || "(no name)";
           const flags = `${allowed ? "✓" : "+"}${roster ? "R" : ""}`;
           return `${flags} ${name}\n    ${g.id}${allowed ? "" : "  (NOT allowlisted)"}`;
         });
@@ -3094,22 +3422,35 @@ const handleToolCall = async (req: {
           );
         }
         const meta = await sock.groupMetadata(chat_id);
+        // resolveToPhone(p.id) only resolves through OUR OWN passively-
+        // populated lidMap (see its own comment) - a participant we've
+        // never exchanged a lid-mapping.update event with (never spoken)
+        // falls back to the raw LID jid unresolved, so both the name
+        // lookup and the mask below would key/show the LID's own digits
+        // instead of the phone number. groupMetadata() already returns
+        // each participant's phoneNumber directly (Baileys resolves this
+        // as part of the roster fetch itself, no event needed) - prefer
+        // that, and feed it back into lidMap so later lookups elsewhere
+        // (allowlist matching, other tools) benefit too, not just this one.
+        // Collected and applied in ONE batch before the render loop below:
+        // done per participant, a big group meant thousands of synchronous
+        // whole-file rewrites with the event loop stalled throughout.
+        recordLidMappings(
+          meta.participants.flatMap((p) =>
+            p.phoneNumber && isLidUser(p.id)
+              ? [[p.id, p.phoneNumber] as [string, string]]
+              : [],
+          ),
+        );
         const lines = meta.participants.map((p) => {
-          // resolveToPhone(p.id) only resolves through OUR OWN passively-
-          // populated lidMap (see its own comment) - a participant we've
-          // never exchanged a lid-mapping.update event with (never spoken)
-          // falls back to the raw LID jid unresolved, so both the name
-          // lookup and the mask below would key/show the LID's own digits
-          // instead of the phone number. groupMetadata() already returns
-          // each participant's phoneNumber directly (Baileys resolves this
-          // as part of the roster fetch itself, no event needed) - prefer
-          // that, and feed it back into lidMap so later lookups elsewhere
-          // (allowlist matching, other tools) benefit too, not just this one.
-          if (p.phoneNumber && isLidUser(p.id)) {
-            recordLidMapping(p.id, p.phoneNumber);
-          }
           const phone = p.phoneNumber ?? resolveToPhone(p.id);
-          const name = contactName(contactsMap, contactKey(phone));
+          // safeName for the same reason the group subject above gets it:
+          // contactName() falls back to `.notify`, which the member sets
+          // themselves, and this is a rendered surface - a member named
+          // "x</channel" would otherwise close the envelope the roster is
+          // read inside. Sanitized BEFORE the number-shape test so a name
+          // cannot change shape on the way out.
+          const name = safeName(contactName(contactsMap, contactKey(phone)));
           // .notify (self-reported) commonly defaults to the person's own
           // number for anyone who never set a custom display name -
           // contactName()'s permissive name-or-notify fallback would hand
@@ -3122,7 +3463,7 @@ const handleToolCall = async (req: {
           content: [
             {
               type: "text",
-              text: `${lines.length} member(s) of ${meta.subject || chat_id}:\n${lines.join("\n")}`,
+              text: `${lines.length} member(s) of ${safeName(meta.subject)?.trim() || chat_id}:\n${lines.join("\n")}`,
             },
           ],
         };
@@ -3177,34 +3518,63 @@ for (const n of pendingSecondaryNotifications.splice(0)) {
 
 // ─── Shutdown ──────────────────────────────────────────────────────────
 
-let shuttingDown = false;
+// Long enough for Baileys' in-flight creds/key writes to land, short enough
+// that a terminal closing doesn't feel hung.
+const SHUTDOWN_GRACE_MS = 2000;
+
 function shutdown(): void {
+  // Re-entrant by design: stdin emits 'end' and then 'close', and both are
+  // wired here. Must stay a plain return - forcing the exit on the second
+  // entry would make the 'close' that always follows 'end' cancel the grace
+  // window this function exists for.
   if (shuttingDown) return;
   shuttingDown = true;
   logDiag(`${LOG_PREFIX}: shutting down\n`);
-  // Close the IPC listener BEFORE releasing the singleton lock: releasing
-  // first would open a window where another process can acquire the lock
-  // and start its own listener while this socket/pipe is still bound,
-  // widening the same clobber race startIpcListener() guards against.
-  // Stops accepting and unlinks the Unix socket file. Any open connection is
-  // torn down by the process.exit(0) three lines down, which is what gives a
-  // connected secondary its instant disconnect.
-  // process.exit(0) below is unconditional and synchronous, so the OS closes
-  // every secondarySockets fd instantly and each connected secondary gets its
-  // own close event — no explicit destroy loop needed, that would be dead
-  // code on every path through this function.
+  // Close the IPC listener here, well before the singleton lock is released
+  // at the end of the grace window: a successor that acquires the lock starts
+  // its own listener, and it must never do that while this socket/pipe is
+  // still bound — the same clobber race startIpcListener() guards against.
+  // Stops accepting and unlinks the Unix socket file.
+  // Destroying the sockets explicitly is what gives a connected secondary its
+  // instant disconnect: the exit below is no longer synchronous, so waiting
+  // for the OS to close these fds would leave a secondary hanging for the
+  // whole grace window.
   try {
     ipcServer?.close();
   } catch {}
+  for (const s of secondarySockets) {
+    try {
+      s.destroy();
+    } catch {}
+  }
   try {
     rmSync(ROLE_FILE, { force: true });
   } catch {}
-  releaseSingletonLock();
-  setTimeout(() => process.exit(0), 2000);
+  // The grace timer is the ONLY exit path. Baileys writes creds.update and
+  // Signal key updates asynchronously; exiting synchronously right after
+  // sock.end() aborted those mid-writeFile, which is what corrupted the auth
+  // dir and forced a re-pair. Not unref'd - an unref'd timer would not hold
+  // the loop open and the process could exit before it ever fires, which is
+  // the same bug in a different costume. Nothing downstream may assume this
+  // function returns only when the process is gone; every caller here is a
+  // process/stdin event handler with no code after the call.
+  setTimeout(() => {
+    // The lock is held for the whole window, not dropped at the top of
+    // shutdown. Another process's lock-retry ticks on its own PID every 3s
+    // and this process's shuttingDown flag means nothing to it: a lock freed
+    // early can be won while Baileys is still flushing, and then two
+    // processes have the same auth dir open for writing — exactly the
+    // corruption the window exists to prevent. The successor waits at most
+    // one retry tick. A crash rather than a clean exit leaves the lock file
+    // behind, which acquireSingletonLock's PID + start-time staleness check
+    // already reclaims.
+    releaseSingletonLock();
+    logDiag(`${LOG_PREFIX}: grace window elapsed; lock released, exiting\n`);
+    process.exit(0);
+  }, SHUTDOWN_GRACE_MS);
   try {
     sock?.end(undefined as any);
   } catch {}
-  process.exit(0);
 }
 process.stdin.on("end", shutdown);
 process.stdin.on("close", shutdown);
@@ -3263,6 +3633,24 @@ setInterval(() => {
 const noop = () => {};
 const DIAG_DEBUG = process.env.WHATSAPP_DIAG_DEBUG === "1";
 
+// Baileys logs raw jids — a failed decryption names the sender, and that
+// sender may be a stranger the gate is about to refuse. diag.log is a file on
+// disk that outlives the session, and this file's own rule (see the inbound
+// upsert log) is that no refused stranger's real number is ever written there.
+// So every serialized Baileys line goes through the same maskJid the rest of
+// the file uses, which keeps group/broadcast jids identifiable (they name a
+// channel, not a person) and masks @s.whatsapp.net / @lid outright.
+//
+// Matches jid-SHAPED tokens only. Known misses: a bare phone number logged
+// with no domain, and digits embedded in a pushName or an error string. Those
+// have not been observed in Baileys' own output, and widening this to "any
+// long digit run" would mangle timestamps, message ids and version numbers.
+const JID_IN_TEXT_RE =
+  /[\w.:+-]+@(?:s\.whatsapp\.net|lid|c\.us|g\.us|broadcast|newsletter)/g;
+function maskJidsInText(s: string): string {
+  return s.replace(JID_IN_TEXT_RE, (jid) => maskJid(jid));
+}
+
 const baileysLine = (lvl: string) => (a: any, b?: any) => {
   let head: string;
   try {
@@ -3270,9 +3658,8 @@ const baileysLine = (lvl: string) => (a: any, b?: any) => {
   } catch {
     head = String(a);
   }
-  logDiag(
-    `${LOG_PREFIX} baileys[${lvl}]: ${head}${b === undefined ? "" : ` :: ${b}`}\n`,
-  );
+  const line = `${head}${b === undefined ? "" : ` :: ${b}`}`;
+  logDiag(`${LOG_PREFIX} baileys[${lvl}]: ${maskJidsInText(line)}\n`);
 };
 
 const silentLogger: any = {
@@ -3290,22 +3677,9 @@ const silentLogger: any = {
 
 // ─── WhatsApp connection ───────────────────────────────────────────────
 
-function extractText(msg: proto.IMessage | null | undefined): string {
-  if (!msg) return "";
-  return (
-    msg.conversation ??
-    msg.extendedTextMessage?.text ??
-    msg.imageMessage?.caption ??
-    msg.videoMessage?.caption ??
-    msg.documentMessage?.caption ??
-    ""
-  );
-}
-
-function extractMentions(msg: proto.IMessage | null | undefined): string[] {
-  return (msg?.extendedTextMessage?.contextInfo?.mentionedJid ??
-    []) as string[];
-}
+// extractText / extractMentions live in ./lib/inbound-message.ts so the pair
+// stays testable and, more importantly, stays in step with each other — see
+// that file's header for the bug that separating them caused.
 
 type MediaInfo = {
   kind: string;
@@ -3400,7 +3774,14 @@ async function transcribeCloud(
   }
 }
 
-function transcribeLocal(filePath: string): string | null {
+// execFile, not execFileSync: this runs on the inbound message path with a
+// 180s timeout, and the synchronous form froze the whole event loop for up to
+// three minutes per voice message - no MCP responses, no IPC, no cron ticks,
+// no Baileys frames, nothing. Still argv-based ([filePath], never a shell
+// string), which is what keeps a filename injection-proof.
+const execFileAsync = promisify(execFile);
+
+async function transcribeLocal(filePath: string): Promise<string | null> {
   if (!existsSync(WHISPER_SCRIPT)) {
     if (!whisperMissingWarned) {
       whisperMissingWarned = true;
@@ -3412,21 +3793,25 @@ function transcribeLocal(filePath: string): string | null {
     return null;
   }
   try {
-    const result = execFileSync(WHISPER_SCRIPT, [filePath], {
+    const { stdout } = await execFileAsync(WHISPER_SCRIPT, [filePath], {
       timeout: WHISPER_TIMEOUT_MS,
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
       maxBuffer: 10 * 1024 * 1024,
     });
-    const trimmed = result.trim();
+    const trimmed = stdout.trim();
     if (!trimmed) {
       logDiag(`${LOG_PREFIX}: whisper returned empty output for ${filePath}\n`);
       return null;
     }
     return trimmed;
   } catch (err: unknown) {
-    const e = err as NodeJS.ErrnoException & {
-      status?: number | null;
+    // Same failure information, different carrier: execFile's rejection puts
+    // the EXIT CODE on `code` (a number) where execFileSync used `status`, and
+    // a timeout shows up as killed/SIGTERM. Both shapes are matched so the
+    // existing log lines keep saying the same thing.
+    const e = err as Error & {
+      code?: string | number | null;
+      killed?: boolean;
       signal?: string | null;
       stderr?: Buffer | string;
       stdout?: Buffer | string;
@@ -3435,12 +3820,12 @@ function transcribeLocal(filePath: string): string | null {
     const parts: string[] = [
       `${LOG_PREFIX}: whisper transcription failed for ${filePath}`,
     ];
-    if (e.signal === "SIGTERM" || e.code === "ETIMEDOUT") {
+    if (e.killed || e.signal === "SIGTERM" || e.code === "ETIMEDOUT") {
       parts.push(
         `timed out after ${WHISPER_TIMEOUT_MS}ms (override with WHISPER_TIMEOUT_MS env var; first run downloads the model)`,
       );
-    } else if (typeof e.status === "number") {
-      parts.push(`exit ${e.status}`);
+    } else if (typeof e.code === "number") {
+      parts.push(`exit ${e.code}`);
     } else if (e.code) {
       parts.push(`error code ${e.code}`);
     }
@@ -3460,10 +3845,6 @@ async function transcribeAudio(filePath: string): Promise<string | null> {
   if (TRANSCRIPTION_PROVIDER === "openai")
     return transcribeCloud(filePath, "openai");
   return transcribeLocal(filePath);
-}
-
-function safeName(s: string | undefined | null): string | undefined {
-  return s?.replace(/[<>\[\]\r\n;]/g, "_");
 }
 
 // The owner replied on their phone. Log it for the chats the agent is already
@@ -3522,7 +3903,14 @@ async function logOwnerHandReply(msg: WAMessage): Promise<void> {
     chat_id: chatId,
     user: ownerDisplayName(),
     user_id: ownJid || "self",
-    text,
+    // The owner is trusted, so this is envelope integrity rather than a gate:
+    // their line is rendered by catch_up through the same <channel …> envelope
+    // every inbound line is, and a "</channel" they typed by hand (quoting
+    // this repo's own code, say) would truncate it exactly the same way.
+    // Lines written before this change are not migrated - a stale one still
+    // renders as it did, which is the pre-existing behaviour and self-healing
+    // as the log ages out.
+    text: neutralizeChannelTag(text),
     ts: new Date(tsSec > 0 ? tsSec * 1000 : Date.now()).toISOString(),
     replied: true,
     direction: "out",
@@ -3537,6 +3925,18 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   // fromMe: our own echo, or the owner typing on their phone.
   if (msg.key.fromMe) {
     if (wasSentByServer(msg.key.id)) return;
+    // Before the hand-reply path claims it. When the owner IS the linked
+    // account the permission request lands in their note-to-self, so their
+    // typed "yes <id>" arrives here rather than on the inbound route and was
+    // logged as ordinary chat instead of answering anything. Only a claimed
+    // id is taken; every other fromMe message, "yes xxxxx" included, still
+    // falls through to logOwnerHandReply so unreplied clears and catch_up
+    // shows it.
+    if (
+      !backlog &&
+      tryClaimPermissionReply(msg, msg.key.remoteJid, extractText(msg.message))
+    )
+      return;
     return logOwnerHandReply(msg);
   }
   if (wasSentByServer(msg.key.id)) return;
@@ -3601,9 +4001,9 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
         persistMessage({
           id: messageId,
           chat_id: remoteJid,
-          user: msg.pushName ?? senderJid.split("@")[0],
+          user: displaySenderName(msg.pushName, senderJid),
           user_id: senderJid,
-          text: kept,
+          text: neutralizeChannelTag(kept),
           ts: new Date(timestamp * 1000).toISOString(),
           replied: true,
           direction: "in",
@@ -3666,33 +4066,12 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   // Ensure group config directory exists
   if (isGroup) ensureGroupDir(remoteJid);
 
-  // Permission reply intercept, only while that request id is outstanding:
-  // the pattern ("yes" + 5 letters) is reachable by ordinary chat, and
-  // swallowing a real message — sender sees a tick, agent never sees the
-  // text — is worse than missing an approval. On clients that never send
-  // permission requests, nothing is listening at all.
-  const permMatch = backlog ? null : PERMISSION_REPLY_RE.exec(text);
-  if (permMatch && claimPermission(permMatch[2]!.toLowerCase())) {
-    void mcp.notification({
-      method: "notifications/claude/channel/permission",
-      params: {
-        request_id: permMatch[2]!.toLowerCase(),
-        behavior: permMatch[1]!.toLowerCase().startsWith("y")
-          ? "allow"
-          : "deny",
-      },
-    });
-    // Ack with reaction
-    if (sock && messageId) {
-      const emoji = permMatch[1]!.toLowerCase().startsWith("y")
-        ? "\u2705"
-        : "\u274C";
-      void sendTracked(remoteJid, {
-        react: { text: emoji, key: msg.key },
-      }).catch(() => {});
-    }
-    return;
-  }
+  // Permission reply intercept, only while that request id is outstanding.
+  // On clients that never send permission requests, nothing is listening at
+  // all. Skipped for backlog like every other block that ACTS: a "yes"
+  // replayed from while we were offline answers a request that died with the
+  // process that asked it.
+  if (!backlog && tryClaimPermissionReply(msg, remoteJid, text)) return;
 
   // Ack reaction
   if (!backlog && access.ackReaction && sock && messageId) {
@@ -3791,11 +4170,15 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   }
 
   // Extract sender display info
-  const senderName = msg.pushName ?? senderJid.split("@")[0];
+  const senderName = displaySenderName(msg.pushName, senderJid);
   const senderPhone = senderJid.split("@")[0];
 
-  // Determine content text
-  const contentText = text || (media ? `(${media.kind})` : "");
+  // Determine content text. Neutralized once, here, so the notification, the
+  // secondaries' copy and the on-disk log all carry byte-identical text - the
+  // same invariant the notifyParams comment below states.
+  const contentText = neutralizeChannelTag(
+    text || (media ? `(${media.kind})` : ""),
+  );
   if (!contentText && !imagePath && !attachment) return;
 
   // Check for reply context
@@ -3810,7 +4193,7 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   persistMessage({
     id: messageId,
     chat_id: remoteJid,
-    user: msg.pushName ?? senderJid.split("@")[0],
+    user: senderName,
     user_id: senderJid,
     text: contentText,
     ts: new Date(timestamp * 1000).toISOString(),
@@ -3873,6 +4256,81 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
 // ─── Baileys connection with retry ─────────────────────────────────────
 
 let reconnectAttempt = 0;
+
+// Epoch ms of the moment the CURRENT socket reached 'open'. 0 until the first
+// connect. This is the only honest dividing line between "this was waiting for
+// us while we were offline" and "this just arrived": anything stamped before
+// we connected cannot have been delivered live to this socket. See
+// isOfflineBacklog and the messages.upsert handler for why ev.type alone is
+// not that line.
+let connectedAt = 0;
+
+// A live message merged into an "append" batch is still live. Baileys buffers
+// events for ~100ms and flushes ALL buffered message upserts as ONE
+// messages.upsert whose `type` is taken from the FIRST entry only
+// (Utils/event-buffer.js), and every outbound send re-upserts its own echo as
+// 'append' (Socket/messages-send.js) — so any genuine inbound landing within
+// that window of one of our own chunks used to be silently demoted to backlog:
+// no notification, no broadcast, no ack, no media download.
+//
+// Direction of the guard matters: this may only ever UPGRADE a misclassified
+// message to live, never downgrade a real backlog message. So every uncertain
+// case (no timestamp, never connected) stays backlog, which is exactly
+// today's behaviour. The 60s tolerance is for clock skew between WhatsApp's
+// stamp and our clock; it bounds the worst case to acting on a message at
+// most a minute stale, versus hours for true offline backlog.
+// connectWhatsApp is the ONLY thing that arms the next reconnect - it installs
+// the connection.update handler that schedules it - so a throw out of a
+// scheduled attempt (a corrupt auth dir, an FS error, a failed version fetch)
+// used to end reconnection permanently while the process stayed alive AND kept
+// holding the singleton lock: `status` says "reconnecting" forever and no
+// other terminal can take over. Catch it, reschedule with the same capped
+// backoff, and say it out loud the first time so this degrades noisily instead
+// of silently.
+let reconnectThrows = 0;
+// Same convention as retryGen, for the same reason. connectWhatsApp can throw
+// AFTER creating the socket, and that socket's own close handler schedules a
+// reconnect too - so the throw's catch below and the close both arm a chain,
+// each of which re-arms itself forever, and the duplicate sockets show up as
+// 440 session conflicts. Every scheduling call takes the newest generation;
+// a timer whose generation is stale discards itself instead of firing.
+let reconnectGen = 0;
+function scheduleReconnect(delay: number): void {
+  const gen = ++reconnectGen;
+  setTimeout(() => {
+    // shutdown() calls sock.end(), which emits connection.update 'close' and
+    // lands right back here. Now that the exit is deferred by a grace window,
+    // that reconnect could actually fire and open a fresh socket - and start
+    // writing creds - on the way out. It must not.
+    if (shuttingDown || gen !== reconnectGen) return;
+    connectWhatsApp().catch((err) => {
+      reconnectThrows++;
+      reconnectAttempt++;
+      const next = Math.min(1000 * reconnectAttempt, 30000);
+      logDiag(
+        `${LOG_PREFIX}: connect attempt failed: ${err}; retrying in ${next / 1000}s\n`,
+      );
+      // First failure of a streak only: the backoff caps at 30s, so notifying
+      // every time would be a notification every half minute for as long as
+      // the fault lasts. reconnectThrows is cleared on the next 'open'.
+      if (AUTO_NOTIFY && reconnectThrows === 1) {
+        notifySystem(
+          `WhatsApp could not reconnect: ${err instanceof Error ? err.message : String(err)}. Retrying every ${next / 1000}s.`,
+          "reconnect-failed",
+        );
+      }
+      scheduleReconnect(next);
+    });
+  }, delay);
+}
+
+const BACKLOG_SKEW_TOLERANCE_MS = 60_000;
+function isOfflineBacklog(msg: WAMessage): boolean {
+  if (!connectedAt) return true;
+  const tsMs = toEpochMs(msg.messageTimestamp);
+  if (tsMs === undefined || !tsMs) return true;
+  return tsMs < connectedAt - BACKLOG_SKEW_TOLERANCE_MS;
+}
 
 let pairingCodeRequested = false;
 let lastPairingCode = "";
@@ -3977,7 +4435,11 @@ async function connectWhatsApp(): Promise<void> {
     printQRInTerminal: !PHONE_NUMBER, // QR only if no phone number set
     logger: silentLogger,
     browser: ["Mac OS", "Chrome", "145.0.0"],
-    defaultQueryTimeoutMs: undefined,
+    // Baileys' own default, restored explicitly. `undefined` disables the
+    // timeout entirely, which turns a single dropped iq response into a query
+    // that never settles - and every awaited query behind it (see
+    // resolveGroupName) hangs with it.
+    defaultQueryTimeoutMs: 60_000,
     generateHighQualityLinkPreview: false,
     syncFullHistory: false,
     markOnlineOnConnect: false,
@@ -4122,6 +4584,11 @@ async function connectWhatsApp(): Promise<void> {
 
     if (connection === "open") {
       reconnectAttempt = 0;
+      reconnectThrows = 0;
+      // Stamped before anything else in this branch: isOfflineBacklog treats
+      // 0 as "never connected → everything is backlog", so the window where
+      // this is unset must be as short as possible.
+      connectedAt = Date.now();
       pairingCodeRequested = false;
       ownJid = jidNormalizedUser(sock!.user?.id ?? "");
       // Baileys never emits a lid-mapping.update for our own account, yet
@@ -4135,17 +4602,45 @@ async function connectWhatsApp(): Promise<void> {
       // Auto-add owner to allowlist on first connection
       if (ownJid && !STATIC) {
         const access = loadAccess();
+        let accessChanged = false;
+        // Snapshot before the auto-add below, because ownerStamp's migration
+        // rule is about the allowlist the user built, not the one this connect
+        // is about to append ourselves to.
+        const allowFromBefore = access.allowFrom.slice();
         if (!isAllowedJid(ownJid, access.allowFrom)) {
           access.allowFrom.push(resolvedOwn);
+          accessChanged = true;
           if (access.dmPolicy === "pairing" && access.allowFrom.length > 0) {
             access.dmPolicy = "allowlist";
             logDiag(`${LOG_PREFIX}: auto-locked to allowlist mode\n`);
           }
+        }
+        // Stamped only when absent — see ownerStamp for why re-stamping every
+        // connect was a regression and why an install that already had an
+        // allowlist keeps the target it has been using.
+        const owner = ownerStamp(access.owner, allowFromBefore, resolvedOwn);
+        if (owner !== undefined && owner !== access.owner) {
+          access.owner = owner;
+          accessChanged = true;
+        }
+        if (accessChanged) {
           saveAccess(access);
           logDiag(
-            `${LOG_PREFIX}: auto-added owner ${maskJid(resolvedOwn)} to allowlist\n`,
+            // Says only what this branch did. The owner it stamps is not
+            // always resolvedOwn any more, and the line below is the one that
+            // names the permission target.
+            `${LOG_PREFIX}: linked account ${maskJid(resolvedOwn)} allowlisted\n`,
           );
         }
+        // Unconditional, and on every connect: this names the chat that
+        // receives command previews and can approve them. A misdirected owner
+        // is otherwise invisible — the agent just waits on approvals nobody
+        // sees — and diag.log is the only forensic surface on an unattended
+        // host. `access status` prints the same jid interactively.
+        const target = permissionTarget(access);
+        logDiag(
+          `${LOG_PREFIX}: permission requests go to ${target ? maskJid(target) : "nobody (no owner and an empty allowlist)"}\n`,
+        );
       }
 
       // Initialize server-side cron jobs from group configs
@@ -4214,15 +4709,37 @@ async function connectWhatsApp(): Promise<void> {
       pairingCodeRequested = false;
       const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
       const reason = statusCode ?? "unknown";
+      // shutdown() calls sock.end(), which lands here with no status code at
+      // all. Printing "disconnected (reason: unknown)" and then "reconnecting
+      // in 1s" described a reconnect that scheduleReconnect's own guard then
+      // correctly refused to make — and diag.log is the only forensic surface
+      // on an unattended host, so a line claiming something that did not
+      // happen is worse than no line.
+      if (shuttingDown) {
+        logDiag(
+          `${LOG_PREFIX}: disconnected during shutdown; not reconnecting\n`,
+        );
+        return;
+      }
       logDiag(`${LOG_PREFIX}: disconnected (reason: ${reason})\n`);
 
       if (statusCode === DisconnectReason.loggedOut) {
-        // Device was unlinked — auth is invalid
-        logDiag(
-          `${LOG_PREFIX}: logged out — auth invalid.\n` +
-            `  Run /whatsapp-channel:configure reset-auth to clear and re-pair.\n`,
-        );
-        // Don't auto-delete auth — let user decide
+        // Device was unlinked — auth is invalid and there is no reconnect
+        // that can fix it. This is the one close that ends the channel for
+        // good, and it used to write a single diag line and return: nothing
+        // reached the terminal, so the channel was dead to the outside world
+        // with nobody told. Every other lifecycle event here notifies.
+        const loggedOutMsg = [
+          `WhatsApp is disconnected: this device was unlinked from the phone.`,
+          `No reconnect can recover this — the stored credentials are dead.`,
+          ``,
+          `To get the channel back:`,
+          `  /whatsapp-channel:configure reset-auth`,
+          `  → then re-pair by scanning/entering the code on the phone.`,
+        ].join("\n");
+        logDiag(`${LOG_PREFIX}: ${loggedOutMsg}\n`);
+        // Deliberately NOT deleting AUTH_DIR — that stays the user's call.
+        if (AUTO_NOTIFY) notifySystem(loggedOutMsg, "logged-out");
         return;
       }
 
@@ -4233,7 +4750,7 @@ async function connectWhatsApp(): Promise<void> {
         logDiag(
           `${LOG_PREFIX}: pairing in progress, retrying in ${delay / 1000}s\n`,
         );
-        setTimeout(connectWhatsApp, delay);
+        scheduleReconnect(delay);
         return;
       }
 
@@ -4245,7 +4762,7 @@ async function connectWhatsApp(): Promise<void> {
           ? " (session conflict — another instance may be using this auth)"
           : "";
       logDiag(`${LOG_PREFIX}: reconnecting in ${delay / 1000}s${detail}\n`);
-      setTimeout(connectWhatsApp, delay);
+      scheduleReconnect(delay);
     }
   });
 
@@ -4280,11 +4797,18 @@ async function connectWhatsApp(): Promise<void> {
       // same gate so the log (and catch_up) has them, but as BACKLOG: no
       // live notification, no media download, no pairing reply - a replay
       // must never make this server act on a message that is hours old.
-      const backlog = ev.type === "append";
-      if (!backlog && ev.type !== "notify") return;
+      //
+      // ev.type gates the BATCH, but it cannot decide each message: Baileys'
+      // event buffer merges every buffered upsert into one event and takes
+      // `type` from the first entry alone, so one 'append' echo of our own
+      // send drags genuine live inbounds in behind it. Backlog is therefore
+      // decided per message, against when this socket connected — see
+      // isOfflineBacklog.
+      const appendBatch = ev.type === "append";
+      if (!appendBatch && ev.type !== "notify") return;
       for (const msg of ev.messages) {
         try {
-          await handleMessage(msg, backlog);
+          await handleMessage(msg, appendBatch && isOfflineBacklog(msg));
         } catch (err) {
           logDiag(`${LOG_PREFIX}: message handler error: ${err}\n`);
         }
@@ -4292,28 +4816,62 @@ async function connectWhatsApp(): Promise<void> {
     },
   );
 
-  // Handle emoji reactions on permission request messages
+  // Handle emoji reactions on permission request messages.
+  //
+  // Two keys, only one of them trustworthy. `key` here is
+  // content.reactionMessage.key — the REACTED-TO key, copied verbatim out of
+  // the sender's own stanza (Utils/process-message.js), so its id and fromMe
+  // are whatever the sender chose to put there: anyone who can send us a
+  // reaction can name any message id, including a permission request they
+  // never saw. `reaction.key` is the reaction message's OWN key, stamped by
+  // WhatsApp (remoteJid = the chat it arrived in, participant = the sender in
+  // a group), and is the only authenticated identity available here.
+  //
+  // Nothing on the reacted-to key is trusted, not even as an early-out. It
+  // used to skip anything with fromMe set, which cost nothing when the owner
+  // is a separate contact (their device stamps our request fromMe: false) but
+  // silently killed the whole documented 👍 flow for the note-to-self setup,
+  // where the owner IS the linked account and every key in the chat is
+  // fromMe. Its id is still the map lookup, because guessing a WhatsApp
+  // message id is not the weak link — the reactor check below is.
   sock.ev.on(
     "messages.reaction" as any,
-    async (reactions: { key: WAMessageKey; reaction: { text: string } }[]) => {
+    async (
+      reactions: {
+        key: WAMessageKey;
+        reaction: { text: string; key?: WAMessageKey };
+      }[],
+    ) => {
       for (const { key, reaction } of reactions) {
-        if (!key.id || key.fromMe) continue;
-        const requestId = permissionMessageMap.get(key.id);
-        if (!requestId) continue;
+        if (!key.id) continue;
+        const pending = permissionMessageMap.get(key.id);
+        if (!pending) continue;
         const emoji = reaction.text;
         const isApprove = ["👍", "✅", "👌", "🆗"].includes(emoji);
         const isDeny = ["👎", "❌", "🚫", "✋"].includes(emoji);
         if (!isApprove && !isDeny) continue;
+        const reactorJid =
+          reaction.key?.participant ?? reaction.key?.remoteJid ?? "";
+        // Same normalizing comparison claimPermission uses, for the same
+        // reason: the owner reaches us as @lid or as a phone jid depending on
+        // the path. A mismatch is dropped WITHOUT deleting the entry, so the
+        // owner's own reaction still works afterwards.
+        if (!reactorJid || !isAllowedJid(reactorJid, [pending.chatId])) {
+          logDiag(
+            `${LOG_PREFIX}: ignored permission reaction from ${reactorJid ? maskJid(reactorJid) : "unknown"} (not the chat we asked)\n`,
+          );
+          continue;
+        }
         permissionMessageMap.delete(key.id);
         void mcp.notification({
           method: "notifications/claude/channel/permission",
           params: {
-            request_id: requestId,
+            request_id: pending.requestId,
             behavior: isApprove ? "allow" : "deny",
           },
         });
         logDiag(
-          `${LOG_PREFIX}: permission ${requestId} ${isApprove ? "approved" : "denied"} via reaction ${emoji}\n`,
+          `${LOG_PREFIX}: permission ${pending.requestId} ${isApprove ? "approved" : "denied"} via reaction ${emoji}\n`,
         );
       }
     },
@@ -4322,7 +4880,10 @@ async function connectWhatsApp(): Promise<void> {
 
 if (!CONFLICT) {
   logDiag(`${LOG_PREFIX}: starting\n`);
-  await becomePrimary();
+  // Same wrapper as the lock-retry promotion: a first connect that throws must
+  // leave a live retry chain behind, not a lock-holding process that never
+  // reconnects.
+  await promoteAndConnect();
 } else if (ipcRelay) {
   logDiag(
     `${LOG_PREFIX}: relaying tool calls to the primary (pid ${CONFLICT.pid})\n`,
