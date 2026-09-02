@@ -2584,7 +2584,6 @@ function mimeToExt(mime: string | null | undefined): string {
   return map[mime.split(";")[0].trim()] ?? "bin";
 }
 
-
 // Declared mimetype for outbound documents. Android WhatsApp labels and opens an attachment by this
 // value, so "application/octet-stream" shows up as an unopenable "BIN" file.
 function mimeForExt(ext: string): string {
@@ -2596,9 +2595,12 @@ function mimeForExt(ext: string): string {
     ".json": "application/json",
     ".html": "text/html",
     ".zip": "application/zip",
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".docx":
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx":
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx":
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".mp3": "audio/mpeg",
     ".m4a": "audio/mp4",
     ".ogg": "audio/ogg",
