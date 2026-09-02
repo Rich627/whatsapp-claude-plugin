@@ -2584,6 +2584,31 @@ function mimeToExt(mime: string | null | undefined): string {
   return map[mime.split(";")[0].trim()] ?? "bin";
 }
 
+// Declared mimetype for outbound documents. Android WhatsApp labels and opens an attachment by this
+// value, so "application/octet-stream" shows up as an unopenable "BIN" file.
+function mimeForExt(ext: string): string {
+  const m: Record<string, string> = {
+    ".pdf": "application/pdf",
+    ".md": "text/markdown",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".json": "application/json",
+    ".html": "text/html",
+    ".zip": "application/zip",
+    ".docx":
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx":
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx":
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
+  };
+  return m[ext.toLowerCase()] ?? "application/octet-stream";
+}
+
 // ─── MCP Server ────────────────────────────────────────────────────────
 
 let sock: WASocket | null = null;
@@ -3148,7 +3173,7 @@ const handleToolCall = async (req: {
             sent = (await sock.sendMessage(chat_id, {
               document: buf,
               fileName: basename(f),
-              mimetype: "application/octet-stream",
+              mimetype: mimeForExt(ext),
             })) as WAMessage | undefined;
           }
           if (sent?.key) {
