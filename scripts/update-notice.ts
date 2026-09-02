@@ -57,6 +57,12 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.23.1",
+      notes: [
+        "Documents you send (PDFs, markdown, spreadsheets, audio files) now arrive with their real file type. They used to be sent as a generic binary, which Android WhatsApp showed as an unopenable BIN file.",
+      ],
+    },
+    {
       version: "0.23.0",
       notes: [
         "Fixed a message loss that was easy to mistake for the channel being asleep: a message that arrived within a fraction of a second of Claude sending a reply was filed as old backlog, so you got no notification, no ack, and any photo or voice note in it was never downloaded. It was likeliest right after a long reply, because each chunk reopened the window.",
