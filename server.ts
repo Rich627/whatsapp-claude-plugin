@@ -1142,6 +1142,7 @@ type Access = {
   pending: Record<string, PendingEntry>;
   mentionPatterns?: string[];
   ackReaction?: string;
+  typingIndicator?: boolean; // send "composing" presence on inbound (default off)
   replyToMode?: "off" | "first" | "all";
   textChunkLimit?: number;
   chunkMode?: "length" | "newline";
@@ -1213,6 +1214,7 @@ function readAccessFile(): Access {
       pending: parsed.pending ?? {},
       mentionPatterns: parsed.mentionPatterns,
       ackReaction: parsed.ackReaction,
+      typingIndicator: parsed.typingIndicator,
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
@@ -4105,8 +4107,10 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
     }).catch(() => {});
   }
 
-  // Typing indicator
-  if (sock && !backlog) {
+  // Typing indicator — opt-in via access.json "typingIndicator": true. Off by
+  // default: a "composing" presence on every inbound made the owner's number
+  // show as typing to the whole chat whenever any message arrived.
+  if (sock && !backlog && access.typingIndicator) {
     void sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
   }
 
