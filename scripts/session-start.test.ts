@@ -81,6 +81,29 @@ describe("session-start.sh", () => {
     expect(runHook(dir)).toContain("no contacts are allowlisted yet");
   });
 
+  // Spec R2: the access screen is the ADVERTISED first-run route. This branch
+  // used to lead with the pairing-code choreography, which is four steps per
+  // contact and only ever needed for someone who has never messaged you.
+  test("the no-contacts branch leads with the access screen, pairing second", () => {
+    const dir = configuredStateDir({ allowFrom: [] });
+    const msg = runHook(dir);
+    expect(msg).toContain("/whatsapp-channel:access review");
+    expect(msg).toContain("normal way");
+    // Pairing is still reachable - it is the only route for a stranger.
+    expect(msg).toContain("/whatsapp-channel:access pair");
+    // Order: the screen is offered before the pairing fallback.
+    expect(msg.indexOf("access review")).toBeLessThan(
+      msg.indexOf("policy pairing"),
+    );
+  });
+
+  // A double quote in any of the three unconfigured branches ends the JSON
+  // string they are interpolated raw into. runHookRaw would throw on parse,
+  // but assert it directly so the reason is named at the failure.
+  test("the onboarding branches carry no unescaped double quote", () => {
+    expect(runHook(configuredStateDir({ allowFrom: [] }))).not.toContain('"');
+  });
+
   test("pretty-printed creds.json ('registered': true with space) counts as paired", () => {
     // configuredStateDir writes creds pretty-printed already; getting past
     // the has_auth branch to the fully-configured message proves it matched.

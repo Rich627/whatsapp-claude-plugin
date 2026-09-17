@@ -12,18 +12,46 @@ claude.com/plugins.
 
 ## Tech Stack & Commands
 
-- **Runtime:** Bun — TypeScript runs directly. No build step. No test suite.
-- **Deps (only 2 — no new dependencies without the user's explicit approval):**
-  `@modelcontextprotocol/sdk`, `@whiskeysockets/baileys@7.0.0-rc.9`
+- **Runtime:** Bun — TypeScript runs directly. No build step.
+- **Deps (only 3 — no new dependencies without the user's explicit approval):**
+  `@modelcontextprotocol/sdk`, `@whiskeysockets/baileys@7.0.0-rc.9`,
+  `@inquirer/prompts`
   (4 known rc.9 bugs are patched by `patch-baileys.mjs` via postinstall).
+- **Tests:** there IS a test suite — 22 `*.test.ts` files under `lib/` and
+  `scripts/`, run with `bun test`. There is no `test` script in `package.json`;
+  `bun test` finds them itself.
 - **Linting:** Trunk (prettier, markdownlint, shellcheck, shfmt, checkov, trufflehog).
+  Trunk is not installed on every machine — check before assuming `trunk check` runs.
 
 ```bash
 bun install     # install deps (postinstall runs patch-baileys.mjs)
 bun server.ts   # run the MCP server
+bun test        # ~130s, spawns real servers — see the warning below
 trunk check     # lint
 trunk fmt       # format
 ```
+
+**Type checking — `bun build` is NOT a type check.** `bun build` is a bundler: it
+resolves and emits, it does not check types, so an out-of-scope or misspelled
+identifier bundles happily and tells you nothing. Use `tsc` directly. This repo
+has no `tsconfig.json` and no local `typescript` dependency, so pass the options
+on the command line (verified 2026-09-08: exit 0, no errors):
+
+```bash
+bunx --bun typescript@5 --noEmit --skipLibCheck \
+  --target esnext --module preserve --moduleResolution bundler \
+  --strict server.ts
+```
+
+`--strict` is load-bearing, not decoration: without it you get two phantom
+TS2339s in `lib/mentions.ts` that do not exist under strict mode. Note the
+invocation is `bunx typescript@5 <options>` — `bunx typescript@5 tsc ...` fails,
+because bunx already resolves the package's `tsc` binary and the extra `tsc`
+is then read as a filename to compile.
+
+**Never run `bun test` concurrently with another `bun test` or with a forked
+review agent.** The IPC tests spawn real servers and contend on the singleton
+lock. Run it to a log and grep the summary — piping to `tail` hides failures.
 
 ## Architecture
 
@@ -36,10 +64,15 @@ WhatsApp (phone) ←─ Baileys ─→ MCP Server (server.ts) ←─ stdio ─�
                             ├─ groups/<groupJid>/   (config.md = personality + cron,
                             │                        memory.md = conversation memory)
                             ├─ tasks.md   (agent-maintained open-task list, read by catch_up)
-                            └─ inbox/
+                            ├─ messages.jsonl   (inbound + owner/Claude context lines, pruned
+                            │                    hourly to WHATSAPP_MESSAGE_TTL_DAYS, default 7)
+                            ├─ sent.jsonl       (id + ts of the plugin's own sends, 24h)
+                            ├─ .aged-out-chats.json  (hashed chat_id -> when a WAITING line
+                            │                    was pruned; 30 days; never written in static mode)
+                            └─ inbox/     (attachments, pruned to the same horizon as messages.jsonl)
 ```
 
-- **`server.ts`** — the entire MCP server in one file (~1900 lines; re-check with
+- **`server.ts`** — the entire MCP server in one file (~5400 lines; re-check with
   `wc -l` rather than trusting this number). MCP tools exposed to Claude: `reply`,
   `react`, `download_attachment`, `edit_message`, `status`, `unreplied`, `catch_up`,
   `list_groups`.
@@ -68,6 +101,15 @@ WhatsApp (phone) ←─ Baileys ─→ MCP Server (server.ts) ←─ stdio ─�
    `version`: they must match each other and be newer than before. Skipping one makes
    `plugin update` silently no-op for users. Semver: patch for fixes, minor for
    features.
+   **Same ritual, third step: write the banner notes.** Add or extend the entry for
+   that version in `scripts/update-notice.ts`'s `CHANGELOG`. The note text is
+   hand-written per release — nothing derives it — so a bump without it ships a
+   release the banner never mentions, or worse, leaves an older note standing that
+   the new release just made false (that is how the 0.23.0 permissions note ended up
+   telling users a still-broken block was fixed). **One short line per change, under
+   ~100 characters.** A note that will not fit is two notes, never a wrapped
+   paragraph: they are joined with a blank line between bullets and read at session
+   start, and 0.22.0 once stacked thirteen paragraphs there.
 2. **Danger zones in `server.ts`:** connection lifecycle, the singleton lock, and
    allowlist/access gating have each regressed before. Before editing them, grep the
    whole file for every symbol you touch (`grep -n <symbol> server.ts` — module-level

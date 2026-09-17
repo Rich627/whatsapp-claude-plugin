@@ -65,7 +65,29 @@ RESTART_SCRIPT="$HOME/start-whatsapp-agent.sh"
 LOCK_FILE="$STATE_DIR/.server.lock"
 
 # Thresholds — only nudge if things are really stuck
-MSG_STALE_SECS=600            # 10 min unreplied message
+MSG_STALE_SECS=600 # 10 min unreplied message
+# Ceiling on the same window. Past this an unreplied line means "nobody
+# answered", not "the session is stuck". Before 0.25.0 an unanswered inbound
+# aged out of the log after 24h, so Check 1 was self-limiting; with one 7-day
+# horizon (30 with WHATSAPP_MESSAGE_TTL_DAYS) a single message nobody ever
+# replies to would otherwise make the watchdog declare the session stuck and
+# fire recovery on every cycle for a week. Mirrors MSG_STALE_MAX_SECS in
+# scripts/doctor.ts.
+MSG_STALE_MAX_SECS=86400 # 24h; older than this is not a stuck session
+# Deliberately no INFO/report path for the >24h ones here, unlike doctor.ts,
+# which reports them separately so a long-dead session cannot hide behind a
+# PASS. Check 1 is the "stuck despite traffic" signal, not the liveness one;
+# liveness is the one-way-silence pair further down (INBOUND_STALE_SECS 6h ->
+# alert, INBOUND_RESTART_SECS 12h -> restart).
+#
+# WHAT THAT PAIR DOES NOT COVER, stated because this comment used to claim it
+# covered everything: inbound_silence is measured from max(last inbound,
+# inbound_baseline), and the baseline is REBASED on every restart and network
+# recovery. So immediately after a restart, a 25h-old unanswered message is
+# excluded from Check 1 by the ceiling above AND produces no silence alert for
+# a further 6h. The ceiling is still right - firing recovery every cycle for a
+# week over one unanswered message is worse - but the gap is real, and doctor
+# is where a long-dead session is meant to become visible.
 PENDING_STALE_MIN=15          # 15 min pending file untouched
 COOLDOWN_SECS=600             # don't nudge more than once per 10 min
 AUTH_ALERT_COOLDOWN_SECS=1800 # don't re-alert auth failure more than once per 30 min
@@ -404,7 +426,8 @@ try:
         m = json.loads(line)
         if m.get('replied') is False:
           ts = datetime.fromisoformat(m['ts'].replace('Z','+00:00')).timestamp()
-          if now - ts > $MSG_STALE_SECS:
+          age = now - ts
+          if $MSG_STALE_SECS < age < $MSG_STALE_MAX_SECS:
             stale += 1
       except Exception:
         continue
@@ -414,7 +437,7 @@ print(stale)
 " 2>/dev/null || echo 0)
 	if [ "$stale_count" -gt 0 ]; then
 		stuck=1
-		reason="$stale_count unreplied msg(s) >${MSG_STALE_SECS}s"
+		reason="$stale_count unreplied msg(s) ${MSG_STALE_SECS}-${MSG_STALE_MAX_SECS}s old"
 	fi
 fi
 
@@ -470,7 +493,7 @@ echo "$streak" >"$STUCK_STREAK_FILE"
 # Nudge: ESC + catch-up prompt
 tmux send-keys -t "$TMUX_SESSION" Escape
 sleep 1
-tmux send-keys -t "$TMUX_SESSION" "Watchdog: call whatsapp catch_up tool to recover recent two-way context and open tasks, reply to any unreplied messages in-context, then process any files in ~/.whatsapp-channel/pending/ (execute each prompt, send to chat_id, then rm)." Enter
+tmux send-keys -t "$TMUX_SESSION" "Watchdog: call whatsapp catch_up with no arguments for the per-chat waiting counts and open tasks, then call catch_up again with chat set to each chat that has messages waiting - that view carries the chat_id and the message text you need to reply in-context. Then process any files in ~/.whatsapp-channel/pending/ (execute each prompt, send to chat_id, then rm)." Enter
 sleep 1
 tmux send-keys -t "$TMUX_SESSION" Enter
 

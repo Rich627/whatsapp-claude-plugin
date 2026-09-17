@@ -38,7 +38,17 @@ if [ ! -f "$VENV_ACTIVATE" ]; then
 	echo "whisper-transcribe.sh: whisper is not installed - $VENV_ACTIVATE not found (see setup instructions at the top of this script)" >&2
 	exit 2
 fi
+# `set +u` around the source, and only around it. Older virtualenv/venv
+# activate scripts reference $PS1 and $PYTHONHOME without `:-` guards; under
+# `set -u` that is an unbound-variable error, and with `set -e` this script
+# then exits non-zero having printed nothing. server.ts reads empty stdout as
+# a failed transcription, so on any machine whose venv predates the guarded
+# activate script EVERY voice note would silently degrade to an
+# untranscribed attachment - with the cause invisible, because the contract
+# above says stdout is the transcript and nothing else.
+set +u
 source "$VENV_ACTIVATE"
+set -u
 
 python3 -c '
 import sys

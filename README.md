@@ -35,7 +35,7 @@ A pairing code is printed on first launch. On your phone: WhatsApp → Settings 
 
 The server is a plain stdio MCP server, so any MCP client can run it. Two things are Claude Code specific and worth knowing before you start:
 
-- **Inbound messages are not pushed.** Waking a session on an incoming message uses `notifications/claude/channel`, a Claude Code extension. MCP has no standard equivalent that reaches the model, and other clients drop unknown notifications silently. Elsewhere the plugin is poll-based: call `wait_for_messages` (waits up to 40s for the next message) or `catch_up` / `unreplied`. Every tool result also carries a count of unreplied messages, so a client finds out there is traffic on its next call whatever that call was.
+- **Inbound messages are not pushed.** Waking a session on an incoming message uses `notifications/claude/channel`, a Claude Code extension. MCP has no standard equivalent that reaches the model, and other clients drop unknown notifications silently. Elsewhere the plugin is poll-based: call `wait_for_messages` (parks up to 40s; the first call on a connection returns whatever is already unreplied, later calls only what arrived since) or `catch_up` / `unreplied`. Most tool results also carry a count of unreplied messages, so a client finds out there is traffic on its next call. Three do not: `unreplied` and `wait_for_messages`, which just returned those very messages, and `catch_up` with no arguments, which is that count already.
 - **Setup is done from a terminal, not a slash command.** `/whatsapp-channel:access` and friends are Claude Code skills. Use `bun scripts/access.ts` instead (see [Access control from a terminal](#access-control-from-a-terminal)).
 
 Register the server with an absolute path — `${CLAUDE_PLUGIN_ROOT}` is substituted by Claude Code only:
@@ -106,7 +106,7 @@ Approving always needs the specific code, even when only one pairing is waiting:
 - **Per-group personalities.** Each group gets its own `config.md` with a custom personality and conversation memory.
 - **Permission relay.** Approve or deny Claude's tool requests from WhatsApp with an emoji reaction (👍 / 👎).
 - **Cron tasks.** A `## Cron Jobs` section in a group's `config.md` schedules recurring server-side tasks.
-- **Context recovery.** After a restart, the `catch_up` tool replays recent two-way conversation per chat, unreplied counts, and open tasks from `tasks.md`, so a fresh session resumes mid-flight work.
+- **Context recovery.** After a restart, `catch_up` with no arguments says how many messages are waiting per chat - counts only, no message text - plus open tasks from `tasks.md`. Name a chat and it replays that room's recent two-way conversation, so a fresh session resumes mid-flight work without reading every chat it has.
 - **Dual accounts.** Run personal and business numbers side by side with separate state and behaviors.
 - **Self-diagnosis.** `/whatsapp-channel:doctor` checks the server process, device link, singleton lock, and config, then walks you through the fixes — no more guessing why replies stopped.
 

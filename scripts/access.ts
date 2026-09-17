@@ -268,10 +268,23 @@ function status(): void {
   // chat that receives command previews and can approve them, and a wrong one
   // is otherwise invisible - the agent just waits on approvals nobody sees.
   const owner = typeof a.owner === "string" ? a.owner : "";
+  // The same test the server applies on every read: a stored owner that has
+  // since left the allowlist is NOT where requests go any more (they go to
+  // the linked account), and printing it bare had the user waiting on the
+  // wrong chat.
+  const lidMap = loadLidMap();
+  const ownerKey = contactKeyFor(lidMap, owner);
+  const ownerAllowed =
+    !!owner && a.allowFrom.some((j) => contactKeyFor(lidMap, j) === ownerKey);
+  const ownerNote = !owner
+    ? "  (unstamped — falling back to allowFrom[0])"
+    : ownerAllowed
+      ? ""
+      : "  (NO LONGER ALLOWLISTED — requests go to your own chat until you set a new one)";
   const lines = [
     `state dir:  ${STATE_DIR}`,
     `dmPolicy:   ${a.dmPolicy}`,
-    `owner:      ${owner || a.allowFrom[0] || "(none)"}${owner ? "" : "  (unstamped — falling back to allowFrom[0])"}`,
+    `owner:      ${owner || a.allowFrom[0] || "(none)"}${ownerNote}`,
     `            permission requests go here; change with "set owner <jid>"`,
     `allowFrom:  ${a.allowFrom.length} contact(s)`,
     ...a.allowFrom.map((jid) => `  - ${jid}`),
@@ -483,10 +496,18 @@ const NO_GROUPS_NOTE =
 const NO_SAVED_NAMES_NOTE =
   "No saved contact names have arrived from WhatsApp yet either - the server asks for your address book once on connect, so they fill in by themselves.";
 
+// PRINTS THE COMMAND, rather than telling the reader to go and run "it".
+// This is the message a Remote Control, headless or piped session gets, and
+// there the reader has no window to have opened this from and no path to
+// guess - naming the route without naming the command left them stuck, which
+// is the hang this replaces with an exact instruction. The BARE command, no
+// `!` prefix: the in-session `!` form is Claude-Code-only, and per-client
+// affordances are a separate piece of work.
 const NEEDS_TERMINAL =
   "The access screen needs a real terminal - stdin here is not one.\n" +
-  "Run it directly in your own terminal window (not through a pipe, a script or an AI session), " +
-  'or change one entry at a time with "allow", "remove", "group add" or "group rm".';
+  "Run this in your own terminal window (not through a pipe, a script or an AI session):\n" +
+  `  ${WIZARD_CMD}\n` +
+  'Or change one entry at a time here with "allow", "remove", "group add" or "group rm".';
 
 // One screen: a search line, a `Picked:` chip line, then CONTACTS left and
 // GROUPS right, everything Claude can already reach pre-ticked. Untick to
@@ -1060,13 +1081,30 @@ function set(key: string, rawValue: string): void {
     die("replyToMode must be off, first or all.");
   } else if (key === "chunkMode" && !["length", "newline"].includes(rawValue)) {
     die("chunkMode must be length or newline.");
-  } else if (key === "owner" && !rawValue.includes("@")) {
-    // A jid, not a bare number: this is the send target for every permission
-    // request, and a value WhatsApp cannot address silently sends approvals
-    // nowhere at all.
-    die(
-      "owner must be a JID, e.g. 886912345678@s.whatsapp.net.\nRun status to see the current one.",
-    );
+  } else if (key === "owner") {
+    // This is the chat that receives every permission request, up to 500 raw
+    // characters of the command being approved, so a mistyped digit - still a
+    // valid-looking jid - sent those previews to a stranger indefinitely.
+    // ALLOWLIST MEMBERSHIP, not jid shape, is the real rule: claimPermission
+    // binds the answer to this chat and gate() drops a reply from anyone not
+    // allowlisted, so an owner outside allowFrom could never approve anything
+    // in the first place.
+    const lidMap = loadLidMap();
+    const wanted = contactKeyFor(lidMap, rawValue);
+    const match = rawValue.includes("@")
+      ? a.allowFrom.find((j) => contactKeyFor(lidMap, j) === wanted)
+      : undefined;
+    if (!match) {
+      die(
+        "owner must be the JID of an allowlisted contact, e.g. 886912345678@s.whatsapp.net.\nRun status to see the current owner and the allowlist; allow them first if they are not on it.",
+      );
+    }
+    // STORE THE ALLOWLIST'S OWN SPELLING, not what was typed. The check above
+    // is normalised, so a `:device` or `@lid` form passes it - and stored raw,
+    // the server would address every permission request to that literal
+    // (a single stale device, or an alias the lid map may later forget), and
+    // `remove` would not find it by exact string.
+    value = match;
   }
   a[key] = value;
   save(a);

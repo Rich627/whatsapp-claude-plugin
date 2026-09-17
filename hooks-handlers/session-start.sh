@@ -46,7 +46,14 @@ if [ "$has_phone" = false ]; then
 elif [ "$has_auth" = false ]; then
 	msg="WhatsApp phone number is configured but device is not paired yet.\n\nThe user needs to:\n1. Exit and launch: claude --dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin\n2. The pairing code appears automatically in the session\n3. Enter it on phone: WhatsApp > Linked Devices > Link with phone number instead"
 elif [ "$has_contacts" = false ]; then
-	msg="WhatsApp is paired but no contacts are allowlisted yet. The owner JID is auto-added on connection.\n\nIf the user needs to add other contacts:\n1. Run: /whatsapp-channel:access policy pairing\n2. Have them DM the linked number\n3. Run: /whatsapp-channel:access pair <code>\n4. Policy auto-locks back to allowlist after pairing"
+	# The access screen is the normal route; pairing stays because it
+	# is the only route for someone who has never messaged this account.
+	# NO DOUBLE QUOTES IN THIS STRING. The three unconfigured branches are
+	# interpolated RAW into the heredoc's JSON below, so a quote here ends the
+	# JSON string. That is also why the absolute `bun "<path>" wizard` form
+	# lives in scripts/access.ts, where JSON.stringify escapes it, and this
+	# branch names the skill instead.
+	msg="WhatsApp is paired but no contacts are allowlisted yet. The owner JID is auto-added on connection.\n\nThe normal way to add the rest is the access screen - it opens in a new terminal window, lists the contacts and groups the user already talks to with anything already reachable pre-ticked, and applies the lot in one pass:\n\n1. Run: /whatsapp-channel:access review\n2. Tick contacts and groups there, then Apply. Only the +/- list comes back to this session.\n\nIf that window cannot be opened from here (a headless or remote session), the command prints itself - run it in a real terminal.\n\nFor someone who has never messaged this account, pairing is still the route:\n1. Run: /whatsapp-channel:access policy pairing\n2. Have them DM the linked number\n3. Run: /whatsapp-channel:access pair <code>\n4. Policy auto-locks back to allowlist after pairing"
 else
 	# Fully configured: check for a one-time "what's new" notice first. It
 	# prints its own complete, already-valid JSON (built with

@@ -1,10 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
   closeSync,
   mkdirSync,
   mkdtempSync,
   openSync,
+  rmSync,
   truncateSync,
   writeFileSync,
 } from "node:fs";
@@ -29,8 +30,28 @@ function runDoctor(stateDir: string): string {
   });
 }
 
+// Every fixture dir this file creates, removed at the end of the run. Without
+// this each run leaks ~28 directories into the system temp dir, and the
+// disk-usage boundary tests below allocate ~500 MB each - sparse, but real
+// once the filesystem materialises them. Left unswept it accumulated 35 GB
+// across 981 directories and eventually filled the volume, at which point the
+// two disk-usage tests fail with ENOSPC and look like a code regression.
+const fixtures: string[] = [];
+
+afterAll(() => {
+  for (const dir of fixtures) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // A fixture we cannot remove is litter, not a test failure.
+    }
+  }
+});
+
 function freshStateDir(): string {
-  return mkdtempSync(join(tmpdir(), "doctor-fixture-"));
+  const dir = mkdtempSync(join(tmpdir(), "doctor-fixture-"));
+  fixtures.push(dir);
+  return dir;
 }
 
 // lstart of a live pid, exactly as doctor computes it
@@ -181,6 +202,25 @@ describe("activity", () => {
     const out = runDoctor(dir);
     expect(out).toContain("[PASS] activity: no stale unreplied messages");
   });
+  test("an unreplied message older than a day no longer cries wolf", () => {
+    // The 24h inbound expiry used to retire these lines; one 7-day horizon
+    // (0.25.0) does not. Without a ceiling on the window, a single message
+    // nobody ever answered would report a possibly-stuck agent session on
+    // every doctor run for a week.
+    const dir = freshStateDir();
+    const twoDaysAgo = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    writeFileSync(
+      join(dir, "messages.jsonl"),
+      JSON.stringify({ ts: twoDaysAgo, chat_id: "c", replied: false }) + "\n",
+    );
+    const out = runDoctor(dir);
+    expect(out).toContain("[PASS] activity: no stale unreplied messages");
+    expect(out).not.toMatch(/\[WARN\] activity: \d+ inbound message/);
+    // But it must NOT vanish: dropping it from the report entirely would give
+    // a session dead for two days a clean bill of health, which is the exact
+    // case someone runs doctor to diagnose.
+    expect(out).toMatch(/\[INFO\] activity: 1 inbound message\(s\) unreplied/);
+  });
 });
 
 describe("group-configs", () => {
@@ -206,15 +246,42 @@ describe("group-configs", () => {
     expect(out).toContain("[WARN] group-configs: 123@g.us");
     expect(out).toContain('not exactly "## Cron Jobs"');
   });
-  test("exact heading → INFO with entry count", () => {
+  test("exact heading → INFO with the job count", () => {
     const out = runDoctor(
       withGroup(
         "# P\n\n## Cron Jobs\n\n- daily 9am standup\n- every 30 min check\n",
       ),
     );
     expect(out).toContain(
-      "[INFO] group-configs: 123@g.us: ## Cron Jobs section with 2 entries",
+      "[INFO] group-configs: 123@g.us: ## Cron Jobs section with 2 jobs",
     );
+  });
+
+  // The regression this whole change exists for: doctor kept its own copy of
+  // the section regex, lib/cron.ts gained \r?\n for CRLF files, and the copy
+  // did not. A Windows-saved config.md then scheduled fine while doctor told
+  // the user to rename a heading that was already correct.
+  test("a CRLF config.md is recognised, not WARNed about", () => {
+    const out = runDoctor(
+      withGroup(
+        "# P\r\n\r\n## Cron Jobs\r\n\r\n- daily 9am standup\r\n- every 30 min check\r\n",
+      ),
+    );
+    expect(out).toContain("## Cron Jobs section with 2 jobs");
+    expect(out).not.toContain('not exactly "## Cron Jobs"');
+  });
+
+  // doctor now reports what the server's parser rejected, instead of counting
+  // bullets and assuming each one became a job.
+  test("a bullet that schedules nothing is reported, not counted", () => {
+    const out = runDoctor(
+      withGroup(
+        "# P\n\n## Cron Jobs\n\n- daily 9am standup\n- **Digest**: daily at 9am\n",
+      ),
+    );
+    expect(out).toContain("## Cron Jobs section with 1 job");
+    expect(out).toContain("[WARN] group-configs: 123@g.us");
+    expect(out).toContain("no schedule recognised");
   });
   test("config without cron → PASS", () => {
     const out = runDoctor(withGroup("# Personality\n\nBe helpful.\n"));
@@ -300,7 +367,7 @@ describe("disk-usage", () => {
     writeSized(join(dir, "inbox", "a.jpg"), 500_000_001);
     const out = runDoctor(dir);
     expect(out).toContain("[WARN] disk-usage: inbox/ holds 1 file(s)");
-    expect(out).toContain("never been automatically pruned");
+    expect(out).toContain("prunes it hourly");
   });
 
   test("diag.log just at the WARN threshold → PASS", () => {

@@ -215,17 +215,18 @@ Two different notices, from the same script (`scripts/update-notice.ts`):
 
 ## Skill reference
 
-| Command                                                       | Effect                                                                                                                                                        |
-| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/whatsapp-channel:access`                                    | Print current state: policy, allowlist, pending pairings, enabled groups.                                                                                     |
-| `/whatsapp-channel:access pair a4f91c`                        | Approve pairing code `a4f91c`. Adds the sender to `allowFrom` and sends a confirmation on WhatsApp.                                                           |
-| `/whatsapp-channel:access deny a4f91c`                        | Discard a pending code. The sender is not notified.                                                                                                           |
-| `/whatsapp-channel:access allow 886912345678@s.whatsapp.net`  | Add a JID directly.                                                                                                                                           |
-| `/whatsapp-channel:access remove 886912345678@s.whatsapp.net` | Remove from the allowlist.                                                                                                                                    |
-| `/whatsapp-channel:access policy allowlist`                   | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`.                                                                                                   |
-| `/whatsapp-channel:access group add 120363424405607157@g.us`  | Enable a group (merges into an existing entry). Flags: `--mention`/`--no-mention`, `--allow jid1,jid2`, `--roster`/`--no-roster`, `--context`/`--no-context`. |
-| `/whatsapp-channel:access group rm 120363424405607157@g.us`   | Disable a group.                                                                                                                                              |
-| `/whatsapp-channel:access set ackReaction 👀`                 | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`.                                                             |
+| Command                                                          | Effect                                                                                                                                                                                                                                                                                                                                             |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/whatsapp-channel:access`                                       | Print current state: policy, allowlist, pending pairings, enabled groups.                                                                                                                                                                                                                                                                          |
+| `/whatsapp-channel:access pair a4f91c`                           | Approve pairing code `a4f91c`. Adds the sender to `allowFrom` and sends a confirmation on WhatsApp.                                                                                                                                                                                                                                                |
+| `/whatsapp-channel:access deny a4f91c`                           | Discard a pending code. The sender is not notified.                                                                                                                                                                                                                                                                                                |
+| `/whatsapp-channel:access allow 886912345678@s.whatsapp.net`     | Add a JID directly.                                                                                                                                                                                                                                                                                                                                |
+| `/whatsapp-channel:access remove 886912345678@s.whatsapp.net`    | Remove from the allowlist.                                                                                                                                                                                                                                                                                                                         |
+| `/whatsapp-channel:access policy allowlist`                      | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`.                                                                                                                                                                                                                                                                                        |
+| `/whatsapp-channel:access group add 120363424405607157@g.us`     | Enable a group (merges into an existing entry). Flags: `--mention`/`--no-mention`, `--allow jid1,jid2`, `--roster`/`--no-roster`, `--context`/`--no-context`.                                                                                                                                                                                      |
+| `/whatsapp-channel:access group rm 120363424405607157@g.us`      | Disable a group.                                                                                                                                                                                                                                                                                                                                   |
+| `/whatsapp-channel:access set ackReaction 👀`                    | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`.                                                                                                                                                                                                                                                  |
+| `/whatsapp-channel:access set owner 886912345678@s.whatsapp.net` | The chat that receives permission requests and the only one that may approve them. Must already be on `allowFrom` (so it cannot be set before the first connect on a fresh install, when the linked account is added). Stamped once by the server if missing; removing that contact later sends requests to your own chat until you set a new one. |
 
 ## Config file
 
@@ -238,6 +239,10 @@ Two different notices, from the same script (`scripts/update-notice.ts`):
 
   // WhatsApp JIDs allowed to DM.
   "allowFrom": ["886912345678@s.whatsapp.net"],
+
+  // Where permission requests go and who may approve them. Must be in allowFrom.
+  // Stamped by the server when missing (the linked account on a fresh install).
+  "owner": "886912345678@s.whatsapp.net",
 
   // Groups the channel is active in. Empty object = DM-only.
   "groups": {

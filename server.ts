@@ -62,12 +62,28 @@ import { parseMaxStore } from "./lib/max-store";
 import { logContainsId } from "./lib/message-log-probe";
 import { ownerStamp, parsePermissionReply } from "./lib/owner";
 import {
+  type AgedOut,
+  agedOutKey,
+  agedOutLine,
+  ambiguousChatMessage,
   awaitingReply,
-  CONTEXT_TTL_MS,
+  byTs,
+  catchUpWindow,
+  type ChatCount,
+  chatDisplayName,
+  type ChatRef,
+  DAY_MS,
+  countAgedOut,
+  formatChatCounts,
+  resolveChat,
+  updateAgedOut,
+  isUsableLogEntry,
   keepLogLine,
+  oneLine,
   RECENT_LIMIT,
-  recentBothSides,
   renderLogEntry,
+  resolveTtlMs,
+  takeUnseen,
 } from "./lib/message-view";
 import {
   displaySenderName,
@@ -124,6 +140,10 @@ const SENT_LOG = join(STATE_DIR, "sent.jsonl");
 // would null the app-state version and demand a full snapshot forever.
 const ADDRESS_BOOK_SYNC_MARKER = join(STATE_DIR, ".addressbook-sync");
 const TASKS_FILE = join(STATE_DIR, "tasks.md");
+// HASHED chat_id -> when a waiting line of that chat was pruned. Hashed
+// because this record deliberately outlives the log lines it describes, and a
+// raw jid is a phone number (see agedOutKey). A timestamp and nothing else.
+const AGED_OUT_FILE = join(STATE_DIR, ".aged-out-chats.json");
 const LOCK_FILE = join(STATE_DIR, ".server.lock");
 const IPC_TOKEN_FILE = join(STATE_DIR, ".ipc-token");
 // Read by scripts/statusline-role.ts. PID-scoped so two terminals never
@@ -182,6 +202,14 @@ const ACCOUNT_NAME = process.env.WHATSAPP_ACCOUNT_NAME || "";
 // Opt out per-terminal with WHATSAPP_QUIET=1 - never a config file, so it
 // can't silently persist past the session that set it.
 const AUTO_NOTIFY = process.env.WHATSAPP_QUIET !== "1";
+// How long any stored log line lives (why one horizon, and why it is capped:
+// resolveTtlMs in lib/message-view.ts). Read here, not in the lib, so the lib
+// stays pure. TTL_NOTE is logged at startup rather than here - logDiag's own
+// dependencies are declared further down this file, so calling it from here
+// would hit their temporal dead zone.
+const { ms: LOG_TTL_MS, note: TTL_NOTE } = resolveTtlMs(
+  process.env.WHATSAPP_MESSAGE_TTL_DAYS,
+);
 // import.meta.dir is this file's own directory, not CWD, so it's correct
 // regardless of where the process was launched from.
 const WIZARD_CMD = wizardCmd(import.meta.dir);
@@ -566,6 +594,9 @@ function handleIpcConnection(socket: NetSocket, token: string): void {
   const buf = new LineBuffer();
   let authed = false;
   let preAuthBytes = 0;
+  // This connection's wait_for_messages "already handed" set. Dies with the
+  // closure, so a reconnecting secondary sees the backlog again by design.
+  const seen = new Set<string>();
   const drop = (why: string) => {
     logDiag(`${LOG_PREFIX}: ipc: dropped connection (${why})\n`);
     socket.destroy(); // destroy, not end: fail closed, no half-open socket
@@ -610,7 +641,7 @@ function handleIpcConnection(socket: NetSocket, token: string): void {
         // deliberately not the unreplied-suffix wrapper: the secondary adds
         // that itself from the shared message log, and doing it here too
         // would append it twice.
-        void handleToolCall({ params: { name, arguments: args } })
+        void handleToolCall({ params: { name, arguments: args } }, seen)
           .then((result) => {
             if (!socket.destroyed) {
               socket.write(encode({ type: "result", id, result }));
@@ -1037,6 +1068,12 @@ async function becomePrimary(): Promise<void> {
   // Primary-only background work, started once on becoming primary and never
   // stopped: there is no primary → secondary transition to stop them for.
   if (!STATIC) setInterval(checkApprovals, 5000).unref();
+  // Say so HERE, not at startup: pruning is what the horizon governs, and this
+  // is the only place it is registered. A process that booted as a secondary
+  // reaches this line through the lock-retry promotion, so announcing it at
+  // startup would leave a promoted secondary pruning on a horizon it never
+  // mentioned. Empty when the variable was unset or taken as given.
+  if (TTL_NOTE) logDiag(`${LOG_PREFIX}: ${TTL_NOTE}\n`);
   setInterval(pruneMessageLog, 60 * 60 * 1000).unref();
   // A promoted secondary loaded sent.jsonl at ITS boot; the primary it is
   // replacing kept appending since. Re-read (pruneMessageLog -> pruneSentLog)
@@ -1417,15 +1454,39 @@ async function ensureLidResolved(jid: string): Promise<void> {
 // that want "empty = anyone" (e.g. a group with no allowFrom restriction)
 // must guard the call themselves — see the `groups[jid].allowFrom` check
 // in gate(), which only calls this when the list is non-empty.
+/** ONE comparison, used by everything that asks "is this jid allowed".
+ *
+ *  It normalizes with Baileys' own jidNormalizedUser, which drops a `:device`
+ *  suffix and maps the legacy `@c.us` domain to `@s.whatsapp.net`.
+ *  scripts/ranking.ts's normalizeJid was written to mirror that function
+ *  exactly, and `access set owner` validates through it - so without the same
+ *  rule here the CLI ACCEPTED a value the server then rejected at runtime,
+ *  printed `owner = ...`, and the request quietly went somewhere else.
+ *
+ *  PRESERVED INVARIANT, because this is the access gate (AGENTS.md rule 2):
+ *  this does not widen WHO is allowed. Normalization only makes two spellings
+ *  of THE SAME ACCOUNT compare equal - the device suffix and the c.us domain
+ *  are notations for one user, which is precisely why Baileys ships the
+ *  function. No jid belonging to a different account can now match an entry
+ *  that it did not match before. The nine call sites - the DM gate, the group
+ *  gate, the permission binding, the reaction binding and the owner checks -
+ *  keep their existing semantics; they simply stop disagreeing with the CLI
+ *  about what the same person's jid looks like. */
 function isAllowedJid(jid: string, allowList: string[]): boolean {
   if (allowList.length === 0) return false;
-  const phone = resolveToPhone(jid);
-  if (allowList.includes(phone)) return true;
-  if (allowList.includes(jid)) return true;
-  for (const entry of allowList) {
-    if (resolveToPhone(entry) === phone) return true;
-  }
-  return false;
+  const phone = contactKey(jid);
+  // AN EMPTY CANONICAL FORM MATCHES NOTHING. Measured against the vendored
+  // rc.9: jidNormalizedUser returns "" for "", for undefined, AND for a bare
+  // number with no domain - which is exactly the format
+  // /whatsapp-channel:configure asks the user to type. So a hand-edited
+  // access.json holding "886912345678" would have produced an empty canonical
+  // on BOTH sides and matched, admitting anything else that also canonicalized
+  // to empty. The previous exact-string implementation could not do that;
+  // comparing canonical forms can, so the guard belongs with the change that
+  // introduced the possibility. Fails closed: an unparseable jid is not
+  // allowed, it is refused.
+  if (!phone) return false;
+  return allowList.some((entry) => contactKey(entry) === phone);
 }
 
 // ─── Group name cache ─────────────────────────────────────────────────
@@ -2089,20 +2150,21 @@ function markdownToWhatsApp(text: string): string {
     return `\x00IC${inlineCode.length - 1}\x00`;
   });
 
-  // Headers → bold
-  result = result.replace(/^#{1,6}\s+(.+)$/gm, "*$1*");
-
   // Italic: *text* (single) or _text_ → _text_
   // Only match single * not preceded/followed by * (to avoid conflicts with bold)
   //
-  // Runs BEFORE the bold rules on purpose. Bold rewrites **text** into
+  // Runs BEFORE the bold and header rules on purpose. Both of those emit
   // WhatsApp's *text*, and this pattern matches that output just as readily
   // as a genuine italic span — so with bold first, every **bold** came out
-  // as _italic_ and no input could produce bold at all. A **bold** span
+  // as _italic_, and with headers first every heading did. A **bold** span
   // cannot match this rule (its asterisks are adjacent, failing both
   // lookarounds), so italic-first leaves bold input untouched and converts
-  // only real italics.
-  result = result.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, "_$1_");
+  // only real italics. The inner lookarounds also refuse a space next to
+  // either asterisk, so `a * b * c` stays plain text.
+  result = result.replace(/(?<!\*)\*(?![\s*])(.+?)(?<![\s*])\*(?!\*)/g, "_$1_");
+
+  // Headers → bold
+  result = result.replace(/^#{1,6}\s+(.+)$/gm, "*$1*");
 
   // Bold: **text** or __text__ → *text*
   result = result.replace(/\*\*(.+?)\*\*/g, "*$1*");
@@ -2345,10 +2407,20 @@ function markReplied(chat_id: string, onlyIds?: ReadonlySet<string>): void {
 // Re-reads the log every 2s while waiting, rather than being woken
 // in-process. Simpler, works whoever wrote the line, and costs at most 2s of
 // latency in a chat bridge. Wake on write if that ever matters.
-async function waitForUnreplied(maxMs: number): Promise<MessageLogEntry[]> {
+//
+// Returns what THIS CALLER has not been handed yet: the first call on a
+// connection returns whatever is unreplied, later calls only what arrived
+// since. Without that, the 7-day horizon made this return instantly, forever, on any message
+// nobody answered. `seen` is one set per connection - see handleToolCall.
+async function waitForUnreplied(
+  maxMs: number,
+  seen: Set<string>,
+): Promise<MessageLogEntry[]> {
   const deadline = Date.now() + maxMs;
   for (;;) {
-    const pending = getUnreplied();
+    // Capped HERE, not only in formatMessages: what is marked seen must be
+    // what is rendered, or a backlog past the cap is consumed unseen.
+    const pending = takeUnseen(seen, getUnreplied(), MAX_CATCH_UP_LIMIT);
     if (pending.length > 0) return pending;
     const remaining = deadline - Date.now();
     if (remaining <= 0) return [];
@@ -2356,12 +2428,41 @@ async function waitForUnreplied(maxMs: number): Promise<MessageLogEntry[]> {
   }
 }
 
+/** CAPPED, for the same reason catch_up is. Until this branch an unanswered
+ *  line aged out after 24h, so `unreplied` was self-limiting; the horizon is
+ *  now 7 days, or up to 30 via WHATSAPP_MESSAGE_TTL_DAYS. An owner away a
+ *  fortnight with a busy ungated group therefore had every waiting line
+ *  rendered into a single tool result. Both readers route through here:
+ *  `unreplied` relies on this cap, and wait_for_messages applies the same
+ *  number in takeUnseen so that what it marks handed is what is rendered.
+ *  NEWEST kept, oldest dropped, the
+ *  way catch_up's window does it; the callers' "N unreplied message(s)" count
+ *  is the true total either way.
+ *
+ *  SORTED BEFORE SLICING, for the reason catchUpWindow gives: getUnreplied
+ *  hands back messages.jsonl's APPEND order, which is usually chronological
+ *  and is not guaranteed to be - handleMessage awaits a media download and a
+ *  group-name lookup before it persists, so a text that arrived second can
+ *  land first, and a reconnect backlog is appended at the tail. Slicing raw
+ *  file order would drop a genuinely newer message while the header claimed
+ *  the newest were kept. */
 function formatMessages(entries: MessageLogEntry[]): string {
   const owner = ownerDisplayName();
-  return entries
+  const hidden = Math.max(0, entries.length - MAX_CATCH_UP_LIMIT);
+  // SORTED UNCONDITIONALLY. The first version sorted only on the truncating
+  // branch, which made the ORDER depend on the VOLUME: five waiting messages
+  // rendered in append order (a photo whose download delayed its persist
+  // appearing after a text that arrived later), and a hundred and one
+  // rendered in timestamp order. Same tool, same day, two different answers.
+  // The slice is what the cap needs; the sort is what the reader needs.
+  const ordered = [...entries].sort(byTs);
+  const body = (hidden ? ordered.slice(-MAX_CATCH_UP_LIMIT) : ordered)
     .map((m) => {
       const view = renderLogEntry(m, owner);
-      const parts = [`[${m.ts}] ${view.who} in ${m.group_name ?? m.chat_id}:`];
+      // oneLine for the same reason chatDisplayName uses it: a peer-set
+      // subject with a newline forges a whole fake entry in this view.
+      const where = (m.group_name && oneLine(m.group_name)) || m.chat_id;
+      const parts = [`[${m.ts}] ${view.who} in ${where}:`];
       if (view.text) parts.push(view.text);
       if (m.image_path) parts.push(`(image: ${m.image_path})`);
       if (m.attachment_kind) parts.push(`(${m.attachment_kind} attachment)`);
@@ -2369,6 +2470,13 @@ function formatMessages(entries: MessageLogEntry[]): string {
       return parts.join("\n");
     })
     .join("\n\n");
+  if (!hidden) return body;
+  // The route named here has to actually work. `unreplied` applies its
+  // chat_id filter BEFORE calling this, so the ceiling applies per call to the
+  // FILTERED list: 300 waiting across five chats of 60 returns all 60 for any
+  // one chat. Only a single chat holding more than the ceiling is a dead end
+  // here, and catch_up with an explicit limit is what that case is for.
+  return `(showing the newest ${MAX_CATCH_UP_LIMIT}; ${hidden} older waiting message(s) not shown. This ceiling applies per call, after any chat_id filter - so unreplied chat_id="<jid>" shows one chat in full unless that chat alone holds more than ${MAX_CATCH_UP_LIMIT}; for that, use catch_up chat="<the chat>" limit=${MAX_CATCH_UP_LIMIT})\n\n${body}`;
 }
 
 function getUnreplied(): MessageLogEntry[] {
@@ -2379,6 +2487,14 @@ function getUnreplied(): MessageLogEntry[] {
     for (const line of lines) {
       try {
         const entry = JSON.parse(line) as MessageLogEntry;
+        // THE SAME GUARD getRecentByChat and pruneMessageLog have. It was
+        // applied to two of the three parse boundaries and missed here, so a
+        // line with a missing or non-string ts/chat_id was skipped by both of
+        // those and still COUNTED by this one - meaning the "[N unreplied]"
+        // suffix and wait_for_messages reported a message that the counts list
+        // and every catch_up view denied existed, until the next hourly prune
+        // deleted it. Three boundaries, one rule.
+        if (!isUsableLogEntry(entry)) continue;
         if (awaitingReply(entry)) unreplied.push(entry);
       } catch {}
     }
@@ -2388,10 +2504,21 @@ function getUnreplied(): MessageLogEntry[] {
   }
 }
 
-/** Last ~5 messages from each side per chat, chronological — for catch_up.
- *  The 5-line cap on the owner's own hand-typed replies is their privacy
- *  limit (see lib/message-view.ts); how long a line lives at all is
- *  keepLogLine's decision, enforced by pruneMessageLog, not here. */
+/** Ceiling on catch_up's `limit`. The floor on usefulness is RECENT_LIMIT; this
+ *  is the other end, so a caller cannot ask one tool result to carry an entire
+ *  30-day log. Waiting lines are NOT exempt from it: they take the inbound
+ *  slots first, but the window is still `limit` per side. The header reports
+ *  any that did not fit. formatMessages bounds `unreplied` and
+ *  `wait_for_messages` by the same number for the same reason - one ceiling,
+ *  not one per reader. */
+const MAX_CATCH_UP_LIMIT = 100;
+
+/** Per chat: every line still awaiting a reply, plus ~`limit` of recent
+ *  context from each side, chronological — for catch_up. The `limit` cap on
+ *  the owner's own hand-typed replies is their privacy limit (see
+ *  lib/message-view.ts); how long a line lives at all is keepLogLine's
+ *  decision, enforced by pruneMessageLog, not here. Waiting lines are capped by
+ *  `limit` like everything else — they simply get the slots first. */
 function getRecentByChat(
   limit = RECENT_LIMIT,
 ): Map<string, { entries: MessageLogEntry[]; unreplied: number }> {
@@ -2405,6 +2532,20 @@ function getRecentByChat(
     for (const line of lines) {
       try {
         const entry = JSON.parse(line) as MessageLogEntry;
+        // Same requirement as the prune: without a string chat_id this
+        // becomes a Map key of `undefined`, and agedOutKey(undefined) throws
+        // out of the whole tool call.
+        //
+        // `ts` IS CHECKED HERE TOO, and its absence was a real hole. byTs does
+        // `a.ts.localeCompare(b.ts)`, so one line with a numeric or missing ts
+        // - a hand edit, or a truncated write - threw a TypeError out of the
+        // windowing loop below. That loop sits inside this function's outer
+        // catch and `byChat` is returned anyway, so every chat AFTER the bad
+        // one kept its FULL unwindowed entry list: catch_up then dumped the
+        // entire retained log for those chats, with no limit applied and no
+        // error surfaced. Guarding the field once, where every caller routes
+        // through, is the fix - not defensive code at each `.ts` use.
+        if (!isUsableLogEntry(entry)) continue;
         let bucket = byChat.get(entry.chat_id);
         if (!bucket) {
           bucket = { entries: [], unreplied: 0 };
@@ -2415,7 +2556,10 @@ function getRecentByChat(
       } catch {}
     }
     for (const bucket of byChat.values()) {
-      bucket.entries = recentBothSides(bucket.entries, limit);
+      // catchUpWindow, NOT recentBothSides: the window must hold every line
+      // `unreplied` counted, or a counted mention is invisible in the only
+      // view that shows text. See lib/message-view.ts for the invariant.
+      bucket.entries = catchUpWindow(bucket.entries, limit);
     }
   } catch {}
   return byChat;
@@ -2525,9 +2669,9 @@ function pruneLidMap(
 
 /** Every eagerly-downloaded image and voice note from every allowed chat lands
  *  in inbox/ and nothing ever removed it, so any group member could fill the
- *  disk one photo at a time. Same window as a context log line
- *  (CONTEXT_TTL_MS): once the line that references the file is gone, the file
- *  is unreachable anyway. Rides the same hourly tick as pruneMessageLog.
+ *  disk one photo at a time. Same window as the log line that points at it
+ *  (LOG_TTL_MS): once that line is gone, the file is unreachable anyway.
+ *  Rides the same hourly tick as pruneMessageLog.
  *
  *  Deliberately narrow: only regular files, only direct children of INBOX_DIR
  *  (no recursion, so a directory someone drops in there is left alone rather
@@ -2535,7 +2679,7 @@ function pruneLidMap(
  *  readdir entry, so nothing outside INBOX_DIR is reachable from here. */
 function pruneInbox(): void {
   try {
-    const cutoff = Date.now() - CONTEXT_TTL_MS;
+    const cutoff = Date.now() - LOG_TTL_MS;
     let removed = 0;
     for (const name of readdirSync(INBOX_DIR)) {
       const path = join(INBOX_DIR, name);
@@ -2555,7 +2699,38 @@ function pruneInbox(): void {
   }
 }
 
-/** Prune the log: open inbounds after 24h, context lines after 7 days (keepLogLine) */
+function loadAgedOut(): AgedOut {
+  try {
+    const raw = JSON.parse(readFileSync(AGED_OUT_FILE, "utf8")) as unknown;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const out: AgedOut = {};
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
+    }
+    return out;
+  } catch {
+    // Missing, unreadable or corrupt: treat as empty and say nothing, rather
+    // than failing the prune or the tool call that reads it.
+    return {};
+  }
+}
+
+function saveAgedOut(record: AgedOut): void {
+  // The same guard saveAccess has, and for the reason ACCESS.md states: a
+  // static deployment writes no local state and cannot be made to by an env
+  // var. This file is exactly the residue it opted out of - the ids are
+  // hashed, but by design the record OUTLIVES the messages it describes, by
+  // up to 30 days. becomePrimary registers pruneMessageLog's hourly tick in
+  // static mode too, so without this the file would appear there as well.
+  if (STATIC) return;
+  try {
+    const tmp = AGED_OUT_FILE + ".tmp";
+    writeFileSync(tmp, JSON.stringify(record, null, 2) + "\n", { mode: 0o600 });
+    renameSync(tmp, AGED_OUT_FILE);
+  } catch {}
+}
+
+/** Prune the log: every line older than LOG_TTL_MS goes (keepLogLine) */
 function pruneMessageLog(): void {
   // First: pruneMessageLog returns early when messages.jsonl does not exist
   // yet, and sent.jsonl can exist without it (pairing notices go to chats
@@ -2563,22 +2738,141 @@ function pruneMessageLog(): void {
   pruneSentLog();
   pruneStrangerCaches();
   pruneInbox();
+  // Age the aged-out record BEFORE the early return below. Its 30-day expiry
+  // used to live past that return, so a user who cleared history by deleting
+  // messages.jsonl - a plausible privacy action on a documented file - would
+  // have been told "N chats had activity older than 7 days" forever, with
+  // nothing left that could ever age it out.
+  //
+  // Loaded ONCE, and both saves below use the same staleness test. There used
+  // to be a second loadAgedOut() after the prune, compared with a DIFFERENT
+  // test (key count here, JSON.stringify there) - so a record whose keys were
+  // unchanged but whose contents were not looked stale to one and fresh to the
+  // other, depending which ran.
+  //
+  // ONE load and ONE write per tick. The expiry pass and the misses pass used
+  // to save separately, so a tick that both expired an old key and recorded a
+  // new miss wrote the file twice. `flushAged` always compares against the
+  // record as it was READ, so whichever path reaches it writes at most once.
+  const now = Date.now();
+  const existingAged = loadAgedOut();
+  const agedOnly = updateAgedOut(existingAged, [], now);
+  const flushAged = (next: AgedOut): void => {
+    if (JSON.stringify(next) !== JSON.stringify(existingAged))
+      saveAgedOut(next);
+  };
   try {
-    if (!existsSync(MESSAGE_LOG)) return;
-    // Two lifetimes, decided in lib/message-view.ts: a routed inbound is a
-    // to-do and lives a day; context lines live a week.
-    const now = Date.now();
+    // The expiry still has to land even when there is no log to prune - a user
+    // who deleted messages.jsonl would otherwise be told "N chats had activity
+    // older than 7 days" forever, with nothing left that could ever age out.
+    if (!existsSync(MESSAGE_LOG)) return flushAged(agedOnly);
+    // One lifetime for every line, decided in lib/message-view.ts and
+    // overridable with WHATSAPP_MESSAGE_TTL_DAYS.
     const lines = readFileSync(MESSAGE_LOG, "utf8").split("\n").filter(Boolean);
+    // Chats that lost something still WAITING **that actually addressed the
+    // owner**. Nothing clears a key early - see updateAgedOut for why every
+    // attempt at that lost a real miss.
+    //
+    // ADDRESSED, not merely unanswered (owner, 2026-09-08). Recording every
+    // expired unreplied line made the notice fire on an unanswered "thanks",
+    // so with a handful of active chats the count was almost always non-zero
+    // and "N chats had activity older than 7 days" stopped distinguishing "you
+    // were away and missed something" from ordinary traffic. A DM is always
+    // addressed to the owner; in a group only a mention-gated one can say so,
+    // which is the same selectivity the `@` marker in the counts list already
+    // draws. ACCEPTED CONSEQUENCE: an unanswered line in a NON-gated group no
+    // longer contributes - deliberate, because there every line routes, so
+    // counting them all is exactly what made the number meaningless.
+    // Per chat, while filtering: the newest surviving line, and whether
+    // anything is still waiting. A chat with nothing waiting and activity
+    // NEWER than a recorded miss has been dealt with, so updateAgedOut can
+    // forget it instead of announcing it for thirty days.
+    const newestKept = new Map<string, number>();
+    const stillWaiting = new Set<string>();
+    const accessForAging = loadAccess();
+    const addressedOwner = (chatId: string): boolean =>
+      !chatId.endsWith("@g.us") ||
+      accessForAging.groups[chatId]?.requireMention === true;
+    const missed = new Set<string>();
     const kept = lines.filter((line) => {
+      let entry: MessageLogEntry;
       try {
-        const entry = JSON.parse(line) as MessageLogEntry;
-        return keepLogLine(entry, now);
+        entry = JSON.parse(line) as MessageLogEntry;
       } catch {
         return false;
       }
+      // A line must be an object WITH A STRING chat_id before anything reads
+      // it. null, an array, or an object missing chat_id all get this far
+      // otherwise: keepLogLine drops them, awaitingReply says true (direction
+      // defaults to "in"), and agedOutKey(undefined) throws out of this
+      // callback into the function-level catch. That abandons the whole prune
+      // - log, inbox and aged-out record - and because the offending line is
+      // never removed it repeats on every tick for the life of the process,
+      // so messages.jsonl grows without bound and unreplied never clears.
+      // `ts` guarded alongside chat_id for the same reason it is guarded in
+      // getRecentByChat: it feeds string methods downstream, and one bad line
+      // must not be able to abandon a whole prune.
+      if (!isUsableLogEntry(entry)) return false;
+      const keep = keepLogLine(entry, now, LOG_TTL_MS);
+      // keepLogLine drops an UNPARSEABLE ts as well as an expired one, and
+      // only the second means "this aged out". Recording the first would tell
+      // every session for thirty days that a chat had older activity, on the
+      // strength of one corrupt line that never aged out at all.
+      // NAMED FOR WHAT IT HOLDS. This is "the ts parsed", NOT "the line
+      // expired" - it is true for a perfectly fresh line. It was called
+      // `expired`, and it sits on the path deciding whether a chat is
+      // remembered as missed for 30 days, so an edit that read the old name at
+      // face value (`if (expired) ...`) would have inverted the aged-out record.
+      const hasValidTs = Number.isFinite(Date.parse(entry.ts));
+      if (
+        !keep &&
+        hasValidTs &&
+        awaitingReply(entry) &&
+        addressedOwner(entry.chat_id)
+      )
+        missed.add(agedOutKey(entry.chat_id));
+      if (keep) {
+        const k = agedOutKey(entry.chat_id);
+        // ONLY AN OUTBOUND LINE COUNTS AS "the owner dealt with it". Tracking
+        // the newest surviving line of ANY kind made this feature dead in
+        // exactly the case it exists for: in a mention-gated group, unaddressed
+        // chatter is stored `routed:false, replied:true`, so it is never
+        // awaitingReply and never lands in stillWaiting - but it DID advance
+        // this timestamp. One ordinary message in the room after a missed
+        // @-mention therefore cleared the record on the next tick. Since
+        // addressedOwner only ever RECORDS misses for DMs and mention-gated
+        // groups, that erased half the feature's whole domain.
+        //
+        // An outbound line - a reply the agent sent, or one the owner typed on
+        // his phone - is positive evidence somebody answered. Their mere
+        // presence in the room is not.
+        if ((entry.direction ?? "in") === "out") {
+          const t = Date.parse(entry.ts);
+          if (Number.isFinite(t))
+            newestKept.set(k, Math.max(newestKept.get(k) ?? 0, t));
+        }
+        if (awaitingReply(entry)) stillWaiting.add(k);
+      }
+      return keep;
     });
     writeFileSync(MESSAGE_LOG, kept.length ? kept.join("\n") + "\n" : "");
-  } catch {}
+    // Builds on agedOnly (already aged, above), not a second read of the file.
+    // Compare against what the update would actually produce. Testing
+    // "is the record non-empty" instead rewrote the file on every hourly
+    // tick forever once anything had ever been recorded, which is the
+    // opposite of what this guard is for.
+    // A miss clears only where BOTH hold: somebody replied after it
+    // (newestKept, outbound only) and nothing is outstanding now.
+    const handled = new Map(
+      [...newestKept].filter(([k]) => !stillWaiting.has(k)),
+    );
+    flushAged(updateAgedOut(agedOnly, missed, now, handled));
+  } catch {
+    // A prune that threw part-way still owes the expiry pass: it was computed
+    // before any of the work that can throw, and dropping it silently is how
+    // the never-ages-out bug came back the first time.
+    flushAged(agedOnly);
+  }
 }
 
 // ─── Photo extensions ──────────────────────────────────────────────────
@@ -2669,7 +2963,7 @@ const mcp = new Server(
       "",
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions. WhatsApp supports any emoji for reactions (no whitelist restriction).',
       "",
-      "On session start, call the status tool immediately to check connection state and show the pairing code if the device is not yet paired. Then call the catch_up tool: it returns the recent two-way conversation for every active chat, unreplied counts, and open tasks from tasks.md. Resume any open tasks and reply to unreplied messages. (The unreplied tool still exists if you only want the plain unreplied list.)",
+      "On session start, call the status tool immediately to check connection state and show the pairing code if the device is not yet paired. Then call the catch_up tool with NO arguments: it returns how many messages are waiting per chat (with an @ where a mention-gated group addressed you) and the open tasks from tasks.md - counts only, no message text and no chat_id. To read or answer one of them, call catch_up again with `chat` set to that name; that view carries the chat_id, which is what reply needs. Do NOT call unreplied to open a session - it returns the full text of everything outstanding, which is what counts-only exists to avoid; it is there for when you actually want that dump. Resume any open tasks.",
       "",
       "WhatsApp exposes no history or search API — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       "",
@@ -2702,8 +2996,58 @@ const mcp = new Server(
  *  fallback covers only an access.json that has never been stamped, i.e.
  *  static mode or before the first connect; it keeps the old behaviour rather
  *  than failing closed and silently swallowing permission requests. */
+let warnedStaleOwner = "";
 function permissionTarget(access: Access): string | undefined {
-  return access.owner ?? access.allowFrom[0];
+  const stored = access.owner;
+  // REVALIDATED ON EVERY READ, not just when it is written. `set owner` now
+  // requires an allowlisted contact, but NOTHING kept that true afterwards:
+  // `access remove`, the wizard's revoke path and ownerStamp (which returns
+  // an existing value untouched) all leave a stale owner behind. That is not
+  // cosmetic. permissionTarget kept returning the revoked contact, and the
+  // send site does no allowlist check of its own, so every permission request
+  // - up to 500 raw characters of the command being approved - went on being
+  // DM'd to someone the user had just removed. And it DEADLOCKED at the same
+  // time: claimPermission binds the answer to that chat while gate() now
+  // drops their inbound messages, so nobody could ever approve and the tool
+  // call hung with no diagnostic.
+  //
+  // `stored &&` rather than `??`: an empty string is a hand-edit meaning
+  // "cleared", and `??` steps over only null/undefined - lib/owner.ts's
+  // comment claimed otherwise and was wrong, which would have swallowed every
+  // permission request silently.
+  if (stored && isAllowedJid(stored, access.allowFrom)) return stored;
+  if (stored) {
+    // FALLING BACK TO YOU, NOT TO WHOEVER IS FIRST IN THE LIST (owner,
+    // 2026-09-09). The first version of this fix sent the request to
+    // allowFrom[0] - which stopped the leak to the revoked contact and
+    // started a quieter one to a contact the user never designated as
+    // approver, who then received the full command text. The linked account
+    // is the one address that is always right here: it is the user
+    // themselves, it is auto-added to the allowlist on connect, and both
+    // approval routes already work from their own note-to-self.
+    //
+    // A REVOKED OWNER AND AN UNSTAMPED ONE ARE DIFFERENT THINGS, which is why
+    // only this branch redirects. An unstamped install never made a choice,
+    // and ownerStamp deliberately preserves allowFrom[0] there so the
+    // migration changes nobody's delivery chat. A revoked owner IS a choice,
+    // reversed - and treating a reversal as licence to pick someone else is
+    // what made the original leak.
+    if (stored !== warnedStaleOwner) {
+      // Keyed on the VALUE, not a once-per-process latch: a second, different
+      // stale owner is a second thing worth saying, and the latch would have
+      // silently swallowed it.
+      warnedStaleOwner = stored;
+      logDiag(
+        `${LOG_PREFIX}: access.owner ${maskJid(stored)} is no longer allowlisted; permission requests go to your own chat until you set a new one with "access set owner <jid>".\n`,
+      );
+    }
+    // FAIL CLOSED before the first `open`: ownJid is only known once the
+    // connection opens, and until then the only other candidate is
+    // allowFrom[0] - the leak this branch exists to stop. Not sending is the
+    // right answer for that window; the send site already tolerates undefined.
+    return ownJid || undefined;
+  }
+  return access.allowFrom[0];
 }
 
 // Permission relay — forward to the owner's DM only.
@@ -2851,6 +3195,14 @@ mcp.setNotificationHandler(
         });
         trackSent(sent.key);
       }
+    } else if (!owner) {
+      // Fail closed, but SAY SO: permissionTarget returns nothing when the
+      // stored owner was revoked and the linked account is not yet known
+      // (before the first `open`), or when the allowlist is empty. Silently
+      // dropping it leaves Claude Code waiting on an approval nobody was sent.
+      logDiag(
+        `permission_request ${request_id} not sent: no recipient (owner revoked and not connected yet, or empty allowlist)\n`,
+      );
     }
   },
 );
@@ -2962,13 +3314,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           {
             name: "wait_for_messages",
             description:
-              "Wait for the next inbound WhatsApp message, up to 40 seconds. Returns immediately if messages are already unreplied. Use this when you want to stay responsive without polling: call it, handle whatever it returns, call it again. It returns an empty result if nothing arrives in time, which is normal, not an error. (In Claude Code messages are also pushed into the session automatically, so this is mainly for other MCP clients.)",
+              "Wait up to 40 seconds for inbound WhatsApp messages this connection has not been handed yet. The first call returns whatever is already unreplied (newest 100); later calls return only what arrived since. Use this when you want to stay responsive without polling: call it, handle whatever it returns, call it again. It returns an empty result if nothing arrives in time, which is normal, not an error; a message is handed to a connection once, so if a result was lost, `unreplied` still lists everything outstanding. (In Claude Code messages are also pushed into the session automatically, so this is mainly for other MCP clients.)",
             inputSchema: { type: "object", properties: {} },
           },
           {
             name: "unreplied",
             description:
-              "Get messages received but not yet replied to. Call this on session start (after status) to catch up on messages that arrived before this session or were missed due to a restart. Each entry includes chat_id, message_id, user, text, and timestamp.",
+              "Get the FULL TEXT of every message received and not yet replied to, across all chats. Each entry includes chat_id, message_id, user, text, and timestamp. This is NOT the session-start tool - catch_up with no arguments is, and it deliberately shows counts only. Use this when you have been asked for the actual contents of everything outstanding, not to open a session.",
             inputSchema: {
               type: "object",
               properties: {
@@ -2983,14 +3335,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           {
             name: "catch_up",
             description:
-              'Recover conversation context. Pass `chat` (a chat_id, or part of a group or contact name, case-insensitive) to get ONE chat - do this before drafting a message to someone, so the room is in view without dumping every chat. Without `chat`: every chat. For every chat with a line still in the log (up to 7 days of context; an unanswered message addressed to you lives 24h), returns the recent messages in BOTH directions (sender name for incoming, "You" for a reply this agent sent, and the owner\'s own name for a message they typed on their phone — those show only their most recent hour, older ones read "replied (text expired)"), each chat\'s unreplied count, and the open (unchecked) items from ~/.whatsapp-channel/tasks.md. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
+              'Recover conversation context. Pass `chat` (a chat_id, or part of a group or contact name, case-insensitive) to get ONE chat - do this before drafting a message to someone, so the room is in view without dumping every chat. Without `chat`: COUNTS ONLY - one line per chat that has something waiting, showing the chat name, a WhatsApp-style `@` when it is a mention-gated group (so a waiting message there is one that actually addressed you), and how many are unreplied. NO MESSAGE TEXT at all, and a chat with recent traffic but nothing unreplied is left out rather than listed as 0. Sorted most-unreplied first. Name a chat to read anything. Either way you also get the open (unchecked) items from ~/.whatsapp-channel/tasks.md. With `chat`: EVERY message still awaiting a reply in that chat, plus recent context in BOTH directions (sender name for incoming, the label You for a reply this agent sent, and the real name of the owner for a message they typed on their phone), for lines still in the log (7 days by default, every line alike - WHATSAPP_MESSAGE_TTL_DAYS changes it). Whatever the count said is waiting, this shows, up to the window size - and if more are waiting than fit, the header says exactly how many. Read that number before you answer: replying marks every unreplied message in that chat answered, including any this view did not render. If `chat` matches more than one chat you get the matches instead - each with a group/DM marker and a handle (a group id, or a masked number like 5 dots then the last 4 digits). Ask the user which one they mean, then pass that handle back as `chat`; it is accepted verbatim. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
             inputSchema: {
               type: "object",
               properties: {
                 chat: {
                   type: "string",
                   description:
-                    "Optional: a chat_id, or part of a group/contact name (case-insensitive). Only that chat is returned.",
+                    "Optional: a chat_id, or part of a group/contact name (case-insensitive). Only that chat is returned. If it matches more than one chat you get the list of matches instead of any message text - ask which was meant, then pass the handle shown for it straight back as `chat`. Never guessed for you.",
+                },
+                limit: {
+                  type: "number",
+                  description: `Optional: how many recent CONTEXT lines to show from each side (default ${RECENT_LIMIT}, max ${MAX_CATCH_UP_LIMIT}). Waiting messages fill this window before ordinary chatter does, so what the count is about is always what you see first; raise it when you want more of the surrounding conversation.`,
                 },
               },
             },
@@ -3024,9 +3380,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
 // Wrapped below so every result carries the unreplied count: a client that
 // cannot be pushed to still learns there is traffic, on its next tool call,
 // whatever that call was.
-const handleToolCall = async (req: {
-  params: { name: string; arguments?: unknown };
-}): Promise<CallToolResult> => {
+// `seen` is wait_for_messages' "already handed to this caller" set, and A
+// CALLER IS ONE CONNECTION: the primary's own stdio has one set for the
+// process lifetime (stdioSeen), each secondary's IPC socket has one in its
+// connection closure and loses it with the socket. That identity is what both
+// earlier attempts lacked (see takeUnseen in lib/message-view.ts).
+const handleToolCall = async (
+  req: {
+    params: { name: string; arguments?: unknown };
+  },
+  seen: Set<string>,
+): Promise<CallToolResult> => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>;
   try {
     // A secondary runs no tool locally - it hands the call to the
@@ -3342,9 +3706,10 @@ const handleToolCall = async (req: {
         // and resetTimeoutOnProgress is off by default, so an over-long wait is
         // cancelled client-side rather than answered. The margin covers the
         // re-check tick and any client configured tighter than the default.
-        const arrived = await waitForUnreplied(40_000);
+        const arrived = await waitForUnreplied(40_000, seen);
+        // Not "new": the first call on a connection hands over the backlog.
         const text = arrived.length
-          ? `${arrived.length} unreplied message(s):\n\n${formatMessages(arrived)}`
+          ? `${arrived.length} unreplied message(s) not yet handed to this connection:\n\n${formatMessages(arrived)}`
           : "No new messages in the last 40 seconds. Call again to keep waiting.";
         return { content: [{ type: "text", text }] };
       }
@@ -3371,7 +3736,37 @@ const handleToolCall = async (req: {
       }
 
       case "catch_up": {
-        const byChat = getRecentByChat();
+        // `limit` widens BOTH halves. Waiting lines are NOT exempt from it -
+        // they take the inbound slots first, but the window is still `limit`
+        // per side, which is exactly why the header below reports how many
+        // waiting messages it could not show. This note used to say unreplied
+        // lines were never capped; that was false, and the disclosure block
+        // 60 lines down carries an explicit warning that an edit trusting
+        // this note would delete it and turn a reported gap into a silent
+        // one. Clamped so a bad value cannot ask for an entire 30-day log.
+        const rawLimit = Number(args.limit);
+        // The FLOOR is RECENT_LIMIT, not 1, and it does two jobs.
+        //
+        // 1. Owner, 2026-09-08: a minimum of 5 "for the off chance that I sent
+        //    only 1 message, then at least I'll have more context". `limit: 1`
+        //    rendering a single line is never what anyone wants.
+        // 2. It closes a real dump. Any 0 < limit < 1 passed the `> 0` test and
+        //    then floored to 0 - and `slice(-0)` is `slice(0)`, which returns
+        //    the WHOLE array. So `limit: 0.5` made catch_up render the entire
+        //    retained log for that chat: precisely what the clamp exists to
+        //    prevent, achieved through the clamp. Verified: 12 entries,
+        //    limit 0.5, 12 returned.
+        //
+        // Both sides get the same N, deliberately (owner): if the last N lines
+        // are his own, N of theirs still shows behind them for context.
+        const limit =
+          Number.isFinite(rawLimit) && rawLimit > 0
+            ? Math.min(
+                Math.max(RECENT_LIMIT, Math.floor(rawLimit)),
+                MAX_CATCH_UP_LIMIT,
+              )
+            : RECENT_LIMIT;
+        const byChat = getRecentByChat(limit);
         const sections: string[] = [];
         const owner = ownerDisplayName();
         // One chat on request: the owner drafts a message to someone and
@@ -3379,18 +3774,68 @@ const handleToolCall = async (req: {
         const want = String(args.chat ?? "")
           .trim()
           .toLowerCase();
+        // Session start is COUNTS ONLY (owner, 2026-09-05). Message text
+        // appears in exactly one place - when a chat is named - so opening a
+        // session no longer reads every letter in the mailbox aloud.
+        const counts: ChatCount[] = [];
+        const access = want ? null : loadAccess();
+        // UNIQUENESS, not a length floor. Resolved up front over every chat, so
+        // an ambiguous `chat` asks which one is meant instead of printing
+        // several rooms' full text - the owner's Q5 answer, and the only thing
+        // that stops a private reply landing in a group an admin named after
+        // one of his contacts. Resolved BEFORE the render loop because
+        // the answer depends on ALL chats, which a per-chat filter cannot see.
+        let chosen: ChatRef | null = null;
+        let ambiguous = "";
+        if (want) {
+          const refs: ChatRef[] = [...byChat].map(([chatId, { entries }]) => ({
+            chatId,
+            name: chatDisplayName(entries, chatId),
+          }));
+          const hit = resolveChat(refs, want);
+          if (hit.ok) chosen = hit.chat;
+          else if (hit.matches.length)
+            ambiguous = ambiguousChatMessage(want, hit.matches);
+        }
         for (const [chatId, { entries, unreplied }] of byChat) {
-          const name =
-            entries.find((e) => e.group_name)?.group_name ??
-            entries.find((e) => (e.direction ?? "in") === "in")?.user ??
-            chatId;
-          if (
-            want &&
-            chatId.toLowerCase() !== want &&
-            !name.toLowerCase().includes(want)
-          )
+          const name = chatDisplayName(entries, chatId);
+          if (!want) {
+            // A listed chat always has unreplied > 0, and unreplied only ever
+            // counts ROUTED inbound lines, so in a mention-gated group a
+            // waiting message is by definition one that addressed us - which
+            // is exactly what the `@` claims.
+            counts.push({
+              name,
+              unreplied,
+              mentionGated:
+                chatId.endsWith("@g.us") &&
+                access?.groups[chatId]?.requireMention === true,
+            });
             continue;
-          const header = `=== ${name} (chat_id=${chatId})${unreplied ? ` — ${unreplied} unreplied` : ""} ===`;
+          }
+          // Exactly the one chat resolveChat settled on, decided above.
+          if (!chosen || chosen.chatId !== chatId) continue;
+          // `hidden` IS REACHABLE and this comment used to say it was not.
+          // The window is `limit` lines per side; waiting lines take the
+          // inbound slots first but are still capped, so a chat with more
+          // waiting than `limit` genuinely hides some. The earlier note said
+          // "should now always be 0", which was true only of a design that was
+          // replaced - and a future edit trusting it would DELETE the
+          // disclosure, turning a reported gap into a silent one. Replying
+          // marks all `unreplied` answered (owner, 2026-09-08), so the caller
+          // must be told, and must be told WHAT TO DO ABOUT IT: naming the
+          // exact follow-up call is the difference between a warning and a
+          // dead end.
+          const shown = entries.filter((e) => awaitingReply(e)).length;
+          const hidden = unreplied > shown ? unreplied - shown : 0;
+          const header = `=== ${name} (chat_id=${chatId})${
+            unreplied
+              ? ` — ${unreplied} unreplied` +
+                (hidden
+                  ? ` (${hidden} of them NOT shown below - the window keeps the NEWEST waiting messages, so the hidden ones are the OLDEST. ${unreplied <= MAX_CATCH_UP_LIMIT ? `To see them all first, call catch_up again with chat="${chatId}" and limit=${unreplied}.` : `More are waiting than one call can show (ceiling ${MAX_CATCH_UP_LIMIT}); call catch_up with chat="${chatId}" and limit=${MAX_CATCH_UP_LIMIT} and expect ${unreplied - MAX_CATCH_UP_LIMIT} to remain unseen.`} Replying marks all ${unreplied} answered, shown or not)`
+                  : `, all shown below; replying marks these ${unreplied} answered (a message arriving before you reply is NOT included - reply snapshots the list as it stood when it started)`)
+              : ""
+          } ===`;
           const lines = entries.map((e) => {
             const view = renderLogEntry(e, owner);
             const extras =
@@ -3402,11 +3847,50 @@ const handleToolCall = async (req: {
           });
           sections.push([header, ...lines].join("\n"));
         }
-        let text = sections.length
-          ? sections.join("\n\n")
-          : want
-            ? `No chat on record matching "${want}".`
-            : "No chat activity on record.";
+        const countsText = want ? "" : formatChatCounts(counts);
+        let text = want
+          ? sections.length
+            ? sections.join("\n\n")
+            : // Ambiguity is NOT "not found", and saying so is the whole point:
+              // the caller is told which chats matched, with the ids, so they
+              // can ask or pick. Falling through to "no chat on record" here
+              // would hide a real match behind a wrong answer.
+              ambiguous || `No chat on record matching "${want}".`
+          : // "Nothing waiting" and "nothing on record at all" are different
+            // answers and only one of them is reassuring. An empty log means a
+            // fresh install - or a bridge silently receiving nothing, which is
+            // the one thing a session should be told rather than left to read
+            // as quiet.
+            countsText ||
+            (byChat.size === 0
+              ? "No chat activity on record."
+              : "Nothing waiting.");
+        // Coming back after a while, the rooms whose activity aged out
+        // entirely are the ones you cannot see at all - so say they existed
+        // rather than let an empty list read as silence.
+        if (!want) {
+          // VISIBLE means "listed above", not "still has any line at all".
+          // Keyed off unreplied > 0, which is exactly what formatChatCounts
+          // lists. Using every chat with a surviving line meant a chat whose
+          // unanswered mention was pruned but which still had ordinary chatter
+          // counted as visible - while its `unreplied` was 0 by then, so it was
+          // not in the list either. The miss was reported in NEITHER half:
+          // the aged-out count failing at its own purpose. Now every chat
+          // is in exactly one of the two, never neither.
+          const visible = new Set(
+            [...byChat]
+              .filter(([, b]) => b.unreplied > 0)
+              .map(([id]) => agedOutKey(id)),
+          );
+          const aged = agedOutLine(
+            countAgedOut(loadAgedOut(), visible),
+            LOG_TTL_MS / DAY_MS,
+          );
+          // "\n\n" as an escape, not a literal two-line template: the repo has
+          // no .gitattributes and core.autocrlf=true here, so a Windows
+          // checkout would turn the literal into CRLF in the tool result.
+          if (aged) text += "\n\n" + aged;
+        }
         try {
           if (existsSync(TASKS_FILE)) {
             const open = readFileSync(TASKS_FILE, "utf8")
@@ -3529,22 +4013,38 @@ const handleToolCall = async (req: {
   }
 };
 
+// The primary's own stdio connection is one wait_for_messages caller for the
+// life of the process - see handleToolCall.
+const stdioSeen = new Set<string>();
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   // No live connection and nothing to relay to — answer immediately
   // with today's stub text instead of letting the call queue on a dead
   // socket. Same shape the startup stub used to return (no isError, no
   // unreplied suffix), so nothing downstream changes.
   if (degraded()) return { content: [{ type: "text", text: conflictReason }] };
-  const result = await handleToolCall(req);
+  const result = await handleToolCall(req, stdioSeen);
   const pending = getUnreplied().length;
   const last = result.content?.[result.content.length - 1];
-  // Not on the tools that just returned those very messages.
+  // Not on the tools that just returned those very messages. The counts-only
+  // catch_up is one of them - it reports exactly this number, so appending a
+  // directive to go call the full-text tool defeated the quiet list entirely.
+  // Naming a chat is NOT excluded: there `pending` is the global figure, and a
+  // session working chat-by-chat still wants telling about the others.
+  // wait_for_messages is NOT excluded either: it returns only what
+  // this connection has not been handed, so an empty result must still say
+  // that a backlog is waiting - a poll-only client has no other signal.
+  const countsOnlyCatchUp =
+    req.params.name === "catch_up" &&
+    !String(
+      (req.params.arguments as Record<string, unknown> | undefined)?.chat ?? "",
+    ).trim();
   if (
     pending > 0 &&
     last?.type === "text" &&
-    !["unreplied", "wait_for_messages"].includes(req.params.name)
+    req.params.name !== "unreplied" &&
+    !countsOnlyCatchUp
   ) {
-    last.text += `\n\n[${pending} unreplied WhatsApp message(s) waiting — call unreplied or wait_for_messages]`;
+    last.text += `\n\n[${pending} unreplied WhatsApp message(s) waiting — call catch_up for the per-chat counts]`;
   }
   return result;
 });
@@ -3979,7 +4479,11 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
     // shows it.
     if (
       !backlog &&
-      tryClaimPermissionReply(msg, msg.key.remoteJid, extractText(msg.message))
+      tryClaimPermissionReply(
+        msg,
+        msg.key.remoteJid ?? "",
+        extractText(msg.message),
+      )
     )
       return;
     return logOwnerHandReply(msg);
@@ -4053,7 +4557,23 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
           replied: true,
           direction: "in",
           routed: false,
-          ...(groupName ? { group_name: groupName } : {}),
+          // The kind, so this line renders [photo] like every other one. This
+          // path returns before the EAGER download, so nothing is written to
+          // inbox/ - but storeMessage(msg) already ran above the gate, so
+          // download_attachment can fetch it WHILE THE ID IS STILL IN
+          // messageProtoStore (an in-memory FIFO capped at MAX_STORE, emptied
+          // by a restart - the log line outlives it by days). Two earlier
+          // versions of this comment were wrong in opposite directions: one
+          // said the file "never will be" fetchable, this one said it simply
+          // "works". Without the kind recorded, mediaPlaceholder has nothing
+          // to key on and a
+          // caption-less photo here showed the raw "(image)" marker while the
+          // identical photo on the routed path showed [photo]. Same room, two
+          // renderings, which is the inconsistency R5 exists to remove.
+          ...(dropMedia ? { attachment_kind: dropMedia.kind } : {}),
+          ...(groupName && groupName !== remoteJid
+            ? { group_name: groupName }
+            : {}),
         });
       }
     }
@@ -4143,6 +4663,19 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
     | undefined;
 
   const media = classifyMedia(msg.message);
+  // BACKLOG MEDIA STILL RECORDS ITS KIND. The download is skipped for backlog
+  // - that is what `!backlog` below is for, and it stays - but the kind is
+  // metadata classifyMedia has already worked out, and withholding it made
+  // the two paths disagree: the context path records it unconditionally, so
+  // after an hour offline an unaddressed group photo rendered [photo] while a
+  // caption-less DM photo from the same hour rendered the raw "(image)" and
+  // read as nothing having arrived. Backlog is precisely what catch_up
+  // exists for. storeMessage has already run, so download_attachment can
+  // usually fetch these - though not forever: messageProtoStore is an
+  // in-memory FIFO capped at MAX_STORE and empty after a restart, while the
+  // log line itself lives 7-30 days. So the kind is an honest statement of
+  // WHAT arrived, not a promise that the bytes are still retrievable.
+  if (media && backlog) attachment = { kind: media.kind, file_id: messageId };
   if (media && !backlog) {
     if (media.kind === "image") {
       // Eager download for images (small, commonly sent)
@@ -4165,6 +4698,18 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
         imagePath = path;
       } catch (err) {
         logDiag(`${LOG_PREFIX}: image download failed: ${err}\n`);
+        // FALL BACK TO AN ATTACHMENT, exactly as the voice branch below
+        // already does on its own failure. Without this the line persists as
+        // the bare "(image)" marker with no media fields at all: it renders
+        // as that raw marker instead of [photo], and download_attachment has
+        // no kind to act on - so the reader is told nothing arrived that they
+        // could fetch. The same rule was applied in one of the two eager
+        // branches and not the other.
+        attachment = {
+          kind: media.kind,
+          file_id: messageId,
+          ...(media.mime ? { mime: media.mime } : {}),
+        };
       }
     } else if (media.kind === "voice" || media.kind === "audio") {
       // Eager download + transcribe voice/audio messages
@@ -4246,7 +4791,7 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
     direction: "in",
     ...(imagePath ? { image_path: imagePath } : {}),
     ...(attachment ? { attachment_kind: attachment.kind } : {}),
-    ...(groupName ? { group_name: groupName } : {}),
+    ...(groupName && groupName !== remoteJid ? { group_name: groupName } : {}),
   });
 
   // A backlog line is logged (above) and shows in catch_up/unreplied; it is
@@ -4681,7 +5226,8 @@ async function connectWhatsApp(): Promise<void> {
         // receives command previews and can approve them. A misdirected owner
         // is otherwise invisible — the agent just waits on approvals nobody
         // sees — and diag.log is the only forensic surface on an unattended
-        // host. `access status` prints the same jid interactively.
+        // host. `access status` shows the same state interactively, flagging
+        // a stored owner that has left the allowlist.
         const target = permissionTarget(access);
         logDiag(
           `${LOG_PREFIX}: permission requests go to ${target ? maskJid(target) : "nobody (no owner and an empty allowlist)"}\n`,

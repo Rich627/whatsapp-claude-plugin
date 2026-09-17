@@ -27,6 +27,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { CRON_SECTION_RE, parseCronSection } from "../lib/cron";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -43,10 +44,13 @@ const INBOX_DIR = join(STATE_DIR, "inbox");
 const DIAG_LOG_FILE = join(STATE_DIR, "diag.log");
 const LID_MAP_FILE = join(STATE_DIR, "lid-map.json");
 const MSG_STALE_SECS = 600; // mirrors scripts/watchdog.sh MSG_STALE_SECS
-// inbox/ has historically had no automatic pruning at all — every downloaded
-// image/voice note from every allowed chat accumulates forever. A few MB per
-// attachment means steady moderate use stays well under this; crossing it
-// signals real risk of eating the disk unnoticed.
+// Past this, an unreplied line says "nobody answered", not "the session is
+// stuck", so it stops counting toward the stuck-session warning. See the
+// windowed test in checkActivity.
+const MSG_STALE_MAX_SECS = 24 * 60 * 60;
+// inbox/ is pruned hourly by the running primary to the message horizon, so
+// at the default 7 days steady moderate use stays well under this; crossing
+// it means a long horizon, a burst of large files, or no primary running.
 const INBOX_WARN_BYTES = 500_000_000; // 500 MB
 // Half of server.ts's own DIAG_MAX_BYTES (20 MB) self-truncation cap — past
 // this point diag.log is filling fast enough to hit that reset soon, which
@@ -387,6 +391,7 @@ function checkActivity(): void {
   let lastIn: number | null = null;
   let lastOut: number | null = null;
   let staleUnreplied = 0;
+  let oldUnreplied = 0;
   for (const line of readFileSync(MESSAGE_LOG, "utf8").split("\n")) {
     if (!line.trim()) continue;
     try {
@@ -400,8 +405,19 @@ function checkActivity(): void {
       if ((e.direction ?? "in") === "in") {
         // inbound-default mirrors the server's catch_up logic
         lastIn = Math.max(lastIn ?? 0, t);
-        if (e.replied === false && now - t > MSG_STALE_SECS * 1000)
-          staleUnreplied++;
+        // Split, not filtered. The 24h inbound expiry that used to retire
+        // these lines is gone (one 7-day horizon, 0.25.0), so without an upper
+        // bound a single never-answered message would report a stuck session
+        // on every run for a week. But DROPPING the old ones is its own bug:
+        // a session dead for two days with no new traffic would then report
+        // "no stale unreplied messages" - a clean bill of health for exactly
+        // the case someone runs doctor to diagnose. So the old ones stop
+        // counting as stuck-session evidence and are reported separately.
+        const ageMs = now - t;
+        if (e.replied === false && ageMs > MSG_STALE_SECS * 1000) {
+          if (ageMs < MSG_STALE_MAX_SECS * 1000) staleUnreplied++;
+          else oldUnreplied++;
+        }
       } else {
         lastOut = Math.max(lastOut ?? 0, t);
       }
@@ -424,6 +440,16 @@ function checkActivity(): void {
     );
   } else {
     report("PASS", "activity", "no stale unreplied messages");
+  }
+  // Reported whatever the verdict above, so a long-dead session cannot hide
+  // behind a PASS: these are past the stuck-session window but still on the
+  // retention horizon, and "nobody ever answered" is worth seeing.
+  if (oldUnreplied > 0) {
+    report(
+      "INFO",
+      "activity",
+      `${oldUnreplied} inbound message(s) unreplied for >24h — not counted as a stuck session; check the last-inbound time above if that looks wrong`,
+    );
   }
 }
 
@@ -468,18 +494,28 @@ function checkGroupConfigs(acc: AccessShape | null): void {
       );
       continue;
     }
-    // Exact regex the server uses (loadGroupCrons) — a heading that doesn't
-    // match it byte-for-byte is silently ignored.
-    const section = content.match(/## Cron Jobs\n([\s\S]*?)(?=\n## |\n# |$)/);
-    if (section) {
-      const bullets = section[1]
-        .split("\n")
-        .filter((l) => l.startsWith("- ")).length;
+    // THE SERVER'S OWN PARSER, imported - not a second copy of its regex.
+    // The copy that used to live here was written as "the exact regex the
+    // server uses", then lib/cron.ts gained \r?\n for CRLF files and this one
+    // did not. So a config.md saved by a Windows editor scheduled correctly
+    // while doctor WARNed and told the user to rename a heading that was
+    // already right - a diagnostic contradicting the thing it diagnoses.
+    // Sharing the parser also means doctor now reports the JOBS that will run
+    // and the lines that were rejected, rather than counting bullets and
+    // assuming each one became a job.
+    if (CRON_SECTION_RE.test(content)) {
+      const { jobs, errors } = parseCronSection(content);
       report(
         "INFO",
         "group-configs",
-        `${gid}: ## Cron Jobs section with ${bullets} ${bullets === 1 ? "entry" : "entries"}`,
+        `${gid}: ## Cron Jobs section with ${jobs.length} ${jobs.length === 1 ? "job" : "jobs"}`,
       );
+      for (const err of errors) {
+        report("WARN", "group-configs", `${gid}: ${err}`, {
+          kind: "manual",
+          text: `Fix that line in ${cfg} - it is in the section but schedules nothing`,
+        });
+      }
     } else if (/^#{1,6}\s.*cron/im.test(content)) {
       report(
         "WARN",
@@ -560,7 +596,8 @@ function bytesToMb(bytes: number): string {
 }
 
 function checkDiskUsage(): void {
-  // inbox/ — every downloaded attachment, no automatic pruning at all.
+  // inbox/ — pruned by the primary (pruneInbox) while one runs. The threshold
+  // assumes the default 7-day horizon; doctor cannot see the lock holder's TTL.
   if (!existsSync(INBOX_DIR)) {
     report(
       "INFO",
@@ -592,10 +629,10 @@ function checkDiskUsage(): void {
         report(
           "WARN",
           "disk-usage",
-          `inbox/ holds ${fileCount} file(s), ${mb} MB — it has never been automatically pruned and can grow without bound`,
+          `inbox/ holds ${fileCount} file(s), ${mb} MB — a running primary prunes it hourly to the message horizon (7 days unless WHATSAPP_MESSAGE_TTL_DAYS says otherwise); this threshold assumes that default, and nothing prunes while no server runs`,
           {
             kind: "manual",
-            text: `Review and clear old attachments you no longer need, e.g.: find ${INBOX_DIR} -type f -mtime +7 -delete`,
+            text: `Restart the lock-holding terminal with a lower WHATSAPP_MESSAGE_TTL_DAYS (it is read at startup), or clear attachments you no longer need, e.g.: find ${INBOX_DIR} -type f -mtime +7 -delete`,
           },
         );
       } else {
@@ -604,15 +641,30 @@ function checkDiskUsage(): void {
     }
   }
 
+  // ONE rule for "how big is this file, if I can tell". Both readings below
+  // used a bare statSync, outside any try - unlike the inbox scan above, which
+  // guards every one. A file deleted between existsSync and statSync, an
+  // EACCES, a symlink to a vanished target, or diag.log replaced by a
+  // directory would throw straight out of checkDiskUsage.
+  const sizeOf = (p: string): number | null => {
+    try {
+      return statSync(p).size;
+    } catch {
+      return null;
+    }
+  };
+
   // diag.log — self-truncates at 20 MB (server.ts's DIAG_MAX_BYTES), but a
   // fast-filling log means something is repeatedly failing and the evidence
   // is about to be wiped by that reset.
   if (!existsSync(DIAG_LOG_FILE)) {
     report("INFO", "disk-usage", "diag.log does not exist yet");
   } else {
-    const bytes = statSync(DIAG_LOG_FILE).size;
-    const mb = bytesToMb(bytes);
-    if (bytes > DIAG_LOG_WARN_BYTES) {
+    const bytes = sizeOf(DIAG_LOG_FILE);
+    const mb = bytes === null ? "?" : bytesToMb(bytes);
+    if (bytes === null) {
+      report("WARN", "disk-usage", `could not read ${DIAG_LOG_FILE}`);
+    } else if (bytes > DIAG_LOG_WARN_BYTES) {
       report(
         "WARN",
         "disk-usage",
@@ -629,9 +681,11 @@ function checkDiskUsage(): void {
   if (!existsSync(LID_MAP_FILE)) {
     report("INFO", "disk-usage", "lid-map.json does not exist yet");
   } else {
-    const bytes = statSync(LID_MAP_FILE).size;
-    const mb = bytesToMb(bytes);
-    if (bytes > LID_MAP_WARN_BYTES) {
+    const bytes = sizeOf(LID_MAP_FILE);
+    const mb = bytes === null ? "?" : bytesToMb(bytes);
+    if (bytes === null) {
+      report("WARN", "disk-usage", `could not read ${LID_MAP_FILE}`);
+    } else if (bytes > LID_MAP_WARN_BYTES) {
       report(
         "WARN",
         "disk-usage",
@@ -649,18 +703,36 @@ function checkDiskUsage(): void {
 
 // ── main ────────────────────────────────────────────────────────────────
 
-checkEnv();
-if (checkStateDir()) {
-  checkAuth();
-  checkServer();
-  const acc = checkAccess();
-  checkActivity();
-  checkTranscription();
-  checkGroupConfigs(acc);
-  checkWatchdog();
-  checkDiskUsage();
+// THE REPORT IS PRINTED WHATEVER HAPPENS. `out` is only flushed at the very
+// end, so before this any throw anywhere in any check aborted the run and
+// printed NOTHING - no checks, no summary, just a stack trace. That is the
+// worst failure mode this file has: a diagnostic that dies silently on the
+// machine you are trying to diagnose, and it tells you less than running
+// nothing at all. The specific throw that prompted this is fixed above
+// (sizeOf), but the guard is here so the NEXT unguarded call cannot do it
+// again. The thrown error becomes an ERROR row, so it is in the report rather
+// than instead of it.
+try {
+  checkEnv();
+  if (checkStateDir()) {
+    checkAuth();
+    checkServer();
+    const acc = checkAccess();
+    checkActivity();
+    checkTranscription();
+    checkGroupConfigs(acc);
+    checkWatchdog();
+    checkDiskUsage();
+  }
+} catch (err) {
+  report(
+    "ERROR",
+    "doctor",
+    `a check stopped early: ${err}. Everything above still ran; everything below it did not.`,
+  );
+} finally {
+  out.push(
+    `SUMMARY: ${counts.ERROR} error, ${counts.WARN} warn, ${counts.INFO} info, ${counts.PASS} pass`,
+  );
+  console.log(out.join("\n"));
 }
-out.push(
-  `SUMMARY: ${counts.ERROR} error, ${counts.WARN} warn, ${counts.INFO} info, ${counts.PASS} pass`,
-);
-console.log(out.join("\n"));

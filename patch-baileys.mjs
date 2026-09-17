@@ -29,33 +29,73 @@ const baileys = join(
 // must stay green.
 let unapplied = 0;
 
+// WHITESPACE-TOLERANT TARGETS. The patch targets are source text, so an
+// upstream reindent - or a line break moving - is a cosmetic change that
+// carries no meaning. Matched literally, that read here as "target vanished",
+// and once the exit code became load-bearing below it would have failed
+// `bun install` for EVERY user over a reformat that broke nothing. Every run
+// of whitespace in a target now matches any run of whitespace in the file;
+// everything else is matched literally, so the targets stay as specific as
+// they were. (Owner's call, 2026-09-09: tolerant matching, and the hard
+// failure reserved for a target that is genuinely gone.)
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const flexible = (needle, flags) =>
+  new RegExp(needle.trim().split(/\s+/).map(escapeRe).join("\\s+"), flags);
+
 function patch(file, find, replace, label) {
   const path = join(baileys, file);
   if (!existsSync(path)) {
-    console.log(`  skip: ${file} not found`);
+    // COUNTS AS UNAPPLIED, like the pattern-not-found case below. A missing
+    // file is the LIKELIER form of a Baileys version bump - upstream renames
+    // or moves a module - and it used to print `skip:` and exit 0, leaving
+    // `bun install` green while the runtime ran completely unpatched. The
+    // loud case was loud and the likely case was silent.
+    console.log(
+      `  ERROR: ${label} — ${file} not found; patch NOT applied (baileys layout likely changed, needs manual review)`,
+    );
+    unapplied++;
     return;
   }
   let src = readFileSync(path, "utf8");
-  if (!src.includes(find)) {
-    if (src.includes(replace)) {
+  if (!flexible(find).test(src)) {
+    if (flexible(replace).test(src)) {
       console.log(`  ok: ${label} (already patched)`);
     } else {
+      // GENUINELY ABSENT: present in neither its pre- nor its post-patch
+      // form, even allowing for reformatting. This is the case the hard exit
+      // is for - we cannot tell whether the fix is in place, so the install
+      // must not pass silently.
       console.log(
-        `  ERROR: ${label} — pattern not found in ${file}; patch NOT applied (baileys version likely changed, needs manual review)`,
+        `  ERROR: ${label} — target not found in ${file} in either form; patch NOT applied (baileys version likely changed, needs manual review)`,
       );
       unapplied++;
     }
     return;
   }
-  // replaceAll: some patch targets appear more than once in the file, and a
+  // Global regex: some patch targets appear more than once in the file, and a
   // silent "only the first occurrence got patched" is exactly the kind of
-  // invisible partial-patch this rework exists to prevent.
-  src = src.replaceAll(find, replace);
+  // invisible partial-patch this rework exists to prevent. The replacement is
+  // a FUNCTION so that a `$` in the replacement text could never be read as a
+  // substitution pattern.
+  src = src.replace(flexible(find, "g"), () => replace);
   writeFileSync(path, src);
   console.log(`  patched: ${label}`);
 }
 
 console.log("patching baileys rc.9...");
+
+// "NOT INSTALLED HERE" IS NOT "TARGET VANISHED", and the whole rework turns on
+// that distinction. Without this check a hoisted or absent
+// node_modules/@whiskeysockets/baileys makes all five patches take the
+// missing-file branch, and the install fails with five identical "layout
+// likely changed, needs manual review" lines - none of which is the actual
+// condition. Exit 0: nothing is unpatched, because there is nothing here to
+// patch, and a workspace that hoists its dependencies elsewhere must not fail
+// its install over where this script happened to look.
+if (!existsSync(baileys)) {
+  console.log(`  skip: no baileys at ${baileys} (nothing to patch here)`);
+  process.exit(0);
+}
 
 // Patch 1: passive: true → passive: false
 // Matched together with the following `pull: true,` line (not just

@@ -333,8 +333,9 @@ describe("policy", () => {
 // points - a wrong value is otherwise silent, with the agent waiting on
 // approvals nobody receives.
 describe("owner", () => {
-  test("set owner takes a jid and refuses a bare number", () => {
+  test("set owner takes an allowlisted jid and refuses a bare number", () => {
     const dir = freshStateDir();
+    run(dir, "allow", "886912345678@s.whatsapp.net");
     const ok = run(dir, "set", "owner", "886912345678@s.whatsapp.net");
     expect(ok.code).toBe(0);
     expect(access(dir).owner).toBe("886912345678@s.whatsapp.net");
@@ -343,14 +344,56 @@ describe("owner", () => {
     expect(access(dir).owner).toBe("886912345678@s.whatsapp.net"); // unchanged
   });
 
+  // The value this guards is the chat every permission request is delivered
+  // to, command preview and all. A mistyped digit is still a well-formed jid,
+  // so an "@ is present" check pointed that at a stranger for good.
+  test("set owner refuses a jid nobody allowlisted", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "886912345678@s.whatsapp.net");
+    run(dir, "set", "owner", "886912345678@s.whatsapp.net");
+
+    const typo = run(dir, "set", "owner", "886912345679@s.whatsapp.net");
+    expect(typo.code).toBe(1);
+    expect(typo.out).toContain("allowlisted");
+    expect(access(dir).owner).toBe("886912345678@s.whatsapp.net"); // unchanged
+
+    expect(run(dir, "set", "owner", "a@b").code).toBe(1);
+    expect(access(dir).owner).toBe("886912345678@s.whatsapp.net");
+  });
+
   test("status names the owner, and says when it is only a fallback", () => {
     const dir = freshStateDir();
     run(dir, "allow", "886900000000@s.whatsapp.net");
+    run(dir, "allow", "886912345678@s.whatsapp.net");
     expect(run(dir, "status").out).toContain("unstamped");
     run(dir, "set", "owner", "886912345678@s.whatsapp.net");
     const out = run(dir, "status").out;
     expect(out).toContain("owner:      886912345678@s.whatsapp.net");
     expect(out).not.toContain("unstamped");
+  });
+
+  // The server stops sending to a revoked owner on the next read; status
+  // printing the bare field had the user waiting on a chat that gets nothing.
+  test("status flags an owner that has left the allowlist", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "886900000000@s.whatsapp.net");
+    run(dir, "allow", "886912345678@s.whatsapp.net");
+    run(dir, "set", "owner", "886912345678@s.whatsapp.net");
+    run(dir, "remove", "886912345678@s.whatsapp.net");
+    const out = run(dir, "status").out;
+    expect(out).toContain("NO LONGER ALLOWLISTED");
+    expect(access(dir).owner).toBe("886912345678@s.whatsapp.net"); // kept: an unstamped owner would fall back to allowFrom[0]
+  });
+
+  // The check is normalised, so a device-suffixed spelling passes it; stored
+  // raw, the server addressed one stale device and `remove` could not find it.
+  test("set owner stores the allowlist's own spelling", () => {
+    const dir = freshStateDir();
+    run(dir, "allow", "886912345678@s.whatsapp.net");
+    expect(
+      run(dir, "set", "owner", "886912345678:12@s.whatsapp.net").code,
+    ).toBe(0);
+    expect(access(dir).owner).toBe("886912345678@s.whatsapp.net");
   });
 });
 

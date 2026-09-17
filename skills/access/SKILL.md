@@ -60,7 +60,9 @@ Missing file = `{dmPolicy:"pairing", allowFrom:[], groups:{}, pending:{}}`.
 allowed to approve them. The server stamps it once when it is missing — the
 linked account on a fresh install, the existing `allowFrom[0]` on an install
 that already had an allowlist — and never touches it again, so a value set by
-hand survives every reconnect. Set it with `set owner <jid>`. That matters when
+hand survives every reconnect. Set it with `set owner <jid>`, which takes only
+an allowlisted contact's jid — a stranger could never approve anything anyway,
+and a typo'd digit would quietly send them every command preview. That matters when
 the agent runs on a dedicated number: leave it pointing at the linked account
 and every permission request goes to that number's own note-to-self, where
 nobody sees it and the agent waits forever.

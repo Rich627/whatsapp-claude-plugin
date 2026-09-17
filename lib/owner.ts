@@ -30,8 +30,13 @@ export function ownerStamp(
   linkedJid: string,
 ): string | undefined {
   // Empty string counts as absent: it is what a hand-edit that meant "clear
-  // this" leaves behind, and permissionTarget's `??` would step over it into
-  // the allowFrom[0] fallback anyway.
+  // this" leaves behind. This used to add "and permissionTarget's `??` would
+  // step over it anyway", which was FALSE - `??` falls through only on
+  // null/undefined, so an empty owner reached the send site, failed its
+  // truthiness check there, and swallowed every permission request in
+  // silence. permissionTarget now tests the value itself and revalidates it
+  // against the allowlist; this stamp is no longer the only thing standing
+  // between a cleared owner and that failure.
   if (current) return current;
   if (!linkedJid) return current;
   return priorAllowFrom[0] ?? linkedJid;
