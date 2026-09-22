@@ -57,6 +57,13 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.25.2",
+      notes: [
+        "Forwarded, captioned, ephemeral and view-once media are now recognized instead of silently dropped.",
+        "Media you send by hand is now kept in catch_up and can be fetched with download_attachment.",
+      ],
+    },
+    {
       version: "0.25.1",
       notes: [
         "A contact you removed can no longer approve a permission request by emoji reaction.",

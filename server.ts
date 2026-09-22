@@ -26,6 +26,7 @@ import makeWASocket, {
   getContentType,
   jidNormalizedUser,
   isLidUser,
+  normalizeMessageContent,
   type WASocket,
   type WAMessage,
   type WAMessageKey,
@@ -4444,8 +4445,21 @@ async function logOwnerHandReply(msg: WAMessage): Promise<void> {
 
   // Only now is the text read at all. No diag line, no log line, nothing on
   // the drop paths above.
-  const text = extractText(msg.message);
-  if (!text) return; // media-only / reaction / protocol message — see NOTE 3
+  // WhatsApp wraps a forwarded (or captioned) document as
+  // documentWithCaptionMessage, and ephemeral/view-once messages wrap their
+  // payload too — msg.documentMessage etc. is undefined on those until
+  // unwrapped, so a forwarded file silently read as "no media" without this.
+  const content = normalizeMessageContent(msg.message) ?? msg.message;
+  const text = extractText(content);
+  const media = classifyMedia(content);
+  if (!text && !media) return; // reaction / protocol message — see NOTE 3
+  // Self-sent media (Notes to Self, or the owner sending into any configured
+  // chat) previously vanished here with zero trace: this path never called
+  // storeMessage or classifyMedia, unlike the normal inbound pipeline, so a
+  // document/image/video with no caption text hit the `if (!text) return`
+  // above and left no log line, no diag entry, nothing. storeMessage keeps
+  // the proto around so download_attachment can find it by message id.
+  if (media) storeMessage(msg);
 
   // Idempotence: an id already in the log is a replay (second line behind
   // wasSentByServer), or markReplied would flip this chat's unreplied to replied.
@@ -4482,6 +4496,7 @@ async function logOwnerHandReply(msg: WAMessage): Promise<void> {
     replied: true,
     direction: "out",
     by: "owner",
+    ...(media ? { attachment_kind: media.kind } : {}),
     ...(groupName && groupName !== chatId ? { group_name: groupName } : {}),
   });
 }
@@ -4532,8 +4547,12 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
       ? msg.messageTimestamp
       : Number(msg.messageTimestamp ?? 0);
 
-  let text = extractText(msg.message);
-  const mentionedJids = extractMentions(msg.message);
+  // See the matching comment in logOwnerHandReply: documentWithCaptionMessage
+  // (forwarded/captioned documents) and ephemeral/view-once wrappers hide the
+  // real content one level down, so extraction must run on the unwrapped form.
+  const normalizedContent = normalizeMessageContent(msg.message) ?? msg.message;
+  let text = extractText(normalizedContent);
+  const mentionedJids = extractMentions(normalizedContent);
 
   // Store for later use by reply_to and download_attachment
   storeMessage(msg);
@@ -4565,7 +4584,7 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
       // Same content rule as the delivered path: real media becomes
       // "(image)" etc.; reactions, edits, revokes and poll updates carry no
       // content and are not kept.
-      const dropMedia = classifyMedia(msg.message);
+      const dropMedia = classifyMedia(normalizedContent);
       const kept = text || (dropMedia ? `(${dropMedia.kind})` : "");
       if (kept) {
         const groupName = await resolveGroupName(remoteJid);
@@ -4684,7 +4703,7 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
       }
     | undefined;
 
-  const media = classifyMedia(msg.message);
+  const media = classifyMedia(normalizedContent);
   // BACKLOG MEDIA STILL RECORDS ITS KIND. The download is skipped for backlog
   // - that is what `!backlog` below is for, and it stays - but the kind is
   // metadata classifyMedia has already worked out, and withholding it made
