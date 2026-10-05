@@ -136,6 +136,8 @@ chmod +x ~/whisper-transcribe.sh
 
 The reference script uses `mlx-community/whisper-large-v3-turbo` — accurate, fast, multilingual. Swap the model in the script if you prefer a smaller one.
 
+**Cloud alternative.** To skip the local setup, open `/plugin`, pick this plugin, and set **Voice transcription provider** to `groq` or `openai` along with that provider's API key. Keys are kept in your OS keychain, not in `settings.json`. Voice notes are then uploaded to `api.groq.com` or `api.openai.com` for transcription. The older `TRANSCRIPTION_PROVIDER`, `GROQ_API_KEY` and `OPENAI_API_KEY` environment variables still work.
+
 ## Troubleshooting
 
 | Issue                               | Solution                                                                                                                                                                                                                                                                                                                                                                                            |

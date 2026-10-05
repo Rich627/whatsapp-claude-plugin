@@ -57,6 +57,12 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.26.0",
+      notes: [
+        "Cloud voice transcription (Groq/OpenAI) can now be set up in /plugin; keys go to your keychain.",
+      ],
+    },
+    {
       version: "0.25.2",
       notes: [
         "Forwarded, captioned, ephemeral and view-once media are now recognized instead of silently dropped.",

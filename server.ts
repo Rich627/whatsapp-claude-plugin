@@ -4285,11 +4285,26 @@ function classifyMedia(
 
 const WHISPER_SCRIPT = join(homedir(), "whisper-transcribe.sh");
 const WHISPER_TIMEOUT_MS = Number(process.env.WHISPER_TIMEOUT_MS) || 180_000;
+// The plugin's userConfig dialog stores these (API keys in the OS keychain)
+// and .mcp.json passes them in as WHATSAPP_*. An option the user never filled
+// in arrives as the literal "${user_config.<key>}" placeholder - verified on
+// Claude Code 2.1.289, the server still starts - so a placeholder or an empty
+// value counts as unset. The bare env vars still work for installs set up
+// before the dialog existed.
+function pluginOption(value: string | undefined): string | undefined {
+  if (!value || value.startsWith("${user_config.")) return undefined;
+  return value;
+}
 const TRANSCRIPTION_PROVIDER = (
-  process.env.TRANSCRIPTION_PROVIDER ?? "local"
+  pluginOption(process.env.WHATSAPP_TRANSCRIPTION_PROVIDER) ??
+  process.env.TRANSCRIPTION_PROVIDER ??
+  "local"
 ).toLowerCase();
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const GROQ_API_KEY =
+  pluginOption(process.env.WHATSAPP_GROQ_API_KEY) ?? process.env.GROQ_API_KEY;
+const OPENAI_API_KEY =
+  pluginOption(process.env.WHATSAPP_OPENAI_API_KEY) ??
+  process.env.OPENAI_API_KEY;
 
 // Warn once per process when the script is missing — avoids spamming logs on
 // every voice message, but still makes the root cause visible on first use.
@@ -4302,7 +4317,7 @@ async function transcribeCloud(
   const apiKey = provider === "groq" ? GROQ_API_KEY : OPENAI_API_KEY;
   if (!apiKey) {
     logDiag(
-      `${LOG_PREFIX}: ${provider} transcription requires ${provider === "groq" ? "GROQ_API_KEY" : "OPENAI_API_KEY"} env var\n`,
+      `${LOG_PREFIX}: ${provider} transcription needs an API key - set it in the plugin's options (/plugin) or the ${provider === "groq" ? "GROQ_API_KEY" : "OPENAI_API_KEY"} env var\n`,
     );
     return null;
   }

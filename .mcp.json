@@ -9,7 +9,12 @@
         "--shell=bun",
         "--silent",
         "start"
-      ]
+      ],
+      "env": {
+        "WHATSAPP_TRANSCRIPTION_PROVIDER": "${user_config.transcription_provider}",
+        "WHATSAPP_GROQ_API_KEY": "${user_config.groq_api_key}",
+        "WHATSAPP_OPENAI_API_KEY": "${user_config.openai_api_key}"
+      }
     }
   }
 }

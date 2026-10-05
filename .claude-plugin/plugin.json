@@ -2,12 +2,32 @@
   "name": "whatsapp-channel",
   "displayName": "WhatsApp Channel for Claude Code",
   "description": "WhatsApp channel for Claude Code — linked-device messaging bridge with built-in access control. Manage pairing, allowlists, and policy via /whatsapp-channel:access.",
-  "version": "0.25.2",
+  "version": "0.26.0",
   "author": {
     "name": "Rich627"
   },
   "homepage": "https://github.com/Rich627/whatsapp-claude-plugin",
   "repository": "https://github.com/Rich627/whatsapp-claude-plugin",
   "license": "Apache-2.0",
-  "keywords": ["whatsapp", "messaging", "channel", "mcp"]
+  "icon": "./assets/icon.svg",
+  "keywords": ["whatsapp", "messaging", "channel", "mcp"],
+  "userConfig": {
+    "transcription_provider": {
+      "type": "string",
+      "title": "Voice transcription provider",
+      "description": "local (default, needs ~/whisper-transcribe.sh), groq, or openai. Leave empty for local."
+    },
+    "groq_api_key": {
+      "type": "string",
+      "title": "Groq API key",
+      "description": "Only used when the provider is groq. Voice notes are sent to api.groq.com for transcription.",
+      "sensitive": true
+    },
+    "openai_api_key": {
+      "type": "string",
+      "title": "OpenAI API key",
+      "description": "Only used when the provider is openai. Voice notes are sent to api.openai.com for transcription.",
+      "sensitive": true
+    }
+  }
 }

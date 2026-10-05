@@ -8,7 +8,7 @@ The MCP server connects to WhatsApp as a linked device (like WhatsApp Web) and p
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) — the MCP server runs on Bun. Install with `curl -fsSL https://bun.sh/install | bash`.
+- [Bun](https://bun.sh) — the MCP server runs on Bun. See [bun.sh](https://bun.sh/docs/installation) for install options.
 - A WhatsApp account with an active phone number.
 
 ## Quick Setup
