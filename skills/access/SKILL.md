@@ -3,11 +3,11 @@ name: access
 description: WhatsApp channel access — approve pairings, edit allowlists, set DM/group policy. Use when the user asks to pair, approve someone, check who's allowed, or change policy for the WhatsApp channel, and equally when they ask to add contacts or groups, set up access, or take someone's access away — that is this skill's `review`.
 user-invocable: true
 allowed-tools:
-  - Bash(ls ~/.whatsapp-channel*)
-  - Bash(mkdir -p ~/.whatsapp-channel*)
+  - Bash(ls ~/.whatsapp-channel)
+  - Bash(mkdir -p ~/.whatsapp-channel)
+  - Bash(mkdir -p ~/.whatsapp-channel/approved)
   - Bash(bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" *)
   - Read(~/.whatsapp-channel/**)
-  - Write(~/.whatsapp-channel/**)
   - Edit(~/.whatsapp-channel/**)
   - AskUserQuestion
 ---
@@ -24,6 +24,10 @@ downstream of untrusted input.
 Manages access control for the WhatsApp channel. All state lives in
 `~/.whatsapp-channel/access.json`. You never talk to WhatsApp — you
 just edit JSON; the channel server re-reads it.
+
+Only the fixed directory-creation commands above are pre-approved. Creating a
+group-specific directory requires a permission prompt; do not broaden the Bash
+rules with a wildcard to avoid it.
 
 Arguments passed: `$ARGUMENTS`
 

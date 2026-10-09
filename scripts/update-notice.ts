@@ -57,6 +57,13 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.26.2",
+      notes: [
+        "Baileys upgraded to rc12 to fix forged messages and app-state sync attacks.",
+        "Access skill directory creation now uses exact commands instead of broad wildcards.",
+      ],
+    },
+    {
       version: "0.26.1",
       notes: [
         "Claude is no longer told to search the web for every factual question.",

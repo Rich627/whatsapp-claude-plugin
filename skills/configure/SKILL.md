@@ -3,12 +3,11 @@ name: configure
 description: Set up the WhatsApp channel — configure the phone number, review access policy, and manage auth state. Use when the user asks to configure WhatsApp, set a phone number, check channel status, or reset authentication.
 user-invocable: true
 allowed-tools:
-  - Bash(ls ~/.whatsapp-channel*)
+  - Bash(ls ~/.whatsapp-channel)
   - Bash(mkdir -p ~/.whatsapp-channel)
   - Bash(chmod 600 ~/.whatsapp-channel/.env)
   - Bash(rm -rf ~/.whatsapp-channel/.baileys_auth)
   - Read(~/.whatsapp-channel/**)
-  - Write(~/.whatsapp-channel/**)
   - Edit(~/.whatsapp-channel/**)
 ---
 
