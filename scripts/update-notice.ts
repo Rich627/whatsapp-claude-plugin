@@ -57,6 +57,21 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.26.2",
+      notes: [
+        "Baileys upgraded to rc12 to fix forged messages and app-state sync attacks.",
+        "Access skill directory creation now uses exact commands instead of broad wildcards.",
+      ],
+    },
+    {
+      version: "0.26.1",
+      notes: [
+        "Claude is no longer told to search the web for every factual question.",
+        "Configure skill is now limited to ~/.whatsapp-channel/ and refuses requests sent over WhatsApp.",
+        "Do not launch with --dangerously-skip-permissions; see the README for why.",
+      ],
+    },
+    {
       version: "0.26.0",
       notes: [
         "Cloud voice transcription (Groq/OpenAI) can now be set up in /plugin; keys go to your keychain.",

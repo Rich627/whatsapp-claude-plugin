@@ -39,7 +39,7 @@ Use your WhatsApp phone number with country code, no leading `+`.
 **3. Launch with the channel flag.**
 
 ```sh
-claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin
+claude --dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin
 ```
 
 The pairing code appears automatically in your session. On your phone:
@@ -50,7 +50,7 @@ The pairing code appears automatically in your session. On your phone:
 
 Once paired, your own number is **auto-added to the allowlist** and the policy is **auto-locked to allowlist mode**.
 
-> `--dangerously-load-development-channels` is required for third-party plugins during the research preview. Once submitted and approved by Anthropic, use `--channels` instead.
+> `--dangerously-load-development-channels` is what lets an inbound message wake the session; `--channels` only accepts plugins on the research-preview allowlist, which this one is not. Claude Code warns against loading downloaded channels this way, because a channel puts other people's text into your session. Keep the allowlist to people you trust and keep permission prompts on.
 
 **4. Add other contacts (optional).**
 
@@ -83,17 +83,18 @@ See [ACCESS.md](./ACCESS.md) for group options (`--mention`, `--allow`, `--roste
 After initial setup, just run:
 
 ```sh
-claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin
+claude --dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-claude-plugin
 ```
 
-- `--dangerously-skip-permissions` — auto-approve all tool calls (no permission prompts)
-- `--dangerously-load-development-channels` — load third-party channel plugin
+- `--dangerously-load-development-channels` — load this third-party channel plugin so inbound messages wake the session
+
+Do not add `--dangerously-skip-permissions`. With permission prompts off, anyone in an allowlisted chat could get Claude to run commands on your computer. To skip prompts for the WhatsApp tools only, use the fine-grained allowlist below.
 
 Auth is saved in `~/.whatsapp-channel/.baileys_auth/`. The session must stay open to receive messages — closing the session disconnects WhatsApp.
 
 ### Fine-grained permissions
 
-If you prefer to auto-allow only WhatsApp tools (instead of all tools), add to your `~/.claude/settings.json`:
+To auto-allow only the WhatsApp tools, add them to your `~/.claude/settings.json`:
 
 ```json
 {

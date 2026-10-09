@@ -13,10 +13,11 @@ claude.com/plugins.
 ## Tech Stack & Commands
 
 - **Runtime:** Bun — TypeScript runs directly. No build step.
-- **Deps (only 3 — no new dependencies without the user's explicit approval):**
-  `@modelcontextprotocol/sdk`, `@whiskeysockets/baileys@7.0.0-rc.9`,
-  `@inquirer/prompts`
-  (4 known rc.9 bugs are patched by `patch-baileys.mjs` via postinstall).
+- **Deps (only 4 — no new dependencies without the user's explicit approval):**
+  `@modelcontextprotocol/sdk`, `@whiskeysockets/baileys@7.0.0-rc12`,
+  `@inquirer/prompts`, `zod`
+  (2 connection payload fields are patched by `patch-baileys.mjs` via postinstall;
+  rc12 provides the upstream message-spoofing and Noise initialization fixes).
 - **Tests:** there IS a test suite — 22 `*.test.ts` files under `lib/` and
   `scripts/`, run with `bun test`. There is no `test` script in `package.json`;
   `bun test` finds them itself.

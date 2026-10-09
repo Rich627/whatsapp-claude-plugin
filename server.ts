@@ -2981,8 +2981,6 @@ const mcp = new Server(
       "",
       "WhatsApp exposes no history or search API — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       "",
-      "When asked factual questions, current events, or anything you are not confident about, use WebSearch or WebFetch to look it up before answering. Do not guess or rely solely on training data for time-sensitive information.",
-      "",
       "== Per-Group Personality & Context Isolation ==",
       "CRITICAL: Each WhatsApp group is a completely independent conversation context. You MUST treat messages from different chat_ids as entirely separate conversations with separate identities, knowledge, and personalities. NEVER let context from one group leak into another. When you receive a message, check the chat_id — if it differs from the previous message, mentally reset and switch to that group's context entirely.",
       "",
@@ -3241,6 +3239,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
         tools: [
           {
             name: "whatsapp_unavailable",
+            annotations: {
+              title: "WhatsApp unavailable",
+              readOnlyHint: true,
+              destructiveHint: false,
+            },
             description: `WhatsApp is not available in this session. ${conflictReason} No other WhatsApp tool exists here.`,
             inputSchema: { type: "object", properties: {} },
           },
@@ -3250,6 +3253,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
         tools: [
           {
             name: "reply",
+            annotations: {
+              title: "Send WhatsApp reply",
+              readOnlyHint: false,
+              destructiveHint: false,
+            },
             description:
               "Reply on WhatsApp. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for quoting, mentions (to @-tag people) and files (absolute paths) to attach images or documents.",
             inputSchema: {
@@ -3280,6 +3288,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           },
           {
             name: "react",
+            annotations: {
+              title: "React to WhatsApp message",
+              readOnlyHint: false,
+              destructiveHint: false,
+            },
             description:
               "Add an emoji reaction to a WhatsApp message. Any emoji is supported.",
             inputSchema: {
@@ -3294,6 +3307,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           },
           {
             name: "download_attachment",
+            annotations: {
+              title: "Download WhatsApp attachment",
+              readOnlyHint: false,
+              destructiveHint: false,
+            },
             description:
               "Download a media attachment from a WhatsApp message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read.",
             inputSchema: {
@@ -3310,6 +3328,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           },
           {
             name: "edit_message",
+            annotations: {
+              title: "Edit sent WhatsApp message",
+              readOnlyHint: false,
+              destructiveHint: true,
+            },
             description:
               "Edit a message this account previously sent. Only works on the account's own messages.",
             inputSchema: {
@@ -3324,6 +3347,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           },
           {
             name: "status",
+            annotations: {
+              title: "WhatsApp connection status",
+              readOnlyHint: true,
+              destructiveHint: false,
+            },
             description:
               "Get WhatsApp connection status. Returns whether connected, the pairing code (if pending), and the connected JID. Call this on session start to check setup state and show the pairing code to the user.",
             inputSchema: {
@@ -3333,12 +3361,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           },
           {
             name: "wait_for_messages",
+            annotations: {
+              title: "Wait for WhatsApp messages",
+              readOnlyHint: false,
+              destructiveHint: false,
+            },
             description:
               "Wait up to 40 seconds for inbound WhatsApp messages this connection has not been handed yet. The first call returns whatever is already unreplied (newest 100); later calls return only what arrived since. Use this when you want to stay responsive without polling: call it, handle whatever it returns, call it again. It returns an empty result if nothing arrives in time, which is normal, not an error; a message is handed to a connection once, so if a result was lost, `unreplied` still lists everything outstanding. (In Claude Code messages are also pushed into the session automatically, so this is mainly for other MCP clients.)",
             inputSchema: { type: "object", properties: {} },
           },
           {
             name: "unreplied",
+            annotations: {
+              title: "List unreplied WhatsApp messages",
+              readOnlyHint: true,
+              destructiveHint: false,
+            },
             description:
               "Get the FULL TEXT of every message received and not yet replied to, across all chats. Each entry includes chat_id, message_id, user, text, and timestamp. This is NOT the session-start tool - catch_up with no arguments is, and it deliberately shows counts only. Use this when you have been asked for the actual contents of everything outstanding, not to open a session.",
             inputSchema: {
@@ -3354,6 +3392,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           },
           {
             name: "catch_up",
+            annotations: {
+              title: "Catch up on WhatsApp chats",
+              readOnlyHint: true,
+              destructiveHint: false,
+            },
             description:
               'Recover conversation context. Pass `chat` (a chat_id, or part of a group or contact name, case-insensitive) to get ONE chat - do this before drafting a message to someone, so the room is in view without dumping every chat. Without `chat`: COUNTS ONLY - one line per chat that has something waiting, showing the chat name, a WhatsApp-style `@` when it is a mention-gated group (so a waiting message there is one that actually addressed you), and how many are unreplied. NO MESSAGE TEXT at all, and a chat with recent traffic but nothing unreplied is left out rather than listed as 0. Sorted most-unreplied first. Name a chat to read anything. Either way you also get the open (unchecked) items from ~/.whatsapp-channel/tasks.md. With `chat`: EVERY message still awaiting a reply in that chat, plus recent context in BOTH directions (sender name for incoming, the label You for a reply this agent sent, and the real name of the owner for a message they typed on their phone), for lines still in the log (7 days by default, every line alike - WHATSAPP_MESSAGE_TTL_DAYS changes it). Whatever the count said is waiting, this shows, up to the window size - and if more are waiting than fit, the header says exactly how many. Read that number before you answer: replying marks every unreplied message in that chat answered, including any this view did not render. If `chat` matches more than one chat you get the matches instead - each with a group/DM marker and a handle (a group id, or a masked number like 5 dots then the last 4 digits). Ask the user which one they mean, then pass that handle back as `chat`; it is accepted verbatim. Call this on session start, right after status. When you take on a multi-step task from a chat, append a line to tasks.md ("- [ ] [YYYY-MM-DD HH:MM] [chat] task — progress note"), keep the progress note updated as you work, and flip it to "- [x]" when done, so a future session can resume it after a crash.',
             inputSchema: {
@@ -3373,6 +3416,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           },
           {
             name: "list_groups",
+            annotations: {
+              title: "List WhatsApp groups",
+              readOnlyHint: true,
+              destructiveHint: false,
+            },
             description: `List every WhatsApp group this account is currently a member of, with each group's name and JID, whether it's already allowlisted, and whether roster access (member names, needed for @all) is granted. Use this to find the JID of a newly-joined group so it can be added via the /whatsapp-channel:access skill — no need to guess the JID from logs. Read-only: does not change access. Also refreshes the on-disk group name/count cache the terminal access wizard (${WIZARD_CMD}) reads from.`,
             inputSchema: {
               type: "object",
@@ -3381,6 +3429,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           },
           {
             name: "group_roster",
+            annotations: {
+              title: "WhatsApp group roster",
+              readOnlyHint: true,
+              destructiveHint: false,
+            },
             description: `List an allowlisted group's members, by name where a saved contact name is known, or a masked number otherwise — never a raw phone number. Only works when roster access has been explicitly granted for that group (${WIZARD_CMD}, or "group add --roster"); fails with a clear error otherwise. Use this before an @all mention, or to answer who is in a chat.`,
             inputSchema: {
               type: "object",

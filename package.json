@@ -4,7 +4,8 @@
   "dependencies": {
     "@inquirer/prompts": "^8.6.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "@whiskeysockets/baileys": "7.0.0-rc.9"
+    "@whiskeysockets/baileys": "7.0.0-rc12",
+    "zod": "^4.3.6"
   },
   "bin": "./server.ts",
   "license": "Apache-2.0",

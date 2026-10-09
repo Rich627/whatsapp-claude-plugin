@@ -1,11 +1,10 @@
 /**
- * Patches @whiskeysockets/baileys 7.0.0-rc.9 for three known bugs.
+ * Patches @whiskeysockets/baileys 7.0.0-rc12 connection payload fields.
  * Runs as a postinstall script — safe to re-run.
  *
  * 1. passive: true → false  (causes device_removed disconnect)
  * 2. delete lidDbMigrated    (unrecognized field, rejected by WA)
- * 3. remove await on noise.finishInit()  (race condition)
- * 4. update WA Web version (old version rejected with 405)
+ * Noise initialization and the WA Web version use the upstream rc12 fixes.
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
@@ -82,12 +81,12 @@ function patch(file, find, replace, label) {
   console.log(`  patched: ${label}`);
 }
 
-console.log("patching baileys rc.9...");
+console.log("patching baileys rc12...");
 
 // "NOT INSTALLED HERE" IS NOT "TARGET VANISHED", and the whole rework turns on
 // that distinction. Without this check a hoisted or absent
-// node_modules/@whiskeysockets/baileys makes all five patches take the
-// missing-file branch, and the install fails with five identical "layout
+// node_modules/@whiskeysockets/baileys makes both patches take the
+// missing-file branch, and the install fails with two identical "layout
 // likely changed, needs manual review" lines - none of which is the actual
 // condition. Exit 0: nothing is unpatched, because there is nothing here to
 // patch, and a workspace that hoists its dependencies elsewhere must not fail
@@ -116,29 +115,6 @@ patch(
   "lidDbMigrated: false",
   "/* lidDbMigrated removed */",
   "lidDbMigrated",
-);
-
-// Patch 3: remove await on noise.finishInit()
-patch(
-  "Socket/socket.js",
-  "await noise.finishInit()",
-  "noise.finishInit()",
-  "noise.finishInit race condition",
-);
-
-// Patch 4: update WA Web version (405 fix)
-patch(
-  "Defaults/index.js",
-  "1027934701",
-  "1034074495",
-  "WA Web version (Defaults)",
-);
-
-patch(
-  "Utils/generics.js",
-  "1027934701",
-  "1034074495",
-  "WA Web version (generics)",
 );
 
 if (unapplied > 0) {
