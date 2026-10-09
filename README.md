@@ -4,14 +4,11 @@ Drive your Claude Code session from WhatsApp — your personal number, no bots, 
 
 The plugin connects to WhatsApp as a **linked device** (the same protocol as WhatsApp Web, via Baileys) and exposes it to Claude Code as an MCP channel. Incoming messages reach your session in real time; Claude replies from your own number, so recipients see a normal chat. Everything runs locally on your machine — messages travel directly between WhatsApp and your session, with no third-party servers in between. Once paired, it keeps working while your phone is off; only the Claude Code session needs to stay open, and reconnects never require re-pairing.
 
-[![Anthropic Published](https://img.shields.io/badge/Anthropic-Official%20Published-ff6b35?logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cGF0aCBkPSJNMTIgMkw0IDIwaDQuNUwxMiA4bDMuNSAxMkgyMEwxMiAyeiIgZmlsbD0id2hpdGUiLz48L3N2Zz4=)](https://claude.com/plugins)
-[![Claude Code Plugin](https://img.shields.io/badge/Claude%20Code-Plugin-blue)](https://claude.com/plugins)
+[![Claude Code Plugin](https://img.shields.io/badge/Claude%20Code-Plugin-blue)](https://code.claude.com/docs/en/plugins)
 [![MCP Server](https://img.shields.io/badge/MCP-Server-green)](https://modelcontextprotocol.io)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-> Published on the [Anthropic Official Plugin Marketplace](https://claude.com/plugins) — the first community-built WhatsApp channel plugin reviewed and published by Anthropic.
-
-![Anthropic Published Status](assets/published-screenshot.png)
+> **Unofficial.** This is a community project, not made or endorsed by Anthropic or Meta. It signs in to a personal WhatsApp account as an unofficial linked device through [Baileys](https://github.com/WhiskeySockets/Baileys), not through Meta's official WhatsApp Business Platform. That may conflict with WhatsApp's Terms of Service and can get the number restricted. Use it at your own risk.
 
 ## Installation
 
@@ -22,6 +19,8 @@ claude --dangerously-load-development-channels plugin:whatsapp-channel@whatsapp-
 ```
 
 The `--dangerously-load-development-channels` flag matters: it registers the plugin as a **channel**, so an inbound WhatsApp message wakes your session immediately. Without it the tools still load, but nothing wakes the session when messages arrive — they sit unanswered until you (or a [watchdog](./scripts/watchdog.sh)) prompt Claude to check. `--channels` does not accept this plugin yet (it is not on the research-preview allowlist), so the development flag is currently the only way.
+
+> **Know what this flag does.** Claude Code warns against loading downloaded channels this way: a loaded channel can put text from other people straight into your session. Read this plugin's code before you use it, keep the [allowlist](./ACCESS.md) to people you trust, and keep permission prompts on. Never combine it with `--dangerously-skip-permissions`: with prompts off, anyone in an allowlisted chat could get Claude to run commands on your computer.
 
 Inside the session, set your number and pair:
 

@@ -3,15 +3,12 @@ name: access
 description: WhatsApp channel access — approve pairings, edit allowlists, set DM/group policy. Use when the user asks to pair, approve someone, check who's allowed, or change policy for the WhatsApp channel, and equally when they ask to add contacts or groups, set up access, or take someone's access away — that is this skill's `review`.
 user-invocable: true
 allowed-tools:
-  - Read
-  - Write
-  - Edit
-  - Bash(ls *)
-  - Bash(mkdir *)
+  - Bash(ls ~/.whatsapp-channel*)
+  - Bash(mkdir -p ~/.whatsapp-channel*)
   - Bash(bun "${CLAUDE_PLUGIN_ROOT}/scripts/access.ts" *)
-  - Read(~/.whatsapp-channel/*)
-  - Write(~/.whatsapp-channel/*)
-  - Edit(~/.whatsapp-channel/*)
+  - Read(~/.whatsapp-channel/**)
+  - Write(~/.whatsapp-channel/**)
+  - Edit(~/.whatsapp-channel/**)
   - AskUserQuestion
 ---
 
