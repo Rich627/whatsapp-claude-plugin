@@ -157,8 +157,8 @@ describe("allowlist", () => {
 
   test("a positional JID (typed by a human) prints unmasked", () => {
     const dir = freshStateDir();
-    const res = run(dir, "allow", "61403911675@s.whatsapp.net");
-    expect(res.out).toContain("Allowed 61403911675@s.whatsapp.net.");
+    const res = run(dir, "allow", "61400011675@s.whatsapp.net");
+    expect(res.out).toContain("Allowed 61400011675@s.whatsapp.net.");
   });
 
   test("removing a contact also forgets their cached name, not just the allowlist entry", () => {
@@ -182,22 +182,22 @@ describe("allowlist", () => {
   test("removing via a LID resolves through lid-map.json to forget the right contacts.json key", () => {
     const dir = freshStateDir();
     run(dir, "allow", "184710990000999@lid");
-    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
-    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
+    writeLidMap(dir, { "184710990000999@lid": "61400011675@s.whatsapp.net" });
+    writeContacts(dir, { "61400011675@s.whatsapp.net": { name: "Rohan" } });
     const res = run(dir, "remove", "184710990000999@lid");
     expect(res.code).toBe(0);
     expect(res.out).toContain("Forgot their cached name too.");
-    expect(readContacts(dir)["61403911675@s.whatsapp.net"]).toBeUndefined();
+    expect(readContacts(dir)["61400011675@s.whatsapp.net"]).toBeUndefined();
   });
 
   test("removal never touches lid-map.json itself", () => {
     const dir = freshStateDir();
     run(dir, "allow", "184710990000999@lid");
-    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
-    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
+    writeLidMap(dir, { "184710990000999@lid": "61400011675@s.whatsapp.net" });
+    writeContacts(dir, { "61400011675@s.whatsapp.net": { name: "Rohan" } });
     run(dir, "remove", "184710990000999@lid");
     const lidMap = JSON.parse(readFileSync(join(dir, "lid-map.json"), "utf8"));
-    expect(lidMap["184710990000999@lid"]).toBe("61403911675@s.whatsapp.net");
+    expect(lidMap["184710990000999@lid"]).toBe("61400011675@s.whatsapp.net");
   });
 
   test("removing a contact also purges their entry in the wizard's recency cache", () => {
@@ -232,29 +232,29 @@ describe("allowlist", () => {
   // relies on (PR #24 review, #3).
   test("revoking one form of a doubly-allowlisted contact keeps the shared cache", () => {
     const dir = freshStateDir();
-    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
-    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Akash" } });
-    writeDmActivity(dir, { "61403911675@s.whatsapp.net": 1000 });
+    writeLidMap(dir, { "184710990000999@lid": "61400011675@s.whatsapp.net" });
+    writeContacts(dir, { "61400011675@s.whatsapp.net": { name: "Akash" } });
+    writeDmActivity(dir, { "61400011675@s.whatsapp.net": 1000 });
     run(dir, "allow", "184710990000999@lid");
-    run(dir, "allow", "61403911675@s.whatsapp.net");
+    run(dir, "allow", "61400011675@s.whatsapp.net");
 
     const { out } = run(dir, "remove", "184710990000999@lid");
     expect(out).toContain("Kept their cached name");
     expect(out).not.toContain("Forgot their cached name");
     // The surviving grant still works, so the name behind it must survive too.
-    expect(readContacts(dir)["61403911675@s.whatsapp.net"]).toEqual({
+    expect(readContacts(dir)["61400011675@s.whatsapp.net"]).toEqual({
       name: "Akash",
     });
-    expect(access(dir).allowFrom).toEqual(["61403911675@s.whatsapp.net"]);
+    expect(access(dir).allowFrom).toEqual(["61400011675@s.whatsapp.net"]);
   });
 
   test("nothing cached: the surviving grant is kept quietly, no invented name claim", () => {
     // Allowlisted by JID, never DMed - so there is no cached name to keep,
     // and saying one was kept is as wrong as saying one was forgotten.
     const dir = freshStateDir();
-    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
+    writeLidMap(dir, { "184710990000999@lid": "61400011675@s.whatsapp.net" });
     run(dir, "allow", "184710990000999@lid");
-    run(dir, "allow", "61403911675@s.whatsapp.net");
+    run(dir, "allow", "61400011675@s.whatsapp.net");
 
     const { out } = run(dir, "remove", "184710990000999@lid");
     expect(out).toContain("Removed 184710990000999@lid.");
@@ -263,15 +263,15 @@ describe("allowlist", () => {
 
   test("revoking the LAST form of that contact does forget them", () => {
     const dir = freshStateDir();
-    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
-    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Akash" } });
+    writeLidMap(dir, { "184710990000999@lid": "61400011675@s.whatsapp.net" });
+    writeContacts(dir, { "61400011675@s.whatsapp.net": { name: "Akash" } });
     run(dir, "allow", "184710990000999@lid");
-    run(dir, "allow", "61403911675@s.whatsapp.net");
+    run(dir, "allow", "61400011675@s.whatsapp.net");
     run(dir, "remove", "184710990000999@lid");
 
-    const { out } = run(dir, "remove", "61403911675@s.whatsapp.net");
+    const { out } = run(dir, "remove", "61400011675@s.whatsapp.net");
     expect(out).toContain("Forgot their cached name");
-    expect(readContacts(dir)["61403911675@s.whatsapp.net"]).toBeUndefined();
+    expect(readContacts(dir)["61400011675@s.whatsapp.net"]).toBeUndefined();
   });
 });
 
@@ -302,11 +302,11 @@ describe("forget", () => {
 
   test("resolves through lid-map.json, same as remove", () => {
     const dir = freshStateDir();
-    writeLidMap(dir, { "184710990000999@lid": "61403911675@s.whatsapp.net" });
-    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Rohan" } });
+    writeLidMap(dir, { "184710990000999@lid": "61400011675@s.whatsapp.net" });
+    writeContacts(dir, { "61400011675@s.whatsapp.net": { name: "Rohan" } });
     const res = run(dir, "forget", "184710990000999@lid");
     expect(res.code).toBe(0);
-    expect(readContacts(dir)["61403911675@s.whatsapp.net"]).toBeUndefined();
+    expect(readContacts(dir)["61400011675@s.whatsapp.net"]).toBeUndefined();
   });
 
   test("nothing cached for the JID fails loudly, not a silent no-op", () => {
@@ -625,7 +625,7 @@ describe("wizard", () => {
 
   test("a synced address book with no activity is enough to open the screen", () => {
     const dir = freshStateDir();
-    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Thilian" } });
+    writeContacts(dir, { "61400011675@s.whatsapp.net": { name: "Thilian" } });
     const res = run(dir, "wizard");
     expect(res.code).toBe(1);
     expect(res.out.toLowerCase()).toContain("needs a real terminal");
@@ -785,7 +785,7 @@ describe("wizard", () => {
 describe("review", () => {
   test("spawn argv + delta + exit 0", () => {
     const dir = freshStateDir();
-    writeContacts(dir, { "61403911675@s.whatsapp.net": { name: "Akash" } });
+    writeContacts(dir, { "61400011675@s.whatsapp.net": { name: "Akash" } });
     const launcher = writeFakeLauncher(
       dir,
       [
@@ -793,7 +793,7 @@ describe("review", () => {
         `  join(dir, "access.json"),`,
         `  JSON.stringify({`,
         `    dmPolicy: "pairing",`,
-        `    allowFrom: ["61403911675@s.whatsapp.net"],`,
+        `    allowFrom: ["61400011675@s.whatsapp.net"],`,
         `    groups: { "1@g.us": { requireMention: false, allowFrom: [], roster: false } },`,
         `    pending: {},`,
         `  }, null, 2),`,
@@ -817,7 +817,7 @@ describe("review", () => {
     );
     expect(res.out).toContain("+ Akash");
     expect(res.out).toContain("(+ = access this grants");
-    expect(res.out).not.toContain("61403911675");
+    expect(res.out).not.toContain("61400011675");
     expect(existsSync(join(dir, ".picker-done"))).toBe(false);
   });
 
@@ -933,16 +933,16 @@ describe("undo", () => {
 
   test("--dry-run after a backed-up change prints a +/- line per changed entry, no raw number, modifies neither file", () => {
     const dir = freshStateDir();
-    run(dir, "allow", "61403911675@s.whatsapp.net");
-    run(dir, "allow", "61432609386@s.whatsapp.net", "--backup");
+    run(dir, "allow", "61400011675@s.whatsapp.net");
+    run(dir, "allow", "61400039386@s.whatsapp.net", "--backup");
     const accessBefore = readFileSync(join(dir, "access.json"), "utf8");
     const bakBefore = readFileSync(join(dir, "access.json.bak"), "utf8");
     const res = run(dir, "undo", "--dry-run");
     expect(res.code).toBe(0);
     expect(res.out).toContain("+");
     expect(res.out).toContain("-");
-    expect(res.out).not.toContain("61403911675");
-    expect(res.out).not.toContain("61432609386");
+    expect(res.out).not.toContain("61400011675");
+    expect(res.out).not.toContain("61400039386");
     expect(readFileSync(join(dir, "access.json"), "utf8")).toBe(accessBefore);
     expect(readFileSync(join(dir, "access.json.bak"), "utf8")).toBe(bakBefore);
   });

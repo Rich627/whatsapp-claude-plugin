@@ -1,10 +1,10 @@
 /**
- * Patches @whiskeysockets/baileys 7.0.0-rc12 connection payload fields.
+ * Patches @whiskeysockets/baileys 7.0.0-rc14 connection payload fields.
  * Runs as a postinstall script — safe to re-run.
  *
  * 1. passive: true → false  (causes device_removed disconnect)
  * 2. delete lidDbMigrated    (unrecognized field, rejected by WA)
- * Noise initialization and the WA Web version use the upstream rc12 fixes.
+ * Noise initialization and the WA Web version use the upstream fixes (rc12 on).
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
@@ -81,7 +81,7 @@ function patch(file, find, replace, label) {
   console.log(`  patched: ${label}`);
 }
 
-console.log("patching baileys rc12...");
+console.log("patching baileys rc14...");
 
 // "NOT INSTALLED HERE" IS NOT "TARGET VANISHED", and the whole rework turns on
 // that distinction. Without this check a hoisted or absent

@@ -325,7 +325,8 @@ A group's `roster` flag is separate from whether Claude can act in the
 group at all. It controls two things together: the `group_roster` MCP
 tool (lists a group's members by name, or a masked number when no name is
 known — never a raw number) and whether `"all"` in the `reply` tool's
-`mentions` array expands to every current participant. Off by default,
+`mentions` array may tag everyone (WhatsApp's own `@all`; past 32 members it
+works only when the linked account is a group admin). Off by default,
 same as everything else here — granting it means Claude can see who is in
 the group, not just reply in it.
 

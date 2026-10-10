@@ -3,11 +3,11 @@ import { looksLikeNumber, maskJid, maskNumber } from "./mask";
 
 describe("maskNumber", () => {
   test("bare phone number shows only the last 4 digits", () => {
-    expect(maskNumber("918419935122")).toBe("•••••5122");
+    expect(maskNumber("918000005122")).toBe("•••••5122");
   });
 
   test("full JID: domain suffix is stripped before masking", () => {
-    expect(maskNumber("61403911675@s.whatsapp.net")).toBe("•••••1675");
+    expect(maskNumber("61400011675@s.whatsapp.net")).toBe("•••••1675");
   });
 
   test("LID JID: same treatment, no @lid leaking through", () => {
@@ -18,7 +18,7 @@ describe("maskNumber", () => {
     // A 15-digit and an 11-digit number produce masks of the same length -
     // digit count itself is information (country code, format) and must
     // not leak through the mask's length.
-    const short = maskNumber("61403911675");
+    const short = maskNumber("61400011675");
     const long = maskNumber("447123456789012");
     expect(short.length).toBe(long.length);
   });
@@ -29,13 +29,13 @@ describe("maskNumber", () => {
   });
 
   test("non-digit punctuation (+, spaces, dashes) is stripped first", () => {
-    expect(maskNumber("+61 403 911 675")).toBe("•••••1675");
+    expect(maskNumber("+61 400 011 675")).toBe("•••••1675");
   });
 });
 
 describe("looksLikeNumber", () => {
   test("a bare digit string looks like a number", () => {
-    expect(looksLikeNumber("61403911675")).toBe(true);
+    expect(looksLikeNumber("61400011675")).toBe(true);
   });
 
   test("with +, spaces, dashes, parens still counts as number-shaped", () => {
@@ -63,10 +63,10 @@ describe("looksLikeNumber", () => {
   });
 
   test("a number embedded in other text is still caught, not just a pure number", () => {
-    // A .notify like "call 0403911675" is not ITSELF just a number, but it
+    // A .notify like "call 0400011675" is not ITSELF just a number, but it
     // still leaks the embedded one - the whole point of this check.
-    expect(looksLikeNumber("call 0403911675")).toBe(true);
-    expect(looksLikeNumber("WhatsApp: 0403 911 675")).toBe(true);
+    expect(looksLikeNumber("call 0400011675")).toBe(true);
+    expect(looksLikeNumber("WhatsApp: 0400 011 675")).toBe(true);
   });
 
   test("a short embedded digit run (under 6 digits) is not flagged", () => {
@@ -77,7 +77,7 @@ describe("looksLikeNumber", () => {
 
 describe("maskJid", () => {
   test("a user JID is masked", () => {
-    expect(maskJid("61403911675@s.whatsapp.net")).toBe("•••••1675");
+    expect(maskJid("61400011675@s.whatsapp.net")).toBe("•••••1675");
   });
 
   test("a LID is masked too - it carries real digits", () => {
@@ -85,17 +85,17 @@ describe("maskJid", () => {
   });
 
   test("a modern group JID passes through whole: it is the debug handle", () => {
-    expect(maskJid("120363427665348138@g.us")).toBe("120363427665348138@g.us");
+    expect(maskJid("120363000000008138@g.us")).toBe("120363000000008138@g.us");
   });
 
   test("a LEGACY group or broadcast JID has its creator's number masked, timestamp kept", () => {
     // The case the first version of maskJid got wrong: a bare @g.us
     // passthrough writes <creator-phone>-<created-at> to the diag log intact.
-    expect(maskJid("61403911675-1443627404@g.us")).toBe(
-      "•••••1675-1443627404@g.us",
+    expect(maskJid("61400011675-1400000000@g.us")).toBe(
+      "•••••1675-1400000000@g.us",
     );
-    expect(maskJid("61403911675-1443627404@broadcast")).toBe(
-      "•••••1675-1443627404@broadcast",
+    expect(maskJid("61400011675-1400000000@broadcast")).toBe(
+      "•••••1675-1400000000@broadcast",
     );
   });
 
@@ -103,8 +103,8 @@ describe("maskJid", () => {
     // Off the wire a jid can be <number>:<device>@…; unstripped, the ":12"
     // is absorbed into the digit run and the same person renders two ways
     // depending on which call site normalized first.
-    expect(maskJid("61403911675:12@s.whatsapp.net")).toBe(
-      maskJid("61403911675@s.whatsapp.net"),
+    expect(maskJid("61400011675:12@s.whatsapp.net")).toBe(
+      maskJid("61400011675@s.whatsapp.net"),
     );
   });
 
