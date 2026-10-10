@@ -13,7 +13,12 @@
       "env": {
         "WHATSAPP_TRANSCRIPTION_PROVIDER": "${user_config.transcription_provider}",
         "WHATSAPP_GROQ_API_KEY": "${user_config.groq_api_key}",
-        "WHATSAPP_OPENAI_API_KEY": "${user_config.openai_api_key}"
+        "WHATSAPP_OPENAI_API_KEY": "${user_config.openai_api_key}",
+        "WHATSAPP_PROVIDER": "${user_config.connection_provider}",
+        "WHATSAPP_CLOUD_PHONE_NUMBER_ID": "${user_config.cloud_phone_number_id}",
+        "WHATSAPP_CLOUD_ACCESS_TOKEN": "${user_config.cloud_access_token}",
+        "WHATSAPP_CLOUD_APP_SECRET": "${user_config.cloud_app_secret}",
+        "WHATSAPP_CLOUD_VERIFY_TOKEN": "${user_config.cloud_verify_token}"
       }
     }
   }

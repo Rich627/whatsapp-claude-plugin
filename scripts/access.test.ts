@@ -41,6 +41,62 @@ function runEnv(
   }
 }
 
+describe("Cloud permission owner status", () => {
+  test("never reports a customer as the fallback approver", () => {
+    const dir = freshStateDir();
+    try {
+      writeFileSync(
+        join(dir, ".env"),
+        "WHATSAPP_PROVIDER=cloud-api\nWHATSAPP_CLOUD_ACCESS_TOKEN=test-private-token\n",
+      );
+      writeFileSync(
+        join(dir, "access.json"),
+        JSON.stringify({
+          dmPolicy: "allowlist",
+          allowFrom: ["886900000001@s.whatsapp.net"],
+          groups: {},
+          pending: {},
+        }),
+      );
+      const { out, code } = run(dir, "status");
+      expect(code).toBe(0);
+      expect(out).toContain("owner:      (none)");
+      expect(out).toContain("Cloud has no fallback owner");
+      expect(out).not.toContain("falling back to allowFrom[0]");
+      expect(out).not.toContain("permission requests go here");
+      expect(out).not.toContain("test-private-token");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("revoked and LID owners never advertise a usable Cloud recipient", () => {
+    const dir = freshStateDir();
+    try {
+      for (const owner of ["886900000009@s.whatsapp.net", "12345@lid"]) {
+        writeFileSync(
+          join(dir, "access.json"),
+          JSON.stringify({
+            dmPolicy: "allowlist",
+            allowFrom: ["886900000001@s.whatsapp.net", "12345@lid"],
+            owner,
+            groups: {},
+            pending: {},
+          }),
+        );
+        const { out } = runEnv(
+          dir,
+          { WHATSAPP_PROVIDER: "cloud-api" },
+          "status",
+        );
+        expect(out).toContain("NO VALID CLOUD OWNER");
+        expect(out).not.toContain("requests go to your own chat");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // Stands in for the terminal launcher. Prints the argv it was handed (so the
 // test can assert what the platform branch would have run), optionally edits
 // access.json via `body`, then writes the done marker the way the real

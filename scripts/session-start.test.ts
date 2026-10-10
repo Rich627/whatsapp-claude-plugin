@@ -1,6 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,10 +23,23 @@ const PLUGIN_VERSION: string = JSON.parse(
   ),
 ).version;
 
+const fixtures: string[] = [];
+afterAll(() => {
+  for (const dir of fixtures) rmSync(dir, { recursive: true, force: true });
+});
+
 function runHookRaw(dir: string): Record<string, any> {
   return JSON.parse(
     execFileSync("bash", [HOOK], {
-      env: { ...process.env, WHATSAPP_STATE_DIR: dir },
+      env: {
+        ...process.env,
+        WHATSAPP_STATE_DIR: dir,
+        WHATSAPP_PROVIDER: "",
+        WHATSAPP_CLOUD_PHONE_NUMBER_ID: "",
+        WHATSAPP_CLOUD_ACCESS_TOKEN: "",
+        WHATSAPP_CLOUD_APP_SECRET: "",
+        WHATSAPP_CLOUD_VERIFY_TOKEN: "",
+      },
       encoding: "utf8",
     }),
   );
@@ -34,6 +53,7 @@ function runHook(dir: string): string {
 // everywhere (JSON.stringify(x, null, 2)).
 function configuredStateDir(opts: { allowFrom: string[] }): string {
   const dir = mkdtempSync(join(tmpdir(), "wa-hook-"));
+  fixtures.push(dir);
   writeFileSync(join(dir, ".env"), "WHATSAPP_PHONE_NUMBER=886900000000\n");
   mkdirSync(join(dir, ".baileys_auth"));
   writeFileSync(
@@ -55,6 +75,16 @@ function configuredStateDir(opts: { allowFrom: string[] }): string {
 }
 
 describe("session-start.sh", () => {
+  test("legacy state defers to the effective MCP provider before pairing guidance", () => {
+    const dir = configuredStateDir({ allowFrom: [] });
+    const message = runHook(dir);
+    expect(message).toContain("linked-device mode only");
+    expect(message).toContain("Plugin userConfig may select Cloud API");
+    expect(message.indexOf("Check the effective connection")).toBeLessThan(
+      message.indexOf("owner JID is auto-added"),
+    );
+  });
+
   // Regression: the old check grepped the file for compact
   // '"allowFrom":[".' and never matched the pretty-printed form everything
   // writes, so every configured install was greeted as having no contacts.
@@ -129,6 +159,82 @@ describe("session-start.sh", () => {
     );
     expect(out.hookSpecificOutput.additionalContext).toContain(
       "fully configured and ready",
+    );
+  });
+});
+
+describe("Cloud API session onboarding", () => {
+  function cloudState(complete = true, owner = false): string {
+    const dir = configuredStateDir({
+      allowFrom: owner ? ["12345@s.whatsapp.net"] : [],
+    });
+    writeFileSync(
+      join(dir, ".env"),
+      "WHATSAPP_PROVIDER=cloud-api\n" +
+        (complete
+          ? "WHATSAPP_CLOUD_PHONE_NUMBER_ID=123456789\nWHATSAPP_CLOUD_ACCESS_TOKEN=fixture-private-token\nWHATSAPP_CLOUD_APP_SECRET=fixture-private-secret\nWHATSAPP_CLOUD_VERIFY_TOKEN=fixture-private-verify\n"
+          : ""),
+    );
+    if (owner)
+      writeFileSync(
+        join(dir, "access.json"),
+        JSON.stringify({
+          dmPolicy: "allowlist",
+          allowFrom: ["12345@s.whatsapp.net"],
+          owner: "12345@s.whatsapp.net",
+          groups: {},
+        }),
+      );
+    return dir;
+  }
+
+  test("unconfigured installation offers both providers", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wa-hook-empty-"));
+    fixtures.push(dir);
+    const out = runHook(dir);
+    expect(out).toContain("choose linked device");
+    expect(out).toContain("official WhatsApp Cloud API");
+    expect(out).not.toContain("provide their WhatsApp phone number");
+  });
+
+  test("Cloud configuration does not claim webhook delivery or prompt phone pairing", () => {
+    const out = runHook(cloudState());
+    expect(out).toContain("configuration is present");
+    expect(out).toContain("does not verify inbound webhook delivery");
+    expect(out).toContain("explicitly allowlisted personal owner");
+    expect(out).not.toContain("fully configured and ready");
+    expect(out).not.toContain("pairing code");
+    for (const secret of [
+      "fixture-private-token",
+      "fixture-private-secret",
+      "fixture-private-verify",
+    ])
+      expect(out).not.toContain(secret);
+  });
+
+  test("missing credentials directs to private terminal setup", () => {
+    const out = runHook(cloudState(false));
+    expect(out).toContain("incomplete or invalid");
+    expect(out).toContain("configure provider cloud-api");
+    expect(out).toContain("never paste access tokens");
+    expect(out).not.toContain("Enter it on phone");
+  });
+
+  test("explicit allowed owner removes the owner onboarding warning", () => {
+    const out = runHook(cloudState(true, true));
+    expect(out).not.toContain("Set an explicitly allowlisted personal owner");
+    expect(out).toContain("test an approved personal DM");
+  });
+
+  test("Cloud configurations receive release notices without claiming connection", () => {
+    const dir = cloudState(true, true);
+    writeFileSync(join(dir, ".last-seen-version"), "0.9.0");
+    const out = runHookRaw(dir);
+    expect(out.systemMessage).toContain(
+      `WhatsApp plugin updated to v${PLUGIN_VERSION}`,
+    );
+    expect(out.hookSpecificOutput.additionalContext).toContain(
+      "does not verify inbound webhook delivery",
     );
   });
 });

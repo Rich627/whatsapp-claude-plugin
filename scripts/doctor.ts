@@ -28,6 +28,12 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { CRON_SECTION_RE, parseCronSection } from "../lib/cron";
+import { readCloudApiConfig } from "../lib/cloud-api";
+import {
+  channelProvider,
+  stateEnvironment,
+  type ChannelProvider,
+} from "../lib/provider";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -189,6 +195,94 @@ function checkStateDir(): boolean {
   return true;
 }
 
+function checkProvider(): ChannelProvider | null {
+  const env = stateEnvironment(join(STATE_DIR, ".env"));
+  let provider: ChannelProvider;
+  try {
+    provider = channelProvider(env);
+  } catch {
+    report(
+      "ERROR",
+      "provider",
+      "WHATSAPP_PROVIDER must be baileys or cloud-api",
+      {
+        kind: "manual",
+        text: "Run /whatsapp-channel:configure provider in your own terminal",
+      },
+    );
+    return null;
+  }
+  report(
+    "INFO",
+    "provider",
+    provider === "baileys"
+      ? "linked device (Baileys)"
+      : "official WhatsApp Cloud API",
+  );
+  if (provider === "cloud-api") {
+    try {
+      readCloudApiConfig(env);
+      report(
+        "PASS",
+        "cloud-config",
+        "required configuration is present and valid (not a connection or delivery test)",
+      );
+    } catch {
+      report(
+        "ERROR",
+        "cloud-config",
+        "required Cloud API configuration is incomplete or invalid",
+        {
+          kind: "manual",
+          text: "Run /whatsapp-channel:configure provider cloud-api in your own terminal; never send credentials in chat",
+        },
+      );
+    }
+    report(
+      "INFO",
+      "cloud-webhook",
+      "inbound delivery is unverified: check public HTTPS callback, verify token, app-secret signatures and WABA messages subscription; test an approved DM",
+    );
+  }
+  return provider;
+}
+
+function checkCloudAccess(acc: AccessShape | null): void {
+  if (
+    !acc?.owner ||
+    !/^\d{5,20}@s\.whatsapp\.net$/.test(acc.owner) ||
+    !acc.allowFrom.includes(acc.owner)
+  ) {
+    report(
+      "WARN",
+      "cloud-owner",
+      "no explicitly allowlisted personal owner; Cloud API never auto-adds the business number",
+      {
+        kind: "manual",
+        text: "Run /whatsapp-channel:access allow <digits>@s.whatsapp.net, then /whatsapp-channel:access set owner <digits>@s.whatsapp.net",
+      },
+    );
+  } else {
+    report(
+      "PASS",
+      "cloud-owner",
+      "an allowlisted phone owner is configured; runtime status must confirm it differs from the business number",
+    );
+  }
+  if (acc && Object.keys(acc.groups).length > 0)
+    report(
+      "WARN",
+      "cloud-groups",
+      "configured groups are inactive: this plugin's Cloud API provider supports DMs only",
+    );
+  if (acc?.dmPolicy === "disabled")
+    report(
+      "WARN",
+      "cloud-access",
+      "DMs are disabled; this provider has no active group route",
+    );
+}
+
 function checkAuth(): void {
   if (!existsSync(CREDS_FILE)) {
     report(
@@ -277,7 +371,7 @@ function checkServer(): void {
     report(
       "ERROR",
       "server",
-      `orphaned server (pid ${pid}, parent dead) is holding the Baileys session — no new session can connect until it exits`,
+      `orphaned server (pid ${pid}, parent dead) is holding the channel singleton lock — no new session can connect until it exits`,
       {
         kind: "safe",
         text: `kill ${pid}   # wait ~5s; if still alive: kill -9 ${pid} && rm ${JSON.stringify(LOCK_FILE)}`,
@@ -301,6 +395,7 @@ function checkServer(): void {
 const VALID_POLICIES = ["pairing", "allowlist", "disabled"];
 
 type AccessShape = {
+  owner?: string;
   dmPolicy: string;
   allowFrom: unknown[];
   groups: Record<string, unknown>;
@@ -715,12 +810,14 @@ function checkDiskUsage(): void {
 try {
   checkEnv();
   if (checkStateDir()) {
-    checkAuth();
+    const provider = checkProvider();
+    if (provider === "baileys") checkAuth();
     checkServer();
     const acc = checkAccess();
+    if (provider === "cloud-api") checkCloudAccess(acc);
     checkActivity();
     checkTranscription();
-    checkGroupConfigs(acc);
+    if (provider === "baileys") checkGroupConfigs(acc);
     checkWatchdog();
     checkDiskUsage();
   }
