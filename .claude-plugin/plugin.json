@@ -1,8 +1,8 @@
 {
   "name": "whatsapp-channel",
   "displayName": "WhatsApp Channel for Claude Code",
-  "description": "WhatsApp channel for Claude Code — linked-device messaging bridge with built-in access control. Manage pairing, allowlists, and policy via /whatsapp-channel:access.",
-  "version": "0.26.2",
+  "description": "WhatsApp channel for Claude Code \u2014 choose linked-device messaging or official Cloud API, with built-in access control.",
+  "version": "0.27.0",
   "author": {
     "name": "Rich627"
   },
@@ -27,6 +27,34 @@
       "type": "string",
       "title": "OpenAI API key",
       "description": "Only used when the provider is openai. Voice notes are sent to api.openai.com for transcription.",
+      "sensitive": true
+    },
+    "connection_provider": {
+      "type": "string",
+      "title": "WhatsApp connection",
+      "description": "baileys (default, linked device) or cloud-api (official business DMs). Leave empty to use terminal setup."
+    },
+    "cloud_phone_number_id": {
+      "type": "string",
+      "title": "Cloud API phone number ID",
+      "description": "Meta phone number ID, not your phone number. Only used with cloud-api."
+    },
+    "cloud_access_token": {
+      "type": "string",
+      "title": "Cloud API access token",
+      "description": "Only used with cloud-api. Kept in your keychain when configured here.",
+      "sensitive": true
+    },
+    "cloud_app_secret": {
+      "type": "string",
+      "title": "Meta app secret",
+      "description": "Validates signed Cloud API webhooks. Only used with cloud-api.",
+      "sensitive": true
+    },
+    "cloud_verify_token": {
+      "type": "string",
+      "title": "Cloud webhook verify token",
+      "description": "Your chosen callback verification token; enter the same value in Meta. Only used with cloud-api.",
       "sensitive": true
     }
   }

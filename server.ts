@@ -2,12 +2,12 @@
 /**
  * WhatsApp channel for Claude Code.
  *
- * Self-contained MCP server using Baileys (linked-device protocol) with full
+ * MCP server using Baileys or the official WhatsApp Cloud API with full
  * access control: pairing, allowlists, group support with mention-triggering.
  * State lives in ~/.whatsapp-channel/ — managed by /whatsapp-channel:access.
  *
- * WhatsApp has no bot API — this connects as a linked device (like WhatsApp Web).
- * First-time setup requires entering a pairing code on your phone (Linked Devices).
+ * Baileys links a device; Cloud API receives signed webhooks for business DMs.
+ * /whatsapp-channel:setup selects the connection and configures access.
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -33,6 +33,8 @@ import makeWASocket, {
   type BaileysEventMap,
   type proto,
 } from "@whiskeysockets/baileys";
+import { CloudApiSocket, readCloudApiConfig, type Json } from "./lib/cloud-api";
+import { channelProvider, configuredValue } from "./lib/provider";
 import { randomBytes, timingSafeEqual } from "crypto";
 import { execFile, execFileSync } from "child_process";
 import { promisify } from "util";
@@ -169,7 +171,12 @@ try {
   const envText = envRaw.charCodeAt(0) === 0xfeff ? envRaw.slice(1) : envRaw;
   for (const line of envText.split(/\r?\n/)) {
     const m = line.match(/^(\w+)=(.*)$/);
-    if (m && process.env[m[1]] === undefined) {
+    if (
+      m &&
+      (process.env[m[1]] === undefined ||
+        ((m[1] === "WHATSAPP_PROVIDER" || m[1].startsWith("WHATSAPP_CLOUD_")) &&
+          !configuredValue(process.env[m[1]])))
+    ) {
       process.env[m[1]] = m[2]
         .replace(/\r$/, "")
         .replace(/^(['"])(.*)\1$/, "$2");
@@ -177,6 +184,7 @@ try {
   }
 } catch {}
 
+const PROVIDER = channelProvider(process.env);
 const PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER;
 const STATIC = process.env.WHATSAPP_ACCESS_MODE === "static";
 // On by default: contacts.json/dm-activity.json cache the display name and
@@ -246,7 +254,10 @@ function logDiag(line: string): void {
   }
 }
 
-mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
+mkdirSync(PROVIDER === "baileys" ? AUTH_DIR : STATE_DIR, {
+  recursive: true,
+  mode: 0o700,
+});
 mkdirSync(INBOX_DIR, { recursive: true });
 
 // ─── Single-instance lock ──────────────────────────────────────────────
@@ -1446,7 +1457,7 @@ function contactKey(jid: string): string {
 // fallback before gate() runs, so a decryptable message is never dropped
 // just because our passive cache missed the event.
 async function ensureLidResolved(jid: string): Promise<void> {
-  if (!isLidUser(jid) || !sock) return;
+  if (!isLidUser(jid) || !sock || sock instanceof CloudApiSocket) return;
   const normalized = jidNormalizedUser(jid);
   if (lidMap[normalized]) return;
   try {
@@ -1738,9 +1749,7 @@ function lastAddressBookSyncMs(): number {
   }
 }
 
-async function syncSavedNamesOnce(
-  activeSock: NonNullable<typeof sock>,
-): Promise<void> {
+async function syncSavedNamesOnce(activeSock: WASocket): Promise<void> {
   if (!CACHE_CONTACTS) return;
   reloadContactsMap();
   if (hasSavedName(contactsMap)) return;
@@ -2295,6 +2304,23 @@ async function sendTracked(
   const sent = await sock!.sendMessage(jid, content);
   if (sent?.key) trackSent(sent.key);
   return sent;
+}
+
+async function downloadChannelMedia(message: WAMessage): Promise<Buffer> {
+  if (!sock) throw new Error("WhatsApp not connected");
+  if (sock instanceof CloudApiSocket) {
+    assertAllowedChat(message.key.remoteJid ?? "");
+    return sock.downloadMedia(message);
+  }
+  return (await downloadMediaMessage(
+    message,
+    "buffer",
+    {},
+    {
+      reuploadRequest: sock.updateMediaMessage,
+      logger: silentLogger,
+    },
+  )) as Buffer;
 }
 
 // durableSentIds is sent.jsonl read back, so it survives a restart; it is
@@ -2937,7 +2963,7 @@ function mimeForExt(ext: string): string {
 
 // ─── MCP Server ────────────────────────────────────────────────────────
 
-let sock: WASocket | null = null;
+let sock: WASocket | CloudApiSocket | null = null;
 let ownJid = "";
 
 const mcp = new Server(
@@ -2966,6 +2992,11 @@ const mcp = new Server(
           ]
         : []),
       "The sender reads WhatsApp, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.",
+      ...(PROVIDER === "cloud-api"
+        ? [
+            "This account uses official Cloud API business DMs. Groups, mentions, message editing and linked-device pairing are unavailable in this mode. Free-form replies require a 24-hour customer service window; outside it, send_template can send an approved template to an opted-in, allowlisted contact. Do not invent template names or silently substitute a template after a reply error. Cloud permission requests require an explicitly configured, still-allowlisted personal owner. A ready local webhook does not prove public delivery; do not claim connected end-to-end without a test DM.",
+          ]
+        : []),
       "",
       ...(AUTO_NOTIFY
         ? [
@@ -3011,6 +3042,16 @@ const mcp = new Server(
 let warnedStaleOwner = "";
 function permissionTarget(access: Access): string | undefined {
   const stored = access.owner;
+  // A business number is not the human approver. Cloud requires an explicit,
+  // still-allowlisted owner; never select the first customer or self-chat.
+  if (PROVIDER === "cloud-api") {
+    return stored &&
+      /^\d{5,20}@s\.whatsapp\.net$/.test(stored) &&
+      isAllowedJid(stored, access.allowFrom) &&
+      (!ownJid || !isAllowedJid(stored, [ownJid]))
+      ? stored
+      : undefined;
+  }
   // REVALIDATED ON EVERY READ, not just when it is written. `set owner` now
   // requires an allowlisted contact, but NOTHING kept that true afterwards:
   // `access remove`, the wizard's revoke path and ownerStamp (which returns
@@ -3251,6 +3292,33 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
       }
     : {
         tools: [
+          ...(PROVIDER === "cloud-api"
+            ? [
+                {
+                  name: "send_template",
+                  annotations: {
+                    title: "Send approved WhatsApp template",
+                    readOnlyHint: false,
+                    destructiveHint: false,
+                  },
+                  description:
+                    "Cloud API only: send a Meta-approved message template to an allowlisted DM. Use outside the 24-hour service window. The recipient must have opted in. Meta fees may apply. Supply the approved template name, language code and optional components exactly as configured in Meta.",
+                  inputSchema: {
+                    type: "object",
+                    properties: {
+                      chat_id: { type: "string" },
+                      name: { type: "string" },
+                      language: {
+                        type: "string",
+                        description: "Approved language code, e.g. en_US",
+                      },
+                      components: { type: "array", items: { type: "object" } },
+                    },
+                    required: ["chat_id", "name", "language"],
+                  },
+                },
+              ]
+            : []),
           {
             name: "reply",
             annotations: {
@@ -3446,7 +3514,38 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
               required: ["chat_id"],
             },
           },
-        ],
+        ]
+          .filter(
+            (tool) =>
+              PROVIDER !== "cloud-api" ||
+              !["edit_message", "list_groups", "group_roster"].includes(
+                tool.name,
+              ),
+          )
+          .map((tool) => {
+            if (PROVIDER !== "cloud-api") return tool;
+            if (tool.name === "reply")
+              return {
+                ...tool,
+                description:
+                  "Reply to an allowlisted Cloud API DM during an open 24-hour service window. Supports quote replies and supported media files. Outside the window use an explicitly approved send_template; mentions and groups are unavailable.",
+                inputSchema: {
+                  ...tool.inputSchema,
+                  properties: Object.fromEntries(
+                    Object.entries(tool.inputSchema.properties ?? {}).filter(
+                      ([name]) => name !== "mentions",
+                    ),
+                  ),
+                },
+              };
+            if (tool.name === "status")
+              return {
+                ...tool,
+                description:
+                  "Get Cloud API configuration and local webhook listener status. Public HTTPS delivery and WABA subscription require a real test DM; no device pairing is used.",
+              };
+            return tool;
+          }),
       },
 );
 
@@ -3478,6 +3577,48 @@ const handleToolCall = async (
       );
     }
     switch (req.params.name) {
+      case "send_template": {
+        if (!(sock instanceof CloudApiSocket))
+          throw new Error(
+            "send_template requires a connected Cloud API provider",
+          );
+        const template = z
+          .object({
+            chat_id: z.string(),
+            name: z
+              .string()
+              .regex(/^[a-z0-9_]+$/)
+              .max(512),
+            language: z.string().regex(/^[a-z]{2,3}(?:_[A-Z]{2})?$/),
+            components: z.array(z.record(z.string(), z.unknown())).optional(),
+          })
+          .parse(args);
+        assertAllowedChat(template.chat_id);
+        const sent = await sock.sendTemplate(template.chat_id, {
+          name: template.name,
+          language: template.language,
+          components: template.components as Json[] | undefined,
+        });
+        if (sent?.key) trackSent(sent.key);
+        persistMessage({
+          id: sent?.key.id ?? `template-${Date.now()}`,
+          chat_id: template.chat_id,
+          user: "You",
+          user_id: sock.user?.id ?? "self",
+          text: `(template: ${template.name})`,
+          ts: new Date().toISOString(),
+          replied: true,
+          direction: "out",
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `template sent (id: ${sent?.key.id ?? "unknown"})`,
+            },
+          ],
+        };
+      }
       case "reply": {
         const chat_id = args.chat_id as string;
         const text = args.text as string;
@@ -3491,6 +3632,10 @@ const handleToolCall = async (
         // this call isn't even allowed to send to.
         assertAllowedChat(chat_id);
         if (!sock) throw new Error("WhatsApp not connected");
+        if (sock instanceof CloudApiSocket && rawMentions.length)
+          throw new Error(
+            "Mentions are not supported by this plugin's Cloud API mode",
+          );
 
         // Taken before the first await in this handler, not after the send:
         // see markReplied. Anything that lands in this chat from here on is
@@ -3527,6 +3672,14 @@ const handleToolCall = async (
 
         for (const f of files) {
           assertSendable(f);
+          if (
+            sock instanceof CloudApiSocket &&
+            [".mov", ".avi", ".gif", ".wav"].includes(extname(f).toLowerCase())
+          ) {
+            throw new Error(
+              "Cloud API does not accept this media format; use MP4 video, JPEG/PNG images or MP3/OGG audio",
+            );
+          }
           const st = statSync(f);
           if (st.size > MAX_ATTACHMENT_BYTES) {
             throw new Error(
@@ -3580,7 +3733,12 @@ const handleToolCall = async (
           const docSent = await sock.sendMessage(chat_id, {
             document: readFileSync(docPath),
             fileName: `response${ext}`,
-            mimetype: hasMarkdown ? "text/markdown" : "text/plain",
+            mimetype:
+              sock instanceof CloudApiSocket
+                ? "text/plain"
+                : hasMarkdown
+                  ? "text/markdown"
+                  : "text/plain",
           });
           if (docSent?.key) {
             trackSent(docSent.key);
@@ -3618,17 +3776,35 @@ const handleToolCall = async (
           const ext = extname(f).toLowerCase();
           const buf = readFileSync(f);
           let sent: WAMessage | undefined;
-          if (PHOTO_EXTS.has(ext)) {
+          if (sock instanceof CloudApiSocket && ext === ".webp") {
+            sent = await sock.sendMessage(chat_id, { sticker: buf });
+          } else if (PHOTO_EXTS.has(ext)) {
             sent = (await sock.sendMessage(chat_id, { image: buf })) as
               WAMessage | undefined;
           } else if ([".mp4", ".mov", ".avi"].includes(ext)) {
-            sent = (await sock.sendMessage(chat_id, { video: buf })) as
-              WAMessage | undefined;
+            sent = (await sock.sendMessage(chat_id, {
+              video: buf,
+              ...(sock instanceof CloudApiSocket
+                ? { mimetype: "video/mp4" }
+                : {}),
+            })) as WAMessage | undefined;
+          } else if (
+            sock instanceof CloudApiSocket &&
+            [".mp3", ".ogg", ".m4a"].includes(ext)
+          ) {
+            sent = await sock.sendMessage(chat_id, {
+              audio: buf,
+              mimetype: mimeForExt(ext),
+            });
           } else {
             sent = (await sock.sendMessage(chat_id, {
               document: buf,
               fileName: basename(f),
-              mimetype: mimeForExt(ext),
+              mimetype:
+                sock instanceof CloudApiSocket &&
+                [".md", ".txt", ".csv", ".json", ".html"].includes(ext)
+                  ? "text/plain"
+                  : mimeForExt(ext),
             })) as WAMessage | undefined;
           }
           if (sent?.key) {
@@ -3690,15 +3866,7 @@ const handleToolCall = async (
             "Message not found in store — it may have expired. Ask the sender to resend.",
           );
 
-        const buffer = (await downloadMediaMessage(
-          proto,
-          "buffer",
-          {},
-          {
-            reuploadRequest: sock.updateMediaMessage,
-            logger: silentLogger,
-          },
-        )) as Buffer;
+        const buffer = await downloadChannelMedia(proto);
         if (!buffer || buffer.length === 0)
           throw new Error("Download returned empty buffer");
 
@@ -3737,9 +3905,26 @@ const handleToolCall = async (
       }
 
       case "status": {
+        if (PROVIDER === "cloud-api") {
+          const cloud = sock instanceof CloudApiSocket ? sock : undefined;
+          const access = loadAccess();
+          const lines = [
+            "Provider: official WhatsApp Cloud API",
+            cloud
+              ? `Local webhook listener ready: ${JSON.stringify(cloud.status())}`
+              : "Cloud API is not ready. Check configuration and diag.log.",
+            "Listener readiness does not verify public HTTPS delivery or WABA subscription; send a test DM.",
+            `DM policy: ${access.dmPolicy}`,
+            `Allowed contacts: ${access.allowFrom.length}`,
+            `Permission owner: ${permissionTarget(access) ? "configured" : "missing or revoked; set an allowlisted personal contact as owner"}`,
+            "Supported: DMs, replies, reactions, attachments, approved templates. Groups and message editing are unavailable in this mode.",
+            "Free-form replies require an open 24-hour service window. Meta fees and AI-provider rules apply.",
+          ];
+          return { content: [{ type: "text", text: lines.join("\n") }] };
+        }
         const connected = sock !== null;
         const paired = ownJid !== "";
-        const lines: string[] = [];
+        const lines: string[] = ["Provider: linked device (Baileys)"];
         if (paired) {
           lines.push(`Connected as ${ownJid}`);
           const access = loadAccess();
@@ -4789,15 +4974,7 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
     if (media.kind === "image") {
       // Eager download for images (small, commonly sent)
       try {
-        const buffer = (await downloadMediaMessage(
-          msg,
-          "buffer",
-          {},
-          {
-            reuploadRequest: sock!.updateMediaMessage,
-            logger: silentLogger,
-          },
-        )) as Buffer;
+        const buffer = await downloadChannelMedia(msg);
         const ext = mimeToExt(media.mime);
         const path = join(
           INBOX_DIR,
@@ -4823,15 +5000,7 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
     } else if (media.kind === "voice" || media.kind === "audio") {
       // Eager download + transcribe voice/audio messages
       try {
-        const buffer = (await downloadMediaMessage(
-          msg,
-          "buffer",
-          {},
-          {
-            reuploadRequest: sock!.updateMediaMessage,
-            logger: silentLogger,
-          },
-        )) as Buffer;
+        const buffer = await downloadChannelMedia(msg);
         const ext = mimeToExt(media.mime);
         const audioPath = join(
           INBOX_DIR,
@@ -5047,7 +5216,7 @@ let pairingGeneration = 0;
 // user. Reusing the existing code keeps whatever we already showed them valid
 // across reconnects, so they don't have to retype on every 428.
 async function requestAndAnnouncePairingCode(
-  targetSock: NonNullable<typeof sock>,
+  targetSock: WASocket,
 ): Promise<void> {
   // requestPairingCode sends an IQ over the live socket and can hang forever
   // if that socket is already dead — race it against the socket closing and a
@@ -5127,13 +5296,98 @@ async function resolveWaWebVersion(): Promise<[number, number, number]> {
   return waVersion;
 }
 
+type PermissionReaction = {
+  key: WAMessageKey;
+  reaction: { text: string; key?: WAMessageKey };
+};
+
+async function handlePermissionReactions(
+  reactions: PermissionReaction[],
+): Promise<void> {
+  for (const { key, reaction } of reactions) {
+    if (!key.id) continue;
+    const pending = permissionMessageMap.get(key.id);
+    if (!pending) continue;
+    const emoji = reaction.text;
+    const isApprove = ["👍", "✅", "👌", "🆗"].includes(emoji);
+    const isDeny = ["👎", "❌", "🚫", "✋"].includes(emoji);
+    if (!isApprove && !isDeny) continue;
+    const reactorJid =
+      reaction.key?.participant ?? reaction.key?.remoteJid ?? "";
+    // Same normalizing comparison claimPermission uses, for the same
+    // reason: the owner reaches us as @lid or as a phone jid depending on
+    // the path. A mismatch is dropped WITHOUT deleting the entry, so the
+    // owner's own reaction still works afterwards.
+    if (!reactorJid || !isAllowedJid(reactorJid, [pending.chatId])) {
+      logDiag(
+        `${LOG_PREFIX}: ignored permission reaction from ${reactorJid ? maskJid(reactorJid) : "unknown"} (not the chat we asked)\n`,
+      );
+      continue;
+    }
+    // STILL ALLOWLISTED, re-checked now, not when the request was sent.
+    // A typed "yes <id>" only reaches claimPermission after gate(), so a
+    // contact removed since the request went out is refused there - but
+    // reactions never pass gate(), and without this a revoked owner could
+    // still approve by emoji. fromMe is the linked account itself, which
+    // the typed path also trusts without gate() (its note-to-self).
+    if (
+      !reaction.key?.fromMe &&
+      !isAllowedJid(reactorJid, loadAccess().allowFrom)
+    ) {
+      logDiag(
+        `${LOG_PREFIX}: ignored permission reaction from ${maskJid(reactorJid)} (no longer allowlisted)\n`,
+      );
+      continue;
+    }
+    permissionMessageMap.delete(key.id);
+    void mcp.notification({
+      method: "notifications/claude/channel/permission",
+      params: {
+        request_id: pending.requestId,
+        behavior: isApprove ? "allow" : "deny",
+      },
+    });
+    logDiag(
+      `${LOG_PREFIX}: permission ${pending.requestId} ${isApprove ? "approved" : "denied"} via reaction ${emoji}\n`,
+    );
+  }
+}
+
+async function connectCloudApi(): Promise<void> {
+  const cloud = new CloudApiSocket(readCloudApiConfig(process.env), {
+    onMessage: async (message) => {
+      await handleMessage(message);
+    },
+    onReaction: async (reaction) => {
+      await handlePermissionReactions([reaction]);
+    },
+    onError: (message) => logDiag(`${LOG_PREFIX}: ${message}\n`),
+    maxMediaEntries: MAX_STORE,
+  });
+  await cloud.start();
+  if (shuttingDown) {
+    cloud.end();
+    return;
+  }
+  sock = cloud;
+  ownJid = cloud.user?.id ?? "";
+  connectedAt = Date.now();
+  reconnectAttempt = 0;
+  reconnectThrows = 0;
+  const info =
+    "Official Cloud API listener ready. Verify the public HTTPS webhook and messages subscription in Meta, then send a test DM. No linked-device pairing is needed. Set an allowlisted personal contact as owner for permission requests.";
+  logDiag(`${LOG_PREFIX}: ${info}\n`);
+  if (AUTO_NOTIFY) notifySystem(info, "connected");
+}
+
 async function connectWhatsApp(): Promise<void> {
+  if (PROVIDER === "cloud-api") return connectCloudApi();
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const needsPairing = !state.creds.registered;
   const version = await resolveWaWebVersion();
   const myGeneration = ++pairingGeneration;
 
-  sock = makeWASocket({
+  const baileysSock = makeWASocket({
     auth: state,
     version,
     printQRInTerminal: !PHONE_NUMBER, // QR only if no phone number set
@@ -5149,11 +5403,12 @@ async function connectWhatsApp(): Promise<void> {
     markOnlineOnConnect: false,
   });
 
-  sock.ev.on("creds.update", saveCreds);
+  sock = baileysSock;
+  baileysSock.ev.on("creds.update", saveCreds);
 
   // Track LID ↔ phone number mappings for identity resolution.
   // recordLidMapping also migrates the contacts cache; see its definition.
-  sock.ev.on(
+  baileysSock.ev.on(
     "lid-mapping.update" as any,
     (mapping: { lid: string; pn: string }) => {
       recordLidMapping(mapping.lid, mapping.pn);
@@ -5164,7 +5419,7 @@ async function connectWhatsApp(): Promise<void> {
   // .name is what the account owner saved on their own phone; .notify is
   // self-reported by the contact. See recordContact/mergeContact for why
   // those stay separate instead of collapsing into one trusted field.
-  sock.ev.on("contacts.upsert", (contacts) => {
+  baileysSock.ev.on("contacts.upsert", (contacts) => {
     // One batch save after the loop, not one per contact: this event
     // delivers the whole address book on first sync (hundreds to
     // thousands of entries), and contactsMap starts empty so nearly every
@@ -5191,7 +5446,7 @@ async function connectWhatsApp(): Promise<void> {
     }
     if (changed) saveContactsMap();
   });
-  sock.ev.on("contacts.update", (updates) => {
+  baileysSock.ev.on("contacts.update", (updates) => {
     reloadContactsMap();
     let changed = false;
     for (const u of updates) {
@@ -5215,7 +5470,7 @@ async function connectWhatsApp(): Promise<void> {
   // archived to exclude groups from its default listing, and activity to
   // rank its "top 5 groups / top 10 contacts" screen the same way the
   // WhatsApp app itself orders its own chat list.
-  sock.ev.on("chats.upsert", (chats) => {
+  baileysSock.ev.on("chats.upsert", (chats) => {
     reloadDmActivity();
     let groupsChanged = false;
     let dmsChanged = false;
@@ -5228,7 +5483,7 @@ async function connectWhatsApp(): Promise<void> {
     if (groupsChanged) saveGroupsMeta();
     if (dmsChanged) saveDmActivity();
   });
-  sock.ev.on("chats.update", (updates) => {
+  baileysSock.ev.on("chats.update", (updates) => {
     reloadDmActivity();
     let groupsChanged = false;
     let dmsChanged = false;
@@ -5248,7 +5503,7 @@ async function connectWhatsApp(): Promise<void> {
   // happens before any QR event, nullifying `sock`. Instead of a timer, we
   // capture a local reference and request the pairing code right away.
   if (needsPairing && PHONE_NUMBER && !pairingCodeRequested) {
-    const localSock = sock;
+    const localSock = baileysSock;
     (async () => {
       // Small delay to let the WebSocket handshake begin
       await new Promise((r) => setTimeout(r, 5000));
@@ -5272,14 +5527,14 @@ async function connectWhatsApp(): Promise<void> {
     );
   }
 
-  sock.ev.on("connection.update", async (update) => {
+  baileysSock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr && PHONE_NUMBER && !pairingCodeRequested) {
       // QR event fired (works in Node.js) — also request pairing code as alternative
       pairingCodeRequested = true;
       try {
-        await requestAndAnnouncePairingCode(sock!);
+        await requestAndAnnouncePairingCode(baileysSock);
       } catch (err) {
         if (myGeneration === pairingGeneration) pairingCodeRequested = false;
         logDiag(`${LOG_PREFIX}: pairing code request failed: ${err}\n`);
@@ -5299,7 +5554,8 @@ async function connectWhatsApp(): Promise<void> {
       // the owner's self-chat arrives under their own @lid: without this
       // seed, isAllowedJid can't match it to the allowlisted phone and
       // logOwnerHandReply drops every message the owner sends themselves.
-      if (ownJid && sock!.user?.lid) recordLidMapping(sock!.user.lid, ownJid);
+      if (ownJid && baileysSock.user?.lid)
+        recordLidMapping(baileysSock.user!.lid, ownJid);
       const resolvedOwn = ownJid ? resolveToPhone(ownJid) : "";
       logDiag(`${LOG_PREFIX}: connected as ${maskJid(ownJid)}\n`);
 
@@ -5400,7 +5656,7 @@ async function connectWhatsApp(): Promise<void> {
       // failure here must never break the connection, and it must never block
       // startup. Guarded inside on the on-disk cache, so this is a no-op on
       // every connect once names are actually cached.
-      syncSavedNamesOnce(sock!).catch((err) => {
+      syncSavedNamesOnce(baileysSock).catch((err) => {
         logDiag(`${LOG_PREFIX}: address book sync failed: ${err}\n`);
       });
     }
@@ -5471,7 +5727,7 @@ async function connectWhatsApp(): Promise<void> {
     }
   });
 
-  sock.ev.on(
+  baileysSock.ev.on(
     "messages.upsert",
     async (ev: { messages: WAMessage[]; type: string }) => {
       // The one line that answers "did it even get here?". Masked JIDs only,
@@ -5539,63 +5795,7 @@ async function connectWhatsApp(): Promise<void> {
   // where the owner IS the linked account and every key in the chat is
   // fromMe. Its id is still the map lookup, because guessing a WhatsApp
   // message id is not the weak link — the reactor check below is.
-  sock.ev.on(
-    "messages.reaction" as any,
-    async (
-      reactions: {
-        key: WAMessageKey;
-        reaction: { text: string; key?: WAMessageKey };
-      }[],
-    ) => {
-      for (const { key, reaction } of reactions) {
-        if (!key.id) continue;
-        const pending = permissionMessageMap.get(key.id);
-        if (!pending) continue;
-        const emoji = reaction.text;
-        const isApprove = ["👍", "✅", "👌", "🆗"].includes(emoji);
-        const isDeny = ["👎", "❌", "🚫", "✋"].includes(emoji);
-        if (!isApprove && !isDeny) continue;
-        const reactorJid =
-          reaction.key?.participant ?? reaction.key?.remoteJid ?? "";
-        // Same normalizing comparison claimPermission uses, for the same
-        // reason: the owner reaches us as @lid or as a phone jid depending on
-        // the path. A mismatch is dropped WITHOUT deleting the entry, so the
-        // owner's own reaction still works afterwards.
-        if (!reactorJid || !isAllowedJid(reactorJid, [pending.chatId])) {
-          logDiag(
-            `${LOG_PREFIX}: ignored permission reaction from ${reactorJid ? maskJid(reactorJid) : "unknown"} (not the chat we asked)\n`,
-          );
-          continue;
-        }
-        // STILL ALLOWLISTED, re-checked now, not when the request was sent.
-        // A typed "yes <id>" only reaches claimPermission after gate(), so a
-        // contact removed since the request went out is refused there - but
-        // reactions never pass gate(), and without this a revoked owner could
-        // still approve by emoji. fromMe is the linked account itself, which
-        // the typed path also trusts without gate() (its note-to-self).
-        if (
-          !reaction.key?.fromMe &&
-          !isAllowedJid(reactorJid, loadAccess().allowFrom)
-        ) {
-          logDiag(
-            `${LOG_PREFIX}: ignored permission reaction from ${maskJid(reactorJid)} (no longer allowlisted)\n`,
-          );
-          continue;
-        }
-        permissionMessageMap.delete(key.id);
-        void mcp.notification({
-          method: "notifications/claude/channel/permission",
-          params: {
-            request_id: pending.requestId,
-            behavior: isApprove ? "allow" : "deny",
-          },
-        });
-        logDiag(
-          `${LOG_PREFIX}: permission ${pending.requestId} ${isApprove ? "approved" : "denied"} via reaction ${emoji}\n`,
-        );
-      }
-    },
-  );
+  baileysSock.ev.on("messages.reaction" as any, handlePermissionReactions);
 }
 
 if (!CONFLICT) {

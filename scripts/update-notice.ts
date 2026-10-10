@@ -57,6 +57,13 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.27.0",
+      notes: [
+        "Choose linked device or official Cloud API in setup; existing installs keep Baileys.",
+        "Cloud API supports business DMs, attachments and approved templates; Meta rules and fees apply.",
+      ],
+    },
+    {
       version: "0.26.2",
       notes: [
         "Baileys upgraded to rc12 to fix forged messages and app-state sync attacks.",

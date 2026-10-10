@@ -52,6 +52,7 @@ import {
   type GroupMeta,
 } from "./ranking";
 import { wizardCmd } from "./wizard-cmd";
+import { channelProvider, stateEnvironment } from "../lib/provider";
 
 const STATE_DIR =
   process.env.WHATSAPP_STATE_DIR ?? join(homedir(), ".whatsapp-channel");
@@ -262,6 +263,8 @@ function loadLidMap(): Record<string, string> {
 
 function status(): void {
   const a = load();
+  const cloud =
+    channelProvider(stateEnvironment(join(STATE_DIR, ".env"))) === "cloud-api";
   const meta = loadGroupsMeta();
   const now = Date.now();
   // owner is printed with what it MEANS, not as a bare field: it is the one
@@ -279,16 +282,24 @@ function status(): void {
   const ownerAllowed =
     owner.includes("@") &&
     a.allowFrom.some((j) => contactKeyFor(lidMap, j) === ownerKey);
-  const ownerNote = !owner
-    ? "  (unstamped — falling back to allowFrom[0])"
-    : ownerAllowed
-      ? ""
-      : "  (NO LONGER ALLOWLISTED — requests go to your own chat until you set a new one)";
+  const cloudOwnerAllowed =
+    ownerAllowed && /^\d{5,20}@s\.whatsapp\.net$/.test(owner);
+  const ownerNote = cloud
+    ? cloudOwnerAllowed
+      ? "  (confirm this is a personal number, different from the business number)"
+      : "  (NO VALID CLOUD OWNER — requests are not sent; set an allowlisted personal phone JID)"
+    : !owner
+      ? "  (unstamped — falling back to allowFrom[0])"
+      : ownerAllowed
+        ? ""
+        : "  (NO LONGER ALLOWLISTED — requests go to your own chat until you set a new one)";
   const lines = [
     `state dir:  ${STATE_DIR}`,
     `dmPolicy:   ${a.dmPolicy}`,
-    `owner:      ${owner || a.allowFrom[0] || "(none)"}${ownerNote}`,
-    `            permission requests go here; change with "set owner <jid>"`,
+    `owner:      ${owner || (!cloud && a.allowFrom[0]) || "(none)"}${ownerNote}`,
+    cloud
+      ? '            Cloud has no fallback owner; runtime status verifies the recipient. Change with "set owner <jid>"'
+      : `            permission requests go here; change with "set owner <jid>"`,
     `allowFrom:  ${a.allowFrom.length} contact(s)`,
     ...a.allowFrom.map(
       (jid) =>

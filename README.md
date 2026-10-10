@@ -1,14 +1,23 @@
 # WhatsApp Channel for Claude Code
 
-Drive your Claude Code session from WhatsApp — your personal number, no bots, no API keys.
+Drive your Claude Code session from WhatsApp. Choose a **linked device** for a
+personal account or the **official WhatsApp Cloud API** for business DMs.
 
-The plugin connects to WhatsApp as a **linked device** (the same protocol as WhatsApp Web, via Baileys) and exposes it to Claude Code as an MCP channel. Incoming messages reach your session in real time; Claude replies from your own number, so recipients see a normal chat. Everything runs locally on your machine — messages travel directly between WhatsApp and your session, with no third-party servers in between. Once paired, it keeps working while your phone is off; only the Claude Code session needs to stay open, and reconnects never require re-pairing.
+The default Baileys provider connects like WhatsApp Web: pair your phone, then
+Claude replies from your own number. Existing installations keep this provider.
+The optional Cloud API provider uses Meta's business API and a public HTTPS
+webhook, with its own credentials, messaging policies and applicable fees.
+Both providers feed the same MCP channel and access gate.
 
 [![Claude Code Plugin](https://img.shields.io/badge/Claude%20Code-Plugin-blue)](https://code.claude.com/docs/en/plugins)
 [![MCP Server](https://img.shields.io/badge/MCP-Server-green)](https://modelcontextprotocol.io)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-> **Unofficial.** This is a community project, not made or endorsed by Anthropic or Meta. It signs in to a personal WhatsApp account as an unofficial linked device through [Baileys](https://github.com/WhiskeySockets/Baileys), not through Meta's official WhatsApp Business Platform. That may conflict with WhatsApp's Terms of Service and can get the number restricted. Use it at your own risk.
+> **Community project.** This plugin is not made or endorsed by Anthropic or Meta.
+> Its Baileys provider uses an unofficial linked-device protocol, which may
+> conflict with WhatsApp's terms and put the number at risk. The optional Cloud
+> provider uses official API transport; confirm your use is permitted under
+> Meta's business and AI-provider rules before enabling it.
 
 ## Installation
 
@@ -22,13 +31,33 @@ The `--dangerously-load-development-channels` flag matters: it registers the plu
 
 > **Know what this flag does.** Claude Code warns against loading downloaded channels this way: a loaded channel can put text from other people straight into your session. Read this plugin's code before you use it, keep the [allowlist](./ACCESS.md) to people you trust, and keep permission prompts on. Never combine it with `--dangerously-skip-permissions`: with prompts off, anyone in an allowlisted chat could get Claude to run commands on your computer.
 
-Inside the session, set your number and pair:
+Inside the session, choose your connection:
 
 ```text
-/whatsapp-channel:configure <phone>   # country code + number, no +
+/whatsapp-channel:setup
+/whatsapp-channel:configure provider
 ```
 
-A pairing code is printed on first launch. On your phone: WhatsApp → Settings → Linked Devices → Link a Device → **Link with phone number instead** → enter the code. No WhatsApp Business API, Meta developer account, or API key is involved — it links to your regular account.
+The wizard runs in your own terminal so Cloud credentials never pass through
+chat. Or run `bun scripts/provider.ts choose` from the plugin directory.
+
+| Connection                         | Setup                                                                       | Main limits                                                                            |
+| ---------------------------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Linked device (`baileys`, default) | Pair your phone; no Meta API credentials                                    | Unofficial protocol; existing personal/group behavior                                  |
+| Official (`cloud-api`)             | Meta business number, token, app secret, verify token, public HTTPS webhook | DMs only in this implementation; service window/templates and Meta fees/policies apply |
+
+For linked-device pairing, save your number with
+`/whatsapp-channel:configure <phone>` (country code + number, no `+`). Enter the
+printed pairing code in WhatsApp → Settings → Linked Devices → Link a Device →
+**Link with phone number instead**, or scan the QR.
+
+For official business DMs, follow [Cloud API setup](./docs/cloud-api.md). This
+provider does not yet support groups, message editing, phone history/address-book
+import or coexistence synchronization. Add an explicitly allowed personal owner;
+the business number is never auto-added. Configuration readiness is not proof
+that the public webhook works. Rates vary; consult
+[Meta pricing](https://business.whatsapp.com/products/platform-pricing) and
+[FAQ](https://whatsappbusiness.com/resources/faq/).
 
 ## Other MCP clients (Codex CLI, Gemini CLI, Cursor)
 
@@ -77,7 +106,7 @@ tool_timeout_sec = 120     # default 60; wait_for_messages parks for up to 40s
 }
 ```
 
-Only one client at a time can hold the WhatsApp connection: WhatsApp allows one linked-device session per account, and two servers would kick each other off. A second server does not fail silently — it stays up and serves a single `whatsapp_unavailable` tool naming the process that holds the connection.
+Only one client at a time can hold a state directory’s singleton lock. With Baileys, two connections using the same linked-device auth would kick each other off. Use separate state directories for separate numbers. A second server does not fail silently — it stays up and serves a single `whatsapp_unavailable` tool naming the process that holds the connection.
 
 ## Access control from a terminal
 
@@ -97,6 +126,11 @@ Approving always needs the specific code, even when only one pairing is waiting:
 
 ## Features
 
+The list below describes the default linked-device provider. See the
+[provider capability comparison](./docs/cloud-api.md#capabilities-in-this-plugins-first-cloud-provider)
+for the initial Cloud API scope. Shared DM access, attachment processing,
+transcription and context recovery also work with Cloud API.
+
 - **Bidirectional messaging.** Send and receive from the session; long replies are chunked to WhatsApp's limits or sent as a document attachment past a configurable threshold.
 - **@-mentions.** `reply` can tag people so they actually get notified — ids are accepted as phone, LID, or full JID, and mentions attach only to the chunk that names them.
 - **Full media support.** Photos, voice notes, video, documents, and stickers, in both directions.
@@ -112,12 +146,13 @@ Approving always needs the specific code, even when only one pairing is waiting:
 ## How it works
 
 ```text
-WhatsApp (phone) <──Baileys──> MCP Server <──stdio──> Claude Code
+WhatsApp linked device <──Baileys────────> MCP Server <──stdio──> Claude Code
+WhatsApp business DMs   <──Cloud API/HTTPS─> MCP Server
 ```
 
-The server (a single Bun process) holds the linked-device connection and forwards inbound messages to the session as channel notifications after they pass the access gate. Claude acts through MCP tools — `reply`, `react`, `edit_message`, `download_attachment`, `status`, `unreplied`, `catch_up`, `list_groups`. Runtime state (auth, allowlists, group configs, inbox) lives in `~/.whatsapp-channel/`, never in the repo.
+The server (a single Bun process) holds either the linked-device connection or the Cloud API webhook listener and forwards inbound messages after they pass the access gate. Claude acts through shared MCP tools such as `reply`, `react`, `download_attachment`, `status`, `unreplied` and `catch_up`. Provider-specific tools include linked-device group/edit operations and Cloud `send_template`. Runtime state lives in `~/.whatsapp-channel/` (or `WHATSAPP_STATE_DIR`), never in the repo.
 
-Messages sent by Claude appear as coming from your phone number. Use a dedicated number if you want a distinct bot identity.
+Messages sent by Claude appear from your linked personal number or configured business number. Use a dedicated number if you want a distinct assistant identity.
 
 ## Voice transcription (optional)
 

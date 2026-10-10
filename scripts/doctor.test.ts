@@ -23,10 +23,22 @@ const DOCTOR = join(import.meta.dir, "doctor.ts");
 
 // Runs doctor against a fixture state dir. execFileSync throws on nonzero
 // exit, so every passing test also proves the exit-0 contract.
-function runDoctor(stateDir: string): string {
+function runDoctor(
+  stateDir: string,
+  overrides: Record<string, string> = {},
+): string {
   return execFileSync("bun", [DOCTOR], {
     encoding: "utf8",
-    env: { ...process.env, WHATSAPP_STATE_DIR: stateDir },
+    env: {
+      ...process.env,
+      WHATSAPP_STATE_DIR: stateDir,
+      WHATSAPP_PROVIDER: "",
+      WHATSAPP_CLOUD_PHONE_NUMBER_ID: "",
+      WHATSAPP_CLOUD_ACCESS_TOKEN: "",
+      WHATSAPP_CLOUD_APP_SECRET: "",
+      WHATSAPP_CLOUD_VERIFY_TOKEN: "",
+      ...overrides,
+    },
   });
 }
 
@@ -396,5 +408,70 @@ describe("disk-usage", () => {
     const out = runDoctor(dir);
     expect(out).toContain("[WARN] disk-usage: lid-map.json is 2.0 MB");
     expect(out).toContain("larger than a normal contact list");
+  });
+});
+
+describe("Cloud API provider", () => {
+  function cloudState(complete = true): string {
+    const dir = freshStateDir();
+    writeFileSync(
+      join(dir, ".env"),
+      "WHATSAPP_PROVIDER=cloud-api\n" +
+        (complete
+          ? "WHATSAPP_CLOUD_PHONE_NUMBER_ID=123456789\nWHATSAPP_CLOUD_ACCESS_TOKEN=fixture-private-token\nWHATSAPP_CLOUD_APP_SECRET=fixture-private-secret\nWHATSAPP_CLOUD_VERIFY_TOKEN=fixture-private-verify\n"
+          : ""),
+    );
+    return dir;
+  }
+
+  test("Cloud diagnostics skip device auth and warn about explicit owner and unverified inbound delivery", () => {
+    const out = runDoctor(cloudState());
+    expect(out).toContain("[PASS] cloud-config:");
+    expect(out).toContain("not a connection or delivery test");
+    expect(out).toContain(
+      "[INFO] cloud-webhook: inbound delivery is unverified",
+    );
+    expect(out).toContain("[WARN] cloud-owner:");
+    expect(out).not.toContain("[ERROR] auth:");
+    expect(out).not.toContain("scan the QR");
+    for (const secret of [
+      "fixture-private-token",
+      "fixture-private-secret",
+      "fixture-private-verify",
+    ])
+      expect(out).not.toContain(secret);
+  });
+
+  test("missing Cloud configuration is an error without offering a QR fix", () => {
+    const out = runDoctor(cloudState(false));
+    expect(out).toContain("[ERROR] cloud-config:");
+    expect(out).toContain("configure provider cloud-api");
+    expect(out).not.toContain("Baileys credentials");
+  });
+
+  test("allowed personal owner passes and configured groups are explicitly inactive", () => {
+    const dir = cloudState();
+    writeFileSync(
+      join(dir, "access.json"),
+      JSON.stringify({
+        dmPolicy: "allowlist",
+        allowFrom: ["12345@s.whatsapp.net"],
+        owner: "12345@s.whatsapp.net",
+        groups: { "456@g.us": {} },
+        pending: {},
+      }),
+    );
+    const out = runDoctor(dir);
+    expect(out).toContain("[PASS] cloud-owner:");
+    expect(out).toContain("[WARN] cloud-groups:");
+    expect(out).not.toContain("[INFO] group-configs:");
+  });
+
+  test("unknown provider cannot fall back to linked device", () => {
+    const out = runDoctor(freshStateDir(), {
+      WHATSAPP_PROVIDER: "unknown-provider",
+    });
+    expect(out).toContain("[ERROR] provider:");
+    expect(out).not.toContain("Baileys credentials");
   });
 });
