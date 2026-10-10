@@ -57,6 +57,20 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.26.3",
+      notes: [
+        "Baileys upgraded to rc14: rc12 threw away the phone's own contact and history sync on a new link.",
+        "Linked on 0.26.2 and no saved names? Re-link: /whatsapp-channel:configure reset-auth.",
+        "Saved-name sync no longer breaks on Windows and macOS for links made from now on.",
+        "A tag now shows as the name each reader saved for that person, never as a bare number.",
+        "@all is sent as WhatsApp's own everyone-tag: one tag, no member list.",
+        "Past 32 members @all is refused unless the linked account is a group admin (WhatsApp's rule).",
+        "Group members' cached names are no longer wiped at every start; they age out after 30 days.",
+        "Their LID-to-number mappings now survive the same 30 days instead of being dropped hourly.",
+        "Unsaved contacts and their DM activity now age out after 30 days instead of 90.",
+      ],
+    },
+    {
       version: "0.26.2",
       notes: [
         "Baileys upgraded to rc12 to fix forged messages and app-state sync attacks.",

@@ -7,6 +7,7 @@ import {
   migrateContactKey,
   pruneStrangers,
   resolveByName,
+  SEEN_REFRESH_MS,
   STRANGER_TTL_MS,
   type ContactsMap,
 } from "./contacts";
@@ -14,19 +15,19 @@ import {
 describe("mergeContact", () => {
   test("first sighting of a contact is stored", () => {
     const map: ContactsMap = {};
-    const changed = mergeContact(map, "61434505973@s.whatsapp.net", {
+    const changed = mergeContact(map, "61400045973@s.whatsapp.net", {
       name: "Akash",
     });
     expect(changed).toBe(true);
-    expect(map["61434505973@s.whatsapp.net"]).toEqual({ name: "Akash" });
+    expect(map["61400045973@s.whatsapp.net"]).toEqual({ name: "Akash" });
   });
 
   test("an update with only notify doesn't erase an existing saved name", () => {
     const map: ContactsMap = {
-      "61434505973@s.whatsapp.net": { name: "Akash" },
+      "61400045973@s.whatsapp.net": { name: "Akash" },
     };
-    mergeContact(map, "61434505973@s.whatsapp.net", { notify: "aki_98" });
-    expect(map["61434505973@s.whatsapp.net"]).toEqual({
+    mergeContact(map, "61400045973@s.whatsapp.net", { notify: "aki_98" });
+    expect(map["61400045973@s.whatsapp.net"]).toEqual({
       name: "Akash",
       notify: "aki_98",
     });
@@ -34,10 +35,10 @@ describe("mergeContact", () => {
 
   test("a name change (contact renamed later) overwrites the old one", () => {
     const map: ContactsMap = {
-      "61434505973@s.whatsapp.net": { name: "Neha" },
+      "61400045973@s.whatsapp.net": { name: "Neha" },
     };
-    mergeContact(map, "61434505973@s.whatsapp.net", { name: "Nehaaaa" });
-    expect(contactName(map, "61434505973@s.whatsapp.net")).toBe("Nehaaaa");
+    mergeContact(map, "61400045973@s.whatsapp.net", { name: "Nehaaaa" });
+    expect(contactName(map, "61400045973@s.whatsapp.net")).toBe("Nehaaaa");
   });
 
   test("an explicit empty-string name doesn't erase an existing saved name", () => {
@@ -45,13 +46,13 @@ describe("mergeContact", () => {
     // "" - so an empty string must be treated the same as absent, not as a
     // real update that wipes the trusted name.
     const map: ContactsMap = {
-      "61434505973@s.whatsapp.net": { name: "Akash" },
+      "61400045973@s.whatsapp.net": { name: "Akash" },
     };
-    mergeContact(map, "61434505973@s.whatsapp.net", {
+    mergeContact(map, "61400045973@s.whatsapp.net", {
       name: "",
       notify: "aki_98",
     });
-    expect(map["61434505973@s.whatsapp.net"]).toEqual({
+    expect(map["61400045973@s.whatsapp.net"]).toEqual({
       name: "Akash",
       notify: "aki_98",
     });
@@ -59,12 +60,52 @@ describe("mergeContact", () => {
 
   test("no actual change reports false, doesn't churn the caller's save", () => {
     const map: ContactsMap = {
-      "61434505973@s.whatsapp.net": { name: "Akash" },
+      "61400045973@s.whatsapp.net": { name: "Akash" },
     };
-    const changed = mergeContact(map, "61434505973@s.whatsapp.net", {
+    const changed = mergeContact(map, "61400045973@s.whatsapp.net", {
       name: "Akash",
     });
     expect(changed).toBe(false);
+  });
+});
+
+describe("mergeContact: the last-seen stamp", () => {
+  const T = 1_756_000_000_000;
+  const J = "61400000001@s.whatsapp.net";
+
+  test("a nameless contact is stamped with when it was seen", () => {
+    const map: ContactsMap = {};
+    expect(mergeContact(map, J, { notify: "aki_98" }, T)).toBe(true);
+    expect(map[J]).toEqual({ notify: "aki_98", seen: T });
+  });
+
+  test("a saved contact never carries a stamp, and gaining a name drops it", () => {
+    const map: ContactsMap = {};
+    mergeContact(map, J, { name: "Akash" }, T);
+    expect(map[J].seen).toBeUndefined();
+    const other = "61400000002@s.whatsapp.net";
+    mergeContact(map, other, { notify: "roh" }, T);
+    expect(map[other].seen).toBe(T);
+    mergeContact(map, other, { name: "Rohan" }, T + 1);
+    expect(map[other].seen).toBeUndefined();
+  });
+
+  test("the same sighting again inside a day is no change; a day later it refreshes", () => {
+    const map: ContactsMap = {};
+    mergeContact(map, J, { notify: "aki_98" }, T);
+    expect(mergeContact(map, J, { notify: "aki_98" }, T + 1)).toBe(false);
+    expect(map[J].seen).toBe(T);
+    expect(
+      mergeContact(map, J, { notify: "aki_98" }, T + SEEN_REFRESH_MS),
+    ).toBe(true);
+    expect(map[J].seen).toBe(T + SEEN_REFRESH_MS);
+  });
+
+  test("a changed display name is still a change inside the day", () => {
+    const map: ContactsMap = {};
+    mergeContact(map, J, { notify: "aki_98" }, T);
+    expect(mergeContact(map, J, { notify: "aki_99" }, T + 1)).toBe(true);
+    expect(map[J]).toEqual({ notify: "aki_99", seen: T + 1 });
   });
 });
 
@@ -94,11 +135,11 @@ describe("migrateContactKey", () => {
     const changed = migrateContactKey(
       map,
       "184710990000999@lid",
-      "61403911675@s.whatsapp.net",
+      "61400011675@s.whatsapp.net",
     );
     expect(changed).toBe(true);
     expect(map["184710990000999@lid"]).toBeUndefined();
-    expect(contactName(map, "61403911675@s.whatsapp.net")).toBe("Rohan");
+    expect(contactName(map, "61400011675@s.whatsapp.net")).toBe("Rohan");
   });
 
   test("merges into an existing entry at the new key instead of overwriting it", () => {
@@ -107,10 +148,10 @@ describe("migrateContactKey", () => {
     // not be lost either.
     const map: ContactsMap = {
       "184710990000999@lid": { name: "Rohan" },
-      "61403911675@s.whatsapp.net": { notify: "rohan_98" },
+      "61400011675@s.whatsapp.net": { notify: "rohan_98" },
     };
-    migrateContactKey(map, "184710990000999@lid", "61403911675@s.whatsapp.net");
-    expect(map["61403911675@s.whatsapp.net"]).toEqual({
+    migrateContactKey(map, "184710990000999@lid", "61400011675@s.whatsapp.net");
+    expect(map["61400011675@s.whatsapp.net"]).toEqual({
       name: "Rohan",
       notify: "rohan_98",
     });
@@ -122,10 +163,10 @@ describe("migrateContactKey", () => {
     // than getting silently clobbered by data migrating in from the old key.
     const map: ContactsMap = {
       "184710990000999@lid": { name: "Old Nickname" },
-      "61403911675@s.whatsapp.net": { name: "Rohan K (current)" },
+      "61400011675@s.whatsapp.net": { name: "Rohan K (current)" },
     };
-    migrateContactKey(map, "184710990000999@lid", "61403911675@s.whatsapp.net");
-    expect(map["61403911675@s.whatsapp.net"]).toEqual({
+    migrateContactKey(map, "184710990000999@lid", "61400011675@s.whatsapp.net");
+    expect(map["61400011675@s.whatsapp.net"]).toEqual({
       name: "Rohan K (current)",
     });
   });
@@ -139,6 +180,30 @@ describe("migrateContactKey", () => {
     const map: ContactsMap = { x: { name: "Akash" } };
     expect(migrateContactKey(map, "x", "x")).toBe(false);
     expect(map.x).toEqual({ name: "Akash" });
+  });
+});
+
+describe("migrateContactKey: the last-seen stamp", () => {
+  const LID = "184710990000999@lid";
+  const PN = "61400000003@s.whatsapp.net";
+
+  test("two nameless entries keep the newer stamp", () => {
+    const map: ContactsMap = {
+      [LID]: { notify: "roh", seen: 100 },
+      [PN]: { notify: "roh", seen: 50 },
+    };
+    migrateContactKey(map, LID, PN);
+    expect(map[PN]).toEqual({ notify: "roh", seen: 100 });
+  });
+
+  test("a saved name at either key means no stamp survives", () => {
+    const map: ContactsMap = {
+      [LID]: { notify: "roh", seen: 100 },
+      [PN]: { name: "Rohan" },
+    };
+    migrateContactKey(map, LID, PN);
+    expect(map[PN].name).toBe("Rohan");
+    expect(map[PN].seen).toBeUndefined();
   });
 });
 
@@ -190,9 +255,9 @@ describe("resolveByName", () => {
     // (a unique match produces no error). Resolution must stay stricter
     // than display.
     const map: ContactsMap = {
-      "attacker@s.whatsapp.net": { notify: "61434505973" },
+      "attacker@s.whatsapp.net": { notify: "61400045973" },
     };
-    expect(resolveByName(map, "61434505973")).toEqual({
+    expect(resolveByName(map, "61400045973")).toEqual({
       ok: false,
       reason: "not_found",
     });
@@ -269,6 +334,9 @@ describe("pruneStrangers", () => {
   const J = (n: string) => `${n}@s.whatsapp.net`;
 
   test("a gate-rejected stranger ages out of both maps", () => {
+    // No stamp: the shape every entry had before `seen` existed. Its
+    // dm-activity row was its only clock, and that row ages out on this call,
+    // so the contact goes with it rather than getting a fresh TTL.
     const contacts: ContactsMap = { [J("1")]: { notify: "spam bot" } };
     const dm = { [J("1")]: OLD };
     const changed = pruneStrangers(contacts, dm, new Set(), NOW);
@@ -278,17 +346,19 @@ describe("pruneStrangers", () => {
   });
 
   test("a saved name never ages out, even with stale activity", () => {
-    const contacts: ContactsMap = { [J("2")]: { name: "Mum" } };
+    // `seen: OLD` cannot be written by mergeContact for a saved entry; it is
+    // here so the name, not a missing stamp, is what keeps the entry.
+    const contacts: ContactsMap = { [J("2")]: { name: "Mum", seen: OLD } };
     const dm = { [J("2")]: OLD };
     pruneStrangers(contacts, dm, new Set(), NOW);
-    expect(contacts[J("2")]).toEqual({ name: "Mum" });
+    expect(contacts[J("2")]).toEqual({ name: "Mum", seen: OLD });
     // ...but the stale activity timestamp itself still goes: it only ranks
     // the wizard, and a saved name earns its row without it.
     expect(dm[J("2")]).toBeUndefined();
   });
 
   test("an allowlisted key is kept in both maps whatever its age", () => {
-    const contacts: ContactsMap = { [J("3")]: { notify: "aki_98" } };
+    const contacts: ContactsMap = { [J("3")]: { notify: "aki_98", seen: OLD } };
     const dm = { [J("3")]: OLD };
     const changed = pruneStrangers(contacts, dm, new Set([J("3")]), NOW);
     expect(changed).toEqual({ contacts: false, dms: false });
@@ -297,17 +367,56 @@ describe("pruneStrangers", () => {
   });
 
   test("fresh activity keeps a notify-only contact", () => {
-    const contacts: ContactsMap = { [J("4")]: { notify: "new friend" } };
+    // Last SEEN long ago, but DM activity is fresh: the activity row keeps it.
+    const contacts: ContactsMap = {
+      [J("4")]: { notify: "new friend", seen: OLD },
+    };
     const dm = { [J("4")]: FRESH };
     const changed = pruneStrangers(contacts, dm, new Set(), NOW);
     expect(changed).toEqual({ contacts: false, dms: false });
+    expect(contacts[J("4")]).toBeDefined();
   });
 
-  test("a notify-only contact with no activity record at all is dropped", () => {
-    const contacts: ContactsMap = { [J("5")]: { notify: "group lurker" } };
+  // A group member never gets a dm-activity row, so `seen` is their only
+  // clock. Before it existed they were deleted on every tick.
+  test("a group member last seen past the TTL is dropped", () => {
+    const contacts: ContactsMap = {
+      [J("5")]: { notify: "group lurker", seen: OLD },
+    };
     const changed = pruneStrangers(contacts, {}, new Set(), NOW);
     expect(changed).toEqual({ contacts: true, dms: false });
     expect(contacts).toEqual({});
+  });
+
+  test("a group member seen inside the TTL is kept, with no activity row", () => {
+    const contacts: ContactsMap = {
+      [J("5")]: { notify: "group regular", seen: FRESH },
+    };
+    const changed = pruneStrangers(contacts, {}, new Set(), NOW);
+    expect(changed).toEqual({ contacts: false, dms: false });
+    expect(contacts[J("5")]).toEqual({ notify: "group regular", seen: FRESH });
+  });
+
+  test("an entry from before the stamp existed gets the TTL from now, not forever", () => {
+    const contacts: ContactsMap = { [J("7")]: { notify: "legacy" } };
+    const first = pruneStrangers(contacts, {}, new Set(), NOW);
+    expect(first).toEqual({ contacts: true, dms: false });
+    expect(contacts[J("7")]).toEqual({ notify: "legacy", seen: NOW });
+    pruneStrangers(contacts, {}, new Set(), NOW + STRANGER_TTL_MS - 1);
+    expect(contacts[J("7")]).toBeDefined();
+    pruneStrangers(contacts, {}, new Set(), NOW + STRANGER_TTL_MS);
+    expect(contacts[J("7")]).toBeUndefined();
+  });
+
+  test("a malformed stamp restarts the clock instead of deleting or sticking", () => {
+    const contacts: ContactsMap = {
+      [J("8")]: { notify: "hand edited", seen: "yesterday" as any },
+      [J("9")]: { notify: "nan", seen: Number.NaN },
+    };
+    const changed = pruneStrangers(contacts, {}, new Set(), NOW);
+    expect(changed.contacts).toBe(true);
+    expect(contacts[J("8")].seen).toBe(NOW);
+    expect(contacts[J("9")].seen).toBe(NOW);
   });
 
   test("a malformed activity timestamp is kept, not treated as old", () => {

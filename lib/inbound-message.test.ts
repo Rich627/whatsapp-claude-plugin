@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { extractMentions, extractText } from "./inbound-message";
 
-const CLAUDE = "61434505973@s.whatsapp.net";
-const OTHER = "61403911675@s.whatsapp.net";
+const CLAUDE = "61400045973@s.whatsapp.net";
+const OTHER = "61400011675@s.whatsapp.net";
 
 describe("extractText", () => {
   test("plain conversation", () => {

@@ -565,7 +565,7 @@ describe("chatDisplayName", () => {
     expect(
       chatDisplayName(
         [{ group_name: "WIL Group HUDINI", user: "Ravi", direction: "in" }],
-        "120363427665348138@g.us",
+        "120363000000008138@g.us",
       ),
     ).toBe("WIL Group HUDINI");
   });
@@ -604,8 +604,8 @@ describe("chatDisplayName", () => {
   });
 
   test("a modern group id survives intact; nothing personal in it", () => {
-    expect(chatDisplayName([], "120363427665348138@g.us")).toBe(
-      "120363427665348138@g.us",
+    expect(chatDisplayName([], "120363000000008138@g.us")).toBe(
+      "120363000000008138@g.us",
     );
   });
 
@@ -631,7 +631,7 @@ describe("chatDisplayName refuses a group_name that is really the chat id", () =
     // would be rejected and the group silently listed under a member's name.
     // The only bad value resolveGroupName can produce is the chat id itself,
     // and that is excluded by identity, so no digit heuristic is needed here.
-    const jid = "120363427665348138@g.us";
+    const jid = "120363000000008138@g.us";
     for (const subject of ["Sprint 2026-09-05", "Batch 2019-2023"]) {
       expect(
         chatDisplayName([{ group_name: subject, direction: "in" }], jid),
@@ -642,7 +642,7 @@ describe("chatDisplayName refuses a group_name that is really the chat id", () =
   test("the first USABLE subject wins, not merely the first present", () => {
     // The oldest line in the window can carry the raw jid from a timed-out
     // metadata lookup while a later line has the real subject.
-    const jid = "120363427665348138@g.us";
+    const jid = "120363000000008138@g.us";
     const out = chatDisplayName(
       [
         { group_name: jid, direction: "in" },
@@ -657,7 +657,7 @@ describe("chatDisplayName refuses a group_name that is really the chat id", () =
     expect(
       chatDisplayName(
         [{ group_name: "WIL Group HUDINI", direction: "in" }],
-        "120363427665348138@g.us",
+        "120363000000008138@g.us",
       ),
     ).toBe("WIL Group HUDINI");
   });
@@ -685,7 +685,7 @@ describe("chatDisplayName never labels a group with a member's name", () => {
   test("a group with no resolvable subject falls through to the anchor", () => {
     // Labelling it "Ravi" makes it indistinguishable from the DM with Ravi,
     // and the label would change between sessions as the window slides.
-    const jid = "120363427665348138@g.us";
+    const jid = "120363000000008138@g.us";
     expect(chatDisplayName([{ user: "Ravi", direction: "in" }], jid)).toBe(jid);
   });
 
@@ -865,7 +865,7 @@ describe("chatDisplayName is always one row", () => {
     // the horizon after an upgrade. formatChatCounts emits one row per line.
     const out = chatDisplayName(
       [{ group_name: "Real\nFake Chat   @99", direction: "in" }],
-      "120363427665348138@g.us",
+      "120363000000008138@g.us",
     );
     expect(out).not.toContain("\n");
     expect(out).toBe("Real Fake Chat @99");
@@ -875,7 +875,7 @@ describe("chatDisplayName is always one row", () => {
 describe("isFallbackName", () => {
   test("a masked DM tail and an unresolved group id are fallbacks", () => {
     expect(
-      isFallbackName("120363427665348138@g.us", "120363427665348138@g.us"),
+      isFallbackName("120363000000008138@g.us", "120363000000008138@g.us"),
     ).toBe(true);
     const dm = "919876543210@s.whatsapp.net";
     expect(isFallbackName(chatDisplayName([], dm), dm)).toBe(true);
@@ -883,7 +883,7 @@ describe("isFallbackName", () => {
 
   test("a real name is not", () => {
     expect(isFallbackName("Mum", "919876543210@s.whatsapp.net")).toBe(false);
-    expect(isFallbackName("WIL Group HUDINI", "120363427665348138@g.us")).toBe(
+    expect(isFallbackName("WIL Group HUDINI", "120363000000008138@g.us")).toBe(
       false,
     );
   });
@@ -893,7 +893,7 @@ describe("chatDisplayName with an empty-after-normalising subject", () => {
   test("a whitespace-only stored subject falls through instead of rendering blank", () => {
     // Truthy raw, empty once CR/LF are collapsed. Returning "" would render a
     // blank row that no `chat` argument could ever match.
-    const jid = "120363427665348138@g.us";
+    const jid = "120363000000008138@g.us";
     for (const subject of ["   ", "\n", "\r\n  \r\n"]) {
       expect(
         chatDisplayName([{ group_name: subject, direction: "in" }], jid),
@@ -915,7 +915,7 @@ describe("chatDisplayName never returns an empty name", () => {
   });
 
   test("a later usable subject wins over an earlier blank one", () => {
-    const jid = "120363427665348138@g.us";
+    const jid = "120363000000008138@g.us";
     const out = chatDisplayName(
       [
         { group_name: "  \n ", direction: "in" },
@@ -946,12 +946,12 @@ describe("nameMatches", () => {
   test("a real name still matches by substring", () => {
     expect(nameMatches("Mum", dm, "mum")).toBe(true);
     expect(
-      nameMatches("WIL Group HUDINI", "120363427665348138@g.us", "hudini"),
+      nameMatches("WIL Group HUDINI", "120363000000008138@g.us", "hudini"),
     ).toBe(true);
   });
 
   test("an unresolved group id is not substring-matchable", () => {
-    const g = "120363427665348138@g.us";
+    const g = "120363000000008138@g.us";
     expect(nameMatches(chatDisplayName([], g), g, "120363")).toBe(false);
   });
 
@@ -959,7 +959,7 @@ describe("nameMatches", () => {
     // An unresolved group's fallback IS the raw jid, so a bare suffix test
     // made chat="@g.us" return all of them - the multi-room dump the id
     // prefix floor exists to prevent.
-    const g = "120363427665348138@g.us";
+    const g = "120363000000008138@g.us";
     const name = chatDisplayName([], g);
     for (const want of ["@g.us", "g.us", ".us"]) {
       expect(nameMatches(name, g, want)).toBe(false);
@@ -975,7 +975,7 @@ describe("oneLine collapses every kind of whitespace", () => {
     // safeName strips only < > [ ] ; CR LF, so these survive it on CURRENT
     // lines. U+2028 is a line terminator to many renderers; a tab breaks the
     // column alignment padEnd relies on.
-    const jid = "120363427665348138@g.us";
+    const jid = "120363000000008138@g.us";
     for (const sep of ["\u2028", "\u2029", "\u0085", "\t"]) {
       const out = chatDisplayName(
         [{ group_name: `Family${sep}Fake Chat   @9`, direction: "in" }],

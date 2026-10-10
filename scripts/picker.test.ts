@@ -116,7 +116,7 @@ describe("reducePicker", () => {
 
   test("a term matching only a JID/number matches nothing (label-only filter)", () => {
     const contact = item({
-      jid: "61403911675@s.whatsapp.net",
+      jid: "61400011675@s.whatsapp.net",
       label: "Rohan",
       granted: false,
     });

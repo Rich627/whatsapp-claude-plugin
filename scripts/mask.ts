@@ -67,8 +67,8 @@ export function maskJid(jid: string): string {
 // at all and mask it instead.
 //
 // Checks for a number-shaped run ANYWHERE in the string, not just when the
-// whole thing is one - a `.notify` like "call 0403911675" or "WhatsApp:
-// 0403 911 675" still leaks the embedded number if only a whole-string
+// whole thing is one - a `.notify` like "call 0400011675" or "WhatsApp:
+// 0400 011 675" still leaks the embedded number if only a whole-string
 // match were checked. A run needs at least 6 real digits to count: long
 // enough to be a phone-number fragment, short enough that "Room 42" or
 // "Team7" don't false-positive.

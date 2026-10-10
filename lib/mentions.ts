@@ -18,7 +18,9 @@ import { resolveByName, type ContactsMap } from "../scripts/contacts";
 // path. A future caller that skips that step will get duplicate/aliased
 // jids - this was a real, working guarantee of the pre-refactor API that
 // moving to pairs deliberately traded away for the input-matching fix.
-export type MentionPair = { input: string; jid: string };
+// `inChat` is set by mentionsInChat for a person who is a member of the chat
+// being sent to; only those get their "@<input>" text rewritten.
+export type MentionPair = { input: string; jid: string; inChat?: boolean };
 
 // Two saved contacts sharing a display name is not something to guess a
 // winner for — the caller must fall back to the real id for that name.
@@ -120,7 +122,7 @@ export function normalizeMentionJids(
 }
 
 // server.ts's `reply` handler treats a mentions-array entry of "all" as the
-// reserved every-participant token (see expandAllMention below) UNLESS a
+// reserved every-participant token (see mentionContent below) UNLESS a
 // real saved contact is literally named "All" - name resolution always
 // wins over a reserved keyword, the same precedence normalizeMentionJids
 // already gives a saved name over treating it as a numeric id.
@@ -139,25 +141,87 @@ export function isReservedAllToken(
   return !resolveByName(contactsMap, s).ok;
 }
 
-// "@all" expands to every group participant's own jid, all sharing the
-// same input ("all") so mentionsForChunk's ordinary text-match handles it
-// like any other mention: one "@all" in the text attaches every expanded
-// pair to that chunk. Building the pairs here (not inline in server.ts)
-// keeps this step unit-testable without a live Baileys socket - the
-// sock.groupMetadata() fetch and the roster-access permission check stay
-// in server.ts, the only place that can make either of them.
-export function expandAllMention(
-  participantIds: string[],
-  jidNormalizedUser: (jid: string) => string,
-): MentionPair[] {
-  return participantIds.map((id) => ({
-    input: "all",
-    jid: jidNormalizedUser(id),
-  }));
-}
-
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Where a typed "@<input>" ends: not followed by a word character. ASCII on
+// purpose. In a script written without spaces the character after a name is
+// a letter ("@田中さん"), and a Unicode-aware boundary silently dropped that tag.
+const NAME_END = "(?!\\w)";
+const inputRe = (input: string, flags: string) =>
+  new RegExp(`@${escapeRegExp(input)}${NAME_END}`, flags);
+
+// One pattern for every requested mention, longest input first, so "Sam"
+// cannot claim the start of "@Sam Smith". Shared by the visible rewrite and
+// by who gets notified, so the two can never disagree about who was named.
+function pairMatcher(pairs: MentionPair[]) {
+  const byLength = [...pairs].sort((a, b) => b.input.length - a.input.length);
+  return {
+    re: new RegExp(
+      `@(${byLength.map((m) => escapeRegExp(m.input)).join("|")})${NAME_END}`,
+      "gi",
+    ),
+    pairOf: (input: string) =>
+      byLength.find((m) => m.input.toLowerCase() === input.toLowerCase()),
+  };
+}
+
+type Participant = { id: string; phoneNumber?: string; lid?: string };
+
+// Marks the requested mentions that are members of this chat, and moves each
+// onto the id the GROUP uses for that member (a LID in a LID-addressed group,
+// whatever form we resolved the name to). Anyone else is returned untouched:
+// their jid still rides in the hidden mentions array, as it always has, but
+// mentionContent will not write their id into the visible text.
+export function mentionsInChat(
+  pairs: MentionPair[],
+  participants: Participant[],
+  jidNormalizedUser: (jid: string) => string,
+): MentionPair[] {
+  return pairs.map((m) => {
+    const p = participants.find((p) =>
+      [p.id, p.phoneNumber, p.lid].some(
+        (j) => j && jidNormalizedUser(j) === m.jid,
+      ),
+    );
+    return p ? { ...m, jid: jidNormalizedUser(p.id), inChat: true } : m;
+  });
+}
+
+// What one outgoing text message must carry for its tags to render as tags.
+//
+// A person: WhatsApp draws a tag only where the text reads "@<user part of a
+// jid in mentionedJid>", and swaps in the name each reader saved. So the
+// "@<input>" the caller typed is rewritten to that user part - but ONLY for a
+// member of this chat (`inChat`). For anyone else no tag can render, and the
+// rewrite would print their raw number to people who could not see it.
+//
+// Everyone: the text keeps the literal "@all" and the message carries
+// Baileys' `mentionAll` (contextInfo.nonJidMentions = 1); no member list.
+export function mentionContent(
+  text: string,
+  pairs: MentionPair[],
+  all = false,
+): { text: string; mentions?: string[]; mentionAll?: true } {
+  const mentions = mentionsForChunk(text, pairs);
+  // Matched against ALL pairs, rewritten only for members: a longer name
+  // whose owner is not in the chat must still win its own text, or a
+  // member's shorter name would be written into it.
+  if (pairs.some((m) => m.inChat)) {
+    const { re, pairOf } = pairMatcher(pairs);
+    text = text.replace(re, (hit, input: string) => {
+      const m = pairOf(input);
+      return m?.inChat ? `@${m.jid.split("@")[0]}` : hit;
+    });
+  }
+  const allRe = inputRe("all", "gi");
+  const tagAll = all && allRe.test(text);
+  return {
+    text: tagAll ? text.replace(allRe, "@all") : text,
+    ...(mentions && { mentions }),
+    ...(tagAll && { mentionAll: true as const }),
+  };
 }
 
 // A long reply is split into chunks; only attach a mention to the chunk whose
@@ -179,8 +243,10 @@ export function mentionsForChunk(
   all: MentionPair[],
 ): string[] | undefined {
   if (!all.length) return undefined;
-  const hits = all.filter((m) =>
-    new RegExp(`@${escapeRegExp(m.input)}(?!\\w)`, "i").test(text),
-  );
-  return hits.length ? [...new Set(hits.map((m) => m.jid))] : undefined;
+  const { re, pairOf } = pairMatcher(all);
+  const jids = [...text.matchAll(re)].flatMap((hit) => {
+    const m = pairOf(hit[1]);
+    return m ? [m.jid] : [];
+  });
+  return jids.length ? [...new Set(jids)] : undefined;
 }

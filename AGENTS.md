@@ -14,11 +14,12 @@ claude.com/plugins.
 
 - **Runtime:** Bun — TypeScript runs directly. No build step.
 - **Deps (only 4 — no new dependencies without the user's explicit approval):**
-  `@modelcontextprotocol/sdk`, `@whiskeysockets/baileys@7.0.0-rc12`,
+  `@modelcontextprotocol/sdk`, `@whiskeysockets/baileys@7.0.0-rc14`,
   `@inquirer/prompts`, `zod`
   (2 connection payload fields are patched by `patch-baileys.mjs` via postinstall;
-  rc12 provides the upstream message-spoofing and Noise initialization fixes).
-- **Tests:** there IS a test suite — 22 `*.test.ts` files under `lib/` and
+  rc12 brought the upstream message-spoofing and Noise initialization fixes; rc14
+  is the first release whose spoofing guard still accepts the phone's own sync).
+- **Tests:** there IS a test suite — 26 `*.test.ts` files under `lib/` and
   `scripts/`, run with `bun test`. There is no `test` script in `package.json`;
   `bun test` finds them itself.
 - **Linting:** Trunk (prettier, markdownlint, shellcheck, shfmt, checkov, trufflehog).

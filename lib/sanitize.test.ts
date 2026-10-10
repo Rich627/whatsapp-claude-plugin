@@ -27,11 +27,11 @@ describe("safeName", () => {
 
 describe("displaySenderName", () => {
   test("falls back to the phone part when there is no usable name", () => {
-    expect(displaySenderName(undefined, "61403911675@s.whatsapp.net")).toBe(
-      "61403911675",
+    expect(displaySenderName(undefined, "61400011675@s.whatsapp.net")).toBe(
+      "61400011675",
     );
-    expect(displaySenderName("   ", "61403911675@s.whatsapp.net")).toBe(
-      "61403911675",
+    expect(displaySenderName("   ", "61400011675@s.whatsapp.net")).toBe(
+      "61400011675",
     );
   });
 
@@ -39,7 +39,7 @@ describe("displaySenderName", () => {
   // stripped characters survives as underscores rather than reaching the
   // fallback. Ugly, but envelope-safe, which is all this owes the caller.
   test("a name of nothing but stripped characters is not the fallback", () => {
-    expect(displaySenderName("<>[]", "61403911675@s.whatsapp.net")).toBe(
+    expect(displaySenderName("<>[]", "61400011675@s.whatsapp.net")).toBe(
       "____",
     );
   });

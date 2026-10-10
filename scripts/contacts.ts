@@ -3,8 +3,15 @@
 // `contacts.update` events (see server.ts). This module only holds the pure
 // merge/read logic so it's unit-testable without server.ts's connect-on-import
 // side effects; server.ts owns the actual persisted map and event wiring.
-export type ContactEntry = { name?: string; notify?: string };
+// `seen` (epoch ms) is carried by NAMELESS entries only: when WhatsApp last
+// showed us this person (a message of theirs or a contact sync). It is what
+// pruneStrangers ages them by. A saved contact never has one.
+export type ContactEntry = { name?: string; notify?: string; seen?: number };
 export type ContactsMap = Record<string, ContactEntry>;
+
+// A nameless entry's stamp is refreshed at most this often, so one group
+// message is not one rewrite of contacts.json.
+export const SEEN_REFRESH_MS = 24 * 60 * 60 * 1000;
 
 // `.name` is what the account owner saved on their own WhatsApp - trusted,
 // only they can set it. `.notify` is the display name the contact chose for
@@ -15,6 +22,7 @@ export function mergeContact(
   map: ContactsMap,
   jid: string,
   update: ContactEntry,
+  now: number = Date.now(),
 ): boolean {
   const existing = map[jid] ?? {};
   // `||`, not `??`: an explicit empty string in an update means "nothing
@@ -25,7 +33,15 @@ export function mergeContact(
     name: update.name || existing.name,
     notify: update.notify || existing.notify,
   };
-  if (merged.name === existing.name && merged.notify === existing.notify) {
+  if (!merged.name) merged.seen = now;
+  const stampFresh =
+    !!merged.name ||
+    (Number.isFinite(existing.seen) && now - existing.seen! < SEEN_REFRESH_MS);
+  if (
+    merged.name === existing.name &&
+    merged.notify === existing.notify &&
+    stampFresh
+  ) {
     return false;
   }
   map[jid] = merged;
@@ -71,9 +87,15 @@ export function migrateContactKey(
   if (!stale) return false;
   delete map[oldKey];
   const current = map[newKey] ?? {};
+  const name = current.name || stale.name;
   map[newKey] = {
-    name: current.name || stale.name,
+    name,
     notify: current.notify || stale.notify,
+    // Nameless only, and the newer of the two (as migrateDmActivity does), so
+    // learning a LID mapping never resets or drops the stamp.
+    seen: name
+      ? undefined
+      : Math.max(current.seen ?? 0, stale.seen ?? 0) || undefined,
   };
   return true;
 }
@@ -141,7 +163,10 @@ export function resolveByName(map: ContactsMap, name: string): NameResolution {
 //   their phone; forgetting it would undo the address-book sync
 // - an allowlisted key - someone the owner explicitly approved
 // - a notify-only contact with dm-activity younger than the TTL
-export const STRANGER_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+// - a notify-only contact SEEN (a message of theirs, in a group or a DM, or
+//   a contact sync) younger than the TTL. Group members never get a
+//   dm-activity row, so without this they were wiped on every tick.
+export const STRANGER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** Mutates both maps in place (house style - see mergeContact). Returns
  *  which map actually changed so the caller saves only what moved.
@@ -155,6 +180,7 @@ export function pruneStrangers(
   ttlMs: number = STRANGER_TTL_MS,
 ): { contacts: boolean; dms: boolean } {
   let dmsChanged = false;
+  const agedOut = new Set<string>();
   for (const [key, ts] of Object.entries(dmActivity)) {
     // A malformed timestamp is kept, not dropped: this prune exists to
     // forget stale strangers, and "we can't tell how old" is not "old".
@@ -162,6 +188,7 @@ export function pruneStrangers(
     if (now - ts < ttlMs) continue;
     if (allowedKeys.has(key)) continue;
     delete dmActivity[key];
+    agedOut.add(key);
     dmsChanged = true;
   }
   let contactsChanged = false;
@@ -172,6 +199,20 @@ export function pruneStrangers(
     // still has Object.prototype, so a contact keyed "constructor" would look
     // permanently active and never age out.
     if (Object.hasOwn(dmActivity, key)) continue; // younger than the TTL (above)
+    // No stamp (written before `seen` existed) or a malformed one: start the
+    // clock now. "Can't tell how old" is not "old", and must not be "forever".
+    // Except when its dm-activity row aged out on this very call: that row
+    // WAS its clock, and restarting it would give a stranger a second TTL.
+    if (typeof entry.seen !== "number" || !Number.isFinite(entry.seen)) {
+      if (agedOut.has(key)) {
+        delete contacts[key];
+      } else {
+        entry.seen = now;
+      }
+      contactsChanged = true;
+      continue;
+    }
+    if (now - entry.seen < ttlMs) continue;
     delete contacts[key];
     contactsChanged = true;
   }
