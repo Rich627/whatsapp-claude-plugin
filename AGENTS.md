@@ -37,13 +37,22 @@ trunk fmt       # format
 resolves and emits, it does not check types, so an out-of-scope or misspelled
 identifier bundles happily and tells you nothing. Use `tsc` directly. This repo
 has no `tsconfig.json` and no local `typescript` dependency, so pass the options
-on the command line (verified 2026-09-08: exit 0, no errors):
+on the command line:
 
 ```bash
 bunx --bun typescript@5 --noEmit --skipLibCheck \
   --target esnext --module preserve --moduleResolution bundler \
   --strict server.ts
 ```
+
+**Known baseline: 4 errors, not 0.** Since 0.27.0 (Cloud API provider, PR #44)
+this command reports exactly four pre-existing errors, because the repo has no
+Bun type definitions and adding `@types/bun` would be a new dependency:
+three in `lib/cloud-api.ts` (`Bun` global, and an implicit-any `request`
+parameter that follows from it) and one in `server.ts` (`import.meta.dir`).
+Treat those four as the baseline (verified 2026-10-14). Any other error, or a
+fifth one, is a real regression introduced by your change — compare against
+unmodified `main` if in doubt.
 
 `--strict` is load-bearing, not decoration: without it you get two phantom
 TS2339s in `lib/mentions.ts` that do not exist under strict mode. Note the
