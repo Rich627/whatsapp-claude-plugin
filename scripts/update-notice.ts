@@ -57,12 +57,27 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
-      version: "0.30.1",
+      version: "0.32.1",
       notes: [
         "Security: media downloads reject untrusted URLs, redirects, oversized files and stalled requests.",
         "Security: quotes stay in their chat; rejected or revoked senders' attachments are refused.",
         "Attachments now default to inbox/outbox only; WHATSAPP_ATTACH_DIRS grants extra folders.",
         "Auth status no longer reads credentials into chat; dependencies include current security fixes.",
+      ],
+    },
+    {
+      version: "0.32.0",
+      notes: [
+        "Linked device: WHATSAPP_READ_RECEIPTS=1 marks messages read once Claude gets them (default off).",
+        "New mark_read tool marks one received message read (blue ticks) by hand. Linked device only.",
+      ],
+    },
+    {
+      version: "0.31.0",
+      notes: [
+        'Linked device: "typing…" now stays up while Claude works on a message, until it replies.',
+        "It stops after 10 minutes at most; set WHATSAPP_TYPING_MAX_MINUTES to change that (0 = off).",
+        'reply shows "recording audio…" while it uploads a voice note; set_presence sets either by hand.',
       ],
     },
     {

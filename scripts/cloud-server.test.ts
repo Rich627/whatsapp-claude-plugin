@@ -281,6 +281,8 @@ test("real Cloud MCP server preserves access, permission identity and singleton 
     expect(names).not.toContain("list_groups");
     expect(names).not.toContain("edit_message");
     expect(names).not.toContain("send_poll");
+    expect(names).not.toContain("mark_read");
+    expect(names).not.toContain("set_presence");
     const replyTool = replies
       .get(2)
       .result.tools.find((entry: any) => entry.name === "reply");
@@ -325,6 +327,12 @@ test("real Cloud MCP server preserves access, permission identity and singleton 
         })
       ).isError,
     ).toBe(true);
+    const markRead = await tool("mark_read", {
+      chat_id: personal,
+      message_id: "owner-msg",
+    });
+    expect(markRead.isError).toBe(true);
+    expect(text(markRead)).toContain("not supported with the Cloud API");
     expect(graphSends()).toHaveLength(0);
     expect(
       (

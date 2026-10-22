@@ -105,7 +105,9 @@ To auto-allow only the WhatsApp tools, add them to your `~/.claude/settings.json
       "mcp__plugin_whatsapp-channel_whatsapp__status",
       "mcp__plugin_whatsapp-channel_whatsapp__download_attachment",
       "mcp__plugin_whatsapp-channel_whatsapp__edit_message",
-      "mcp__plugin_whatsapp-channel_whatsapp__send_poll"
+      "mcp__plugin_whatsapp-channel_whatsapp__send_poll",
+      "mcp__plugin_whatsapp-channel_whatsapp__set_presence",
+      "mcp__plugin_whatsapp-channel_whatsapp__mark_read"
     ]
   }
 }
@@ -126,8 +128,10 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 | `reply`               | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (quote-reply), `files` (attachments), and `mentions` (names over raw numbers; `"all"` needs [roster access](./ACCESS.md#group-roster--all-mentions)).                                                                                                                                                                                                                |
 | `send_poll`           | Send a poll (2-12 options, `multiple` for several picks). Each vote arrives as a `[Poll vote]` message with the tally. Linked device only; see [Polls](#polls).                                                                                                                                                                                                                                                                      |
 | `react`               | Add an emoji reaction to a message by ID. Any emoji is supported.                                                                                                                                                                                                                                                                                                                                                                    |
+| `set_presence`        | Show `composing` ("typing…") or `recording` in a chat until the next reply there, or clear it with `paused`. Linked device only; see [Typing indicator](#typing-indicator).                                                                                                                                                                                                                                                          |
 | `download_attachment` | Download media from a received message. Returns the local file path.                                                                                                                                                                                                                                                                                                                                                                 |
 | `edit_message`        | Edit a message the account previously sent.                                                                                                                                                                                                                                                                                                                                                                                          |
+| `mark_read`           | Mark a received message read (blue ticks) by ID. Linked device only. `WHATSAPP_READ_RECEIPTS=1` does it for every delivered message ([ACCESS.md](./ACCESS.md#read-receipts)).                                                                                                                                                                                                                                                        |
 | `status`              | Check connection state and get the pairing code if not yet paired.                                                                                                                                                                                                                                                                                                                                                                   |
 | `unreplied`           | List received messages not yet replied to, with their chat_ids. Pass `chat_id` for one chat. Shows at most 100 per call (the newest), after that filter; `wait_for_messages` has the same ceiling.                                                                                                                                                                                                                                   |
 | `wait_for_messages`   | Park up to 40s for messages this connection has not been handed yet. The first call returns whatever is already unreplied; later calls only what arrived since. Mainly for MCP clients other than Claude Code, which pushes messages into the session itself.                                                                                                                                                                        |
@@ -158,6 +162,12 @@ is gone for good.
 Separately, `~/.whatsapp-channel/sent.jsonl` (owner-only, pruned to 24 hours) records only the **id and timestamp** of the plugin's own sends — never text, number or chat — so a send WhatsApp re-delivers after a restart is not mistaken for a reply you typed.
 
 One record outlives the horizon on purpose: `~/.whatsapp-channel/.aged-out-chats.json`. When the prune drops a message that was still waiting for a reply, the chat is noted there - as a truncated hash of the chat_id and a timestamp, never the id itself - so the session-start counts can say "N chats had something waiting that has since aged out" after you have been away longer than the horizon. Entries expire after a fixed **30 days**; deleting `messages.jsonl` to clear history does not clear them. Static mode (`WHATSAPP_ACCESS_MODE=static`) never writes the file.
+
+## Typing indicator
+
+On linked device, the chat shows "typing…" while the assistant works on a message from it. The server sends it as soon as an allowed message is picked up and re-sends it every 8 seconds (WhatsApp drops it after about 10), until the assistant replies to that chat or `WHATSAPP_TYPING_MAX_MINUTES` runs out, 10 minutes by default. While `reply` uploads a voice note the chat shows "recording audio…" instead. The `set_presence` tool sets either state, or clears it with `paused`, by hand.
+
+Set `WHATSAPP_TYPING_MAX_MINUTES` in `~/.whatsapp-channel/.env` to change the cap: any number of minutes up to 60 (higher is clamped to 60). `0` turns the kept-up indicator off and leaves only the single "typing…" at pickup that earlier versions sent. A message the assistant never answers keeps "typing…" up until the cap, so keep it short if that happens often.
 
 ## Photos & Media
 

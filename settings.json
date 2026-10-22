@@ -6,7 +6,9 @@
       "mcp__plugin_whatsapp-channel_whatsapp__status",
       "mcp__plugin_whatsapp-channel_whatsapp__download_attachment",
       "mcp__plugin_whatsapp-channel_whatsapp__edit_message",
-      "mcp__plugin_whatsapp-channel_whatsapp__send_poll"
+      "mcp__plugin_whatsapp-channel_whatsapp__send_poll",
+      "mcp__plugin_whatsapp-channel_whatsapp__set_presence",
+      "mcp__plugin_whatsapp-channel_whatsapp__mark_read"
     ]
   }
 }

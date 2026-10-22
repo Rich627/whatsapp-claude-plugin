@@ -77,8 +77,8 @@ WhatsApp (phone) ←─ Baileys ─→ MCP Server (server.ts) ←─ stdio ─�
 
 - **`server.ts`** — the entire MCP server in one file (~5400 lines; re-check with
   `wc -l` rather than trusting this number). MCP tools exposed to Claude: `reply`,
-  `send_poll`, `react`, `download_attachment`, `edit_message`, `status`, `unreplied`,
-  `catch_up`, `list_groups`.
+  `send_poll`, `react`, `set_presence`, `download_attachment`, `edit_message`, `status`,
+  `unreplied`, `catch_up`, `list_groups`, `mark_read`.
   Also contains: access-control engine (DM policies `pairing`/`allowlist`/`disabled`,
   group policies, pairing codes with 1-hour TTL, LID↔phone mapping), message pipeline
   (access gate → routing → mention detection → text/media extraction → optional

@@ -199,6 +199,10 @@ Configure outbound behavior with `/whatsapp-channel:access set <key> <value>`.
 
 **`chunkMode`** chooses the split strategy: `length` cuts exactly at the limit; `newline` prefers paragraph boundaries.
 
+### Read receipts
+
+**Off by default.** Set `WHATSAPP_READ_RECEIPTS=1` (in the environment or `~/.whatsapp-channel/.env`) to mark each message read, turning the sender's ticks blue, as soon as it is delivered to Claude. Only messages that pass the access gate are marked: a dropped sender, a pairing request, an unaddressed message in a mention-gated group and the backlog replayed after a reconnect are left unread. In a group the receipt names the sender, as the phone does. If read receipts are off in your phone's privacy settings, the chat is marked read on your own devices only and senders see no blue ticks. The `mark_read` tool marks one message read by hand. Linked device only: Cloud API sends no read receipts and has no `mark_read`.
+
 ### Proactive notifications
 
 **On by default.** Claude is told to surface things to you the moment they happen, rather than waiting for its next natural reply: an inbound message arriving, this terminal's role _changing_ (becoming primary/secondary, or losing/regaining the primary connection — see multi-terminal sync below; the initial role a terminal starts in isn't a change and never announces), a pairing code, and the "paired and connected" confirmation. Set `WHATSAPP_QUIET=1` to turn all of that off for one terminal — a pairing code you need is always in the diagnostics log regardless, so nothing is lost. It's an env var, not a saved setting, so it only applies to sessions started with it set — nothing persists it past the terminal that set it.

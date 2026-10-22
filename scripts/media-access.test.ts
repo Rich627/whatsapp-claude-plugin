@@ -72,6 +72,7 @@ async function startFixture(extraDirs = "") {
     let next = 0;
     const sock = { ev, user: { id: ${JSON.stringify(OWNER)}, name: "Fixture" },
       signalRepository: { lidMapping: { getPNForLID: async () => null } },
+      readMessages: async keys => { appendFileSync(${JSON.stringify(join(dir, "reads.jsonl"))}, JSON.stringify({ keys }) + "\\n"); },
       sendPresenceUpdate: async () => {}, end() {}, updateMediaMessage: async m => m,
       sendMessage: async (jid, content, options) => {
         if (content.text === "swap-file") {
@@ -108,6 +109,7 @@ async function startFixture(extraDirs = "") {
     WHATSAPP_STATE_DIR: dir,
     WHATSAPP_PROVIDER: "baileys",
     WHATSAPP_QUIET: "1",
+    WHATSAPP_READ_RECEIPTS: "1",
     WHATSAPP_ATTACH_DIRS: extraDirs === "external" ? external : extraDirs,
   };
   const child = spawn("bun", ["--preload", preload, join(root, "server.ts")], {
@@ -230,6 +232,10 @@ test("real server enforces media access, chat binding and default export directo
     expect(quote.isError).toBe(true);
     expect(JSON.stringify(quote)).toContain("another chat");
     expect(f.records("sends")).toHaveLength(0);
+    expect(
+      (await f.tool("mark_read", { chat_id: GROUP, message_id: "private" }))
+        .isError,
+    ).toBe(true);
     expect(
       (
         await f.tool("react", {
@@ -365,6 +371,12 @@ test("real server enforces media access, chat binding and default export directo
       (await f.tool("download_attachment", { file_id: "revoked-during-fetch" }))
         .isError,
     ).toBe(true);
+    const readIds = f
+      .records("reads")
+      .flatMap((record) => record.keys.map((key: { id: string }) => key.id));
+    expect(readIds).toContain("private");
+    expect(readIds).not.toContain("blocked");
+    expect(readIds).not.toContain("revoked-during-fetch");
   } finally {
     await f.stop();
   }

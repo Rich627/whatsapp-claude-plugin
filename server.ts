@@ -85,6 +85,17 @@ import {
   type PollRecord,
 } from "./lib/polls";
 import {
+  autoReadKey,
+  loggedSender,
+  manualReadKey,
+  readReceiptsEnabled,
+} from "./lib/read-receipts";
+import {
+  parseTypingMaxMinutes,
+  TYPING_REFRESH_MS,
+  TypingIndicator,
+} from "./lib/presence";
+import {
   formatLock,
   lockHolderState,
   lockIdentity,
@@ -257,6 +268,10 @@ const ATTACH_DIRS = parseAttachDirs(
   process.env.WHATSAPP_ATTACH_DIRS,
   homedir(),
 ).map((dir) => realDir(dir));
+// Default off: WHATSAPP_READ_RECEIPTS=1 marks each message read (blue ticks)
+// once it has been delivered to Claude. Linked device only; the rules for
+// which message and which key are in lib/read-receipts.ts.
+const READ_RECEIPTS = readReceiptsEnabled(process.env.WHATSAPP_READ_RECEIPTS);
 // How long any stored log line lives (why one horizon, and why it is capped:
 // resolveTtlMs in lib/message-view.ts). Read here, not in the lib, so the lib
 // stays pure. TTL_NOTE is logged at startup rather than here - logDiag's own
@@ -265,6 +280,14 @@ const ATTACH_DIRS = parseAttachDirs(
 const { ms: LOG_TTL_MS, note: TTL_NOTE } = resolveTtlMs(
   process.env.WHATSAPP_MESSAGE_TTL_DAYS,
 );
+// How long "typing…" is kept up in a chat whose message the agent is working
+// on (lib/presence.ts); 0 = only the single update at pickup, as before.
+// Its note is logged where TTL_NOTE is, for the same reason.
+const { ms: TYPING_MAX_MS, note: TYPING_NOTE } = parseTypingMaxMinutes(
+  process.env.WHATSAPP_TYPING_MAX_MINUTES,
+);
+// Cloud API has no typing indicator: no loop (no map entry, no interval).
+const TYPING_LOOP_MS = PROVIDER === "cloud-api" ? 0 : TYPING_MAX_MS;
 // import.meta.dir is this file's own directory, not CWD, so it's correct
 // regardless of where the process was launched from.
 const WIZARD_CMD = wizardCmd(import.meta.dir);
@@ -1105,6 +1128,7 @@ async function becomePrimary(): Promise<void> {
   // startup would leave a promoted secondary pruning on a horizon it never
   // mentioned. Empty when the variable was unset or taken as given.
   if (TTL_NOTE) logDiag(`${LOG_PREFIX}: ${TTL_NOTE}\n`);
+  if (TYPING_NOTE) logDiag(`${LOG_PREFIX}: ${TYPING_NOTE}\n`);
   setInterval(pruneMessageLog, 60 * 60 * 1000).unref();
   // A promoted secondary loaded sent.jsonl at ITS boot; the primary it is
   // replacing kept appending since. Re-read (pruneMessageLog -> pruneSentLog)
@@ -3060,6 +3084,28 @@ function mimeToExt(mime: string | null | undefined): string {
 let sock: WASocket | CloudApiSocket | null = null;
 let ownJid = "";
 
+// "typing…" while the agent works on a chat, kept up until it replies there
+// (lib/presence.ts). Linked device only: CloudApiSocket's presence is a no-op.
+// A send while disconnected is skipped, not queued; the next refresh after a
+// reconnect puts the indicator back.
+const typing = new TypingIndicator(
+  {
+    send(chat, state) {
+      if (!sock || sock instanceof CloudApiSocket) return;
+      void sock.sendPresenceUpdate(state, chat).catch(() => {});
+    },
+    now: Date.now,
+    every(fn, ms) {
+      const timer = setInterval(fn, ms);
+      timer.unref();
+      return () => clearInterval(timer);
+    },
+    keyOf: (chat) => contactKey(chat),
+  },
+  // A cap of 0 schedules nothing: Cloud API cannot show it, so no timers.
+  { refreshMs: TYPING_REFRESH_MS, maxMs: TYPING_LOOP_MS },
+);
+
 const mcp = new Server(
   { name: SERVER_NAME, version: "1.0.0" },
   {
@@ -3506,6 +3552,31 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
               required: ["chat_id", "message_id", "emoji"],
             },
           },
+          ...(PROVIDER === "cloud-api"
+            ? []
+            : [
+                {
+                  name: "set_presence",
+                  annotations: {
+                    title: "Show typing or recording in a WhatsApp chat",
+                    readOnlyHint: false,
+                    destructiveHint: false,
+                  },
+                  description:
+                    'Show "typing…" (composing) or "recording audio…" (recording) in a chat, or clear it (paused). A shown state is kept up until you reply to that chat or call this with paused, for at most WHATSAPP_TYPING_MAX_MINUTES (default 10). Typing already shows by itself while you work on an inbound message, and recording while reply uploads a voice note, so this is only for other moments, e.g. before preparing a voice note.',
+                  inputSchema: {
+                    type: "object",
+                    properties: {
+                      chat_id: { type: "string" },
+                      state: {
+                        type: "string",
+                        enum: ["composing", "recording", "paused"],
+                      },
+                    },
+                    required: ["chat_id", "state"],
+                  },
+                },
+              ]),
           {
             name: "download_attachment",
             annotations: {
@@ -3544,6 +3615,24 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
                 text: { type: "string" },
               },
               required: ["chat_id", "message_id", "text"],
+            },
+          },
+          {
+            name: "mark_read",
+            annotations: {
+              title: "Mark WhatsApp message read",
+              readOnlyHint: false,
+              destructiveHint: false,
+            },
+            description:
+              "Mark a received WhatsApp message as read, which turns the sender's ticks blue. Pass chat_id and message_id from the inbound <channel> block. Not needed when WHATSAPP_READ_RECEIPTS=1, which marks every delivered message read already. If read receipts are off in the phone's privacy settings, the chat is marked read on this account only and the sender sees no blue ticks.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                chat_id: { type: "string" },
+                message_id: { type: "string" },
+              },
+              required: ["chat_id", "message_id"],
             },
           },
           {
@@ -3651,9 +3740,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
           .filter(
             (tool) =>
               PROVIDER !== "cloud-api" ||
-              !["edit_message", "list_groups", "group_roster"].includes(
-                tool.name,
-              ),
+              ![
+                "edit_message",
+                "mark_read",
+                "list_groups",
+                "group_roster",
+              ].includes(tool.name),
           )
           .map((tool) => {
             if (PROVIDER !== "cloud-api") return tool;
@@ -3791,6 +3883,7 @@ const handleToolCall = async (
         // Taken before the first await in this handler, not after the send:
         // see markReplied. Anything that lands in this chat from here on is
         // NOT covered by this reply and must stay unreplied.
+        const typingMark = typing.generation();
         const repliedIds = new Set(
           getUnreplied()
             .filter((m) => m.chat_id === chat_id)
@@ -3961,10 +4054,22 @@ const handleToolCall = async (
 
         // Files as separate messages
         for (const attachment of attachments) {
-          const sent = (await sock.sendMessage(
-            chat_id,
-            fileMessage(attachment.path, attachment.bytes, PROVIDER),
-          )) as WAMessage | undefined;
+          const content = fileMessage(
+            attachment.path,
+            attachment.bytes,
+            PROVIDER,
+          );
+          // "recording audio…" while a voice note uploads. Cleared in a
+          // finally: a failed upload must not leave it up until the cap.
+          const voiceNote = "ptt" in content && content.ptt === true;
+          const recordingGen = voiceNote ? typing.set(chat_id, "recording") : 0;
+          let sent: WAMessage | undefined;
+          try {
+            sent = (await sock.sendMessage(chat_id, content)) as
+              WAMessage | undefined;
+          } finally {
+            if (voiceNote) typing.stop(chat_id, true, recordingGen);
+          }
           if (sent?.key) {
             trackSent(sent.key);
             if (sent.key.id) sentIds.push(sent.key.id);
@@ -3972,6 +4077,9 @@ const handleToolCall = async (
         }
 
         markReplied(chat_id, repliedIds);
+        // Answered: take "typing…" down now rather than at the cap, unless a
+        // newer inbound message restarted it while this was sending.
+        typing.stop(chat_id, false, typingMark);
 
         // Log the outbound reply for catch_up — full original text once, not per chunk
         const outText =
@@ -4013,6 +4121,7 @@ const handleToolCall = async (
         if (!sock) throw new Error("WhatsApp not connected");
         // Snapshot before the await, same as `reply`: a poll answers what was
         // waiting when it was sent, not what lands while it is in flight.
+        const typingMark = typing.generation();
         const pollRepliedIds = new Set(
           getUnreplied()
             .filter((m) => m.chat_id === chat_id)
@@ -4046,6 +4155,7 @@ const handleToolCall = async (
         );
         savePolls();
         markReplied(chat_id, pollRepliedIds);
+        typing.stop(chat_id, false, typingMark);
         const pollGroupName = chat_id.endsWith("@g.us")
           ? await resolveGroupName(chat_id)
           : undefined;
@@ -4083,6 +4193,35 @@ const handleToolCall = async (
           react: { text: args.emoji as string, key },
         });
         return { content: [{ type: "text", text: "reacted" }] };
+      }
+
+      case "set_presence": {
+        if (PROVIDER === "cloud-api" || sock instanceof CloudApiSocket)
+          throw new Error(
+            "set_presence is not supported on Cloud API (linked device only)",
+          );
+        const { chat_id, state } = z
+          .object({
+            chat_id: z.string(),
+            state: z.enum(["composing", "recording", "paused"]),
+          })
+          .parse(args);
+        assertAllowedChat(chat_id);
+        if (!sock) throw new Error("WhatsApp not connected");
+        typing.set(chat_id, state);
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                state === "paused"
+                  ? "presence cleared"
+                  : TYPING_MAX_MS > 0
+                    ? `showing ${state === "composing" ? "typing" : "recording"} until you reply here or call set_presence with paused`
+                    : `sent once (WHATSAPP_TYPING_MAX_MINUTES=0); WhatsApp clears it after about 10 seconds`,
+            },
+          ],
+        };
       }
 
       case "download_attachment": {
@@ -4133,6 +4272,36 @@ const handleToolCall = async (
         };
       }
 
+      case "mark_read": {
+        if (PROVIDER === "cloud-api")
+          throw new Error(
+            "read receipts are not supported with the Cloud API provider (linked device only)",
+          );
+        const chatId = args.chat_id as string;
+        const messageId = args.message_id as string;
+        assertAllowedChat(chatId);
+        if (!sock || sock instanceof CloudApiSocket)
+          throw new Error("WhatsApp not connected");
+        const stored = messageKeyStore.get(messageId);
+        let logText = "";
+        if (!stored)
+          try {
+            logText = readFileSync(MESSAGE_LOG, "utf8");
+          } catch {}
+        await sock.readMessages([
+          manualReadKey(
+            chatId,
+            messageId,
+            stored,
+            loggedSender(logText, chatId, messageId),
+            wasSentByServer(messageId),
+          ),
+        ]);
+        return {
+          content: [{ type: "text", text: `marked read (id: ${messageId})` }],
+        };
+      }
+
       case "status": {
         if (PROVIDER === "cloud-api") {
           const cloud = sock instanceof CloudApiSocket ? sock : undefined;
@@ -4146,7 +4315,7 @@ const handleToolCall = async (
             `DM policy: ${access.dmPolicy}`,
             `Allowed contacts: ${access.allowFrom.length}`,
             `Permission owner: ${permissionTarget(access) ? "configured" : "missing or revoked; set an allowlisted personal contact as owner"}`,
-            "Supported: DMs, replies, reactions, attachments, approved templates. Groups and message editing are unavailable in this mode.",
+            "Supported: DMs, replies, reactions, attachments, approved templates. Groups, message editing and read receipts are unavailable in this mode.",
             "Free-form replies require an open 24-hour service window. Meta fees and AI-provider rules apply.",
           ];
           return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -5135,6 +5304,8 @@ async function handlePollVote(
       logDiag(`${LOG_PREFIX}: failed to deliver poll vote to Claude: ${err}\n`);
     });
   broadcastToSecondaries("notifications/claude/channel", notifyParams);
+  // A vote is a follow-up for the agent like any inbound message.
+  if (TYPING_LOOP_MS > 0) typing.start(chatJid);
 }
 
 async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
@@ -5286,6 +5457,13 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
       });
     }
     // Notify Claude to reset context for this chat
+    const newReadKey = autoReadKey({
+      enabled: READ_RECEIPTS,
+      provider: PROVIDER,
+      gate: result.action,
+      backlog,
+      key: msg.key,
+    });
     mcp
       .notification({
         method: "notifications/claude/channel",
@@ -5308,6 +5486,12 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
           },
         },
       })
+      .then(() => {
+        if (newReadKey && sock && !(sock instanceof CloudApiSocket))
+          sock.readMessages([newReadKey]).catch((err) => {
+            logDiag(`${LOG_PREFIX}: read receipt failed: ${err}\n`);
+          });
+      })
       .catch(() => {});
     return;
   }
@@ -5329,11 +5513,6 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
     }).catch(() => {});
   }
 
-  // Typing indicator
-  if (sock && !backlog) {
-    void sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
-  }
-
   // Media handling
   let imagePath: string | undefined;
   let attachment:
@@ -5347,6 +5526,18 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
     | undefined;
 
   const media = classifyMedia(normalizedContent);
+
+  // Typing indicator, at once, and kept up from here: downloading and
+  // transcribing a voice note can take minutes, and WhatsApp clears a single
+  // update after ~10s. Only for content that will be delivered: a reaction or
+  // protocol message from an allowed chat also reaches this line, and is
+  // never delivered or answered (the check after media handling undoes it).
+  const typingWasUp = typing.isActive(remoteJid);
+  const typingRoutable = !backlog && !!(text || media);
+  if (sock && !backlog) {
+    if (typingRoutable && TYPING_LOOP_MS > 0) typing.start(remoteJid);
+    else void sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
+  }
   // BACKLOG MEDIA STILL RECORDS ITS KIND. The download is skipped for backlog
   // - that is what `!backlog` below is for, and it stays - but the kind is
   // metadata classifyMedia has already worked out, and withholding it made
@@ -5438,7 +5629,10 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
   const contentText = neutralizeChannelTag(
     text || (media ? `(${media.kind})` : ""),
   );
-  if (!contentText && !imagePath && !attachment) return;
+  if (!contentText && !imagePath && !attachment) {
+    if (typingRoutable && !typingWasUp) typing.stop(remoteJid);
+    return;
+  }
 
   // Check for reply context
   const replyCtx = msg.message?.extendedTextMessage?.contextInfo;
@@ -5507,15 +5701,33 @@ async function handleMessage(msg: WAMessage, backlog = false): Promise<void> {
       ...(replyToSender ? { reply_to_sender: safeName(replyToSender) } : {}),
     },
   };
+  // Blue ticks only once Claude has it: after the gate let it through and
+  // the notification went out. Backlog returned above, unmarked.
+  const readKey = autoReadKey({
+    enabled: READ_RECEIPTS,
+    provider: PROVIDER,
+    gate: result.action,
+    backlog,
+    key: msg.key,
+  });
   mcp
     .notification({
       method: "notifications/claude/channel",
       params: notifyParams,
     })
+    .then(() => {
+      if (readKey && sock && !(sock instanceof CloudApiSocket))
+        sock.readMessages([readKey]).catch((err) => {
+          logDiag(`${LOG_PREFIX}: read receipt failed: ${err}\n`);
+        });
+    })
     .catch((err) => {
       logDiag(`${LOG_PREFIX}: failed to deliver inbound to Claude: ${err}\n`);
     });
   broadcastToSecondaries("notifications/claude/channel", notifyParams);
+  // Handed to the agent: "typing…" stays up (started before media handling)
+  // until it replies here (the reply tool stops it) or
+  // WHATSAPP_TYPING_MAX_MINUTES runs out.
 }
 
 // ─── Baileys connection with retry ─────────────────────────────────────
