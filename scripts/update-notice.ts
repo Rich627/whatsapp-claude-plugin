@@ -57,6 +57,15 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.30.1",
+      notes: [
+        "Security: media downloads reject untrusted URLs, redirects, oversized files and stalled requests.",
+        "Security: quotes stay in their chat; rejected or revoked senders' attachments are refused.",
+        "Attachments now default to inbox/outbox only; WHATSAPP_ATTACH_DIRS grants extra folders.",
+        "Auth status no longer reads credentials into chat; dependencies include current security fixes.",
+      ],
+    },
+    {
       version: "0.30.0",
       notes: [
         "New WHATSAPP_ATTACH_DIRS setting limits reply attachments to the listed directories (plus the inbox).",

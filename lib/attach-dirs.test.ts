@@ -2,10 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { isInsideAny, parseAttachDirs } from "./attach-dirs";
 
 describe("parseAttachDirs", () => {
-  test("unset or blank means no allowlist", () => {
-    expect(parseAttachDirs(undefined, "/home/u", ":")).toBeNull();
-    expect(parseAttachDirs("", "/home/u", ":")).toBeNull();
-    expect(parseAttachDirs(" : ", "/home/u", ":")).toBeNull();
+  test("unset or blank grants no additional export directories", () => {
+    expect(parseAttachDirs(undefined, "/home/u", ":")).toEqual([]);
+    expect(parseAttachDirs("", "/home/u", ":")).toEqual([]);
+    expect(parseAttachDirs(" : ", "/home/u", ":")).toEqual([]);
   });
 
   test("a set value with only invalid entries fails closed", () => {

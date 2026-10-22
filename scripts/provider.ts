@@ -108,6 +108,19 @@ async function main(): Promise<void> {
     console.log(
       `Connection: ${provider === "baileys" ? "Linked device (Baileys)" : "Official WhatsApp Cloud API"}`,
     );
+    if (provider === "baileys") {
+      let auth = "not paired";
+      try {
+        const credentials = JSON.parse(
+          readFileSync(join(stateDir, ".baileys_auth", "creds.json"), "utf8"),
+        );
+        if (credentials?.registered === true) auth = "paired";
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+          auth = "unavailable (invalid or unreadable)";
+      }
+      console.log(`Linked-device auth: ${auth}`);
+    }
     if (provider === "cloud-api") {
       try {
         readCloudApiConfig(env);

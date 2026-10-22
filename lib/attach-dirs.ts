@@ -6,20 +6,18 @@ import { delimiter, isAbsolute, join, resolve, sep } from "node:path";
  * (":", or ";" on Windows so drive letters survive). A leading "~" is the
  * home directory. Relative entries are dropped rather than resolved against
  * whatever the server's CWD happens to be, so the list means the same thing
- * however the server was launched. Unset or blank returns null: no directory
- * allowlist, the default behaviour. A set value whose entries are all
- * dropped returns [] so a typo fails closed (inbox only), not open.
+ * however the server was launched. Unset, blank or invalid returns []:
+ * only the inbox and outbox are exportable unless extra directories are granted.
  */
 export function parseAttachDirs(
   raw: string | undefined,
   home: string,
   separator: string = delimiter,
-): string[] | null {
+): string[] {
   const parts = (raw ?? "")
     .split(separator)
     .map((part) => part.trim())
     .filter(Boolean);
-  if (parts.length === 0) return null;
   const dirs: string[] = [];
   for (const entry of parts) {
     const expanded =

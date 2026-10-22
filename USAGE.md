@@ -169,16 +169,24 @@ Outbound, `reply`'s `files` picks the message type from the extension: images se
 
 ### Restricting which files can be attached
 
-By default `reply` can attach any readable file except the channel's own state (credentials, logs) and a short blocklist (`~/.ssh`, `~/.aws`, `~/.gnupg`, files named `.env*`). That list is a speed bump: a secret stored anywhere else, under any other name, can still be sent, and a reply is only one prompt injection away from an allowlisted chat.
+By default `reply` can attach files only from `~/.whatsapp-channel/inbox/` and `~/.whatsapp-channel/outbox/` (under `WHATSAPP_STATE_DIR` when set). Put generated files intended for sharing in `outbox/`. Symlinks are checked against their real destination, so a link cannot export a file from another directory.
 
-To make it a real boundary, set `WHATSAPP_ATTACH_DIRS` in the server's `.env` to the directories attachments may come from, separated by `:` (`;` on Windows, so `D:\share` keeps its drive letter). A leading `~` is your home directory; relative entries are ignored, and if none of the entries is usable only the inbox can be attached.
+To grant additional directories, set `WHATSAPP_ATTACH_DIRS` in the server's `.env`, separated by `:` (`;` on Windows, so `D:\share` keeps its drive letter). A leading `~` is your home directory; relative entries are ignored. Unset, blank or invalid values grant no additional access.
 
 ```bash
 # ~/.whatsapp-channel/.env
 WHATSAPP_ATTACH_DIRS=~/.whatsapp-channel/outbox:~/Pictures/share
 ```
 
-With it set, only files received into `~/.whatsapp-channel/inbox/` or living under a listed directory can be attached; everything else is refused before it is read. The blocklist above still applies inside the listed directories. Unset or empty keeps the default behaviour.
+Channel credentials, logs and other state remain blocked, even inside a listed directory. `~/.ssh`, `~/.aws`, `~/.gnupg` and files named `.env*` are also blocked. Restart the server after changing the directories.
+
+Inbound media accepts only HTTPS WhatsApp/Meta CDN URLs and rejects redirects.
+Each attempt is limited to 15 seconds and 16 MB. An expired linked-device URL may
+trigger one separately bounded refresh and retry.
+
+Linked-device media is authenticated before decryption. Attachment tools re-check
+the current chat and sender policy. Rejected senders' messages are not stored for
+tools, and quote replies stay in their destination chat.
 
 ## Polls
 

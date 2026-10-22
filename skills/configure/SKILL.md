@@ -9,7 +9,6 @@ allowed-tools:
   - Bash(bun "${CLAUDE_PLUGIN_ROOT}/scripts/provider.ts" status)
   - Bash(bun "${CLAUDE_PLUGIN_ROOT}/scripts/provider.ts" phone *)
   - Read(~/.whatsapp-channel/access.json)
-  - Read(~/.whatsapp-channel/.baileys_auth/creds.json)
 ---
 
 # /whatsapp-channel:configure — WhatsApp Channel Setup
@@ -68,10 +67,9 @@ Give the user a complete picture:
    provider/configuration summary; never inspect the raw environment file.
 2. **Phone number (linked device)** — report set/not-set from the
    `Phone number:` line of that status output. Do not Read `.env`.
-3. **Auth state (linked device)** — run `ls ~/.whatsapp-channel`; if
-   `.baileys_auth` exists, Read `~/.whatsapp-channel/.baileys_auth/creds.json`
-   only to check for `"registered": true`. Show paired/not-paired and never
-   quote the file.
+3. **Auth state (linked device)** — use the `Linked-device auth:` line from
+   `provider.ts status`. Never Read `.baileys_auth` files into the conversation,
+   including when status reports invalid or unreadable credentials.
 4. Call the WhatsApp `status` MCP tool for runtime connection information. For
    Cloud, readiness does not prove webhook delivery: confirm public HTTPS, WABA
    `messages` subscription, matching verify token and app-secret signatures,
