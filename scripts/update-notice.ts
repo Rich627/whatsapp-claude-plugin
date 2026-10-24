@@ -57,6 +57,12 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.33.0",
+      notes: [
+        "list_groups now shows only allowlisted groups, the ones Claude can send to.",
+      ],
+    },
+    {
       version: "0.32.0",
       notes: [
         "Linked device: WHATSAPP_READ_RECEIPTS=1 marks messages read once Claude gets them (default off).",

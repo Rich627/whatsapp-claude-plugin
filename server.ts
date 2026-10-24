@@ -137,6 +137,7 @@ import {
 } from "./lib/sanitize";
 import { isInsideAny, parseAttachDirs } from "./lib/attach-dirs";
 import { formatSentLine, parseSentLog } from "./lib/sent-log";
+import { formatGroupList } from "./lib/group-list";
 import {
   contactName,
   hasSavedName,
@@ -3660,7 +3661,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () =>
               readOnlyHint: true,
               destructiveHint: false,
             },
-            description: `List every WhatsApp group this account is currently a member of, with each group's name and JID, whether it's already allowlisted, and whether roster access (member names, needed for @all) is granted. Use this to find the JID of a newly-joined group so it can be added via the /whatsapp-channel:access skill — no need to guess the JID from logs. Read-only: does not change access. Also refreshes the on-disk group name/count cache the terminal access wizard (${WIZARD_CMD}) reads from.`,
+            description: `List the allowlisted WhatsApp groups this account is a member of, with each group's name and JID and whether roster access (member names, needed for @all) is granted. Groups that are not allowlisted are not shown; the user adds one with /whatsapp-channel:access review. Read-only: does not change access. Also refreshes the on-disk group name/count cache that the access wizard reads from.`,
             inputSchema: {
               type: "object",
               properties: {},
@@ -4512,30 +4513,11 @@ const handleToolCall = async (
         if (!sock) throw new Error("WhatsApp not connected");
         const access = loadAccess();
         const groups = await refreshGroupsMeta(sock);
-        if (groups.length === 0) {
-          return {
-            content: [
-              { type: "text", text: "This account is not in any groups." },
-            ],
-          };
-        }
-        groups.sort((a, b) => (a.subject ?? "").localeCompare(b.subject ?? ""));
-        const lines = groups.map((g) => {
-          const allowed = Object.hasOwn(access.groups, g.id);
-          const roster = !!access.groups[g.id]?.roster;
-          // Same reason as resolveGroupName: an admin-settable subject is
-          // rendered into text the model reads.
-          const name = safeName(g.subject)?.trim() || "(no name)";
-          const flags = `${allowed ? "✓" : "+"}${roster ? "R" : ""}`;
-          return `${flags} ${name}\n    ${g.id}${allowed ? "" : "  (NOT allowlisted)"}`;
-        });
-        const legend =
-          "✓ = allowlisted   + = joined but not allowlisted   R = roster access granted (add/change via /whatsapp-channel:access)";
         return {
           content: [
             {
               type: "text",
-              text: `${groups.length} group(s):\n\n${lines.join("\n")}\n\n${legend}`,
+              text: formatGroupList(groups, access.groups),
             },
           ],
         };

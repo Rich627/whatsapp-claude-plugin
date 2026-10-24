@@ -10,7 +10,7 @@
     {
       "name": "whatsapp-channel",
       "description": "WhatsApp channel for Claude Code \u2014 linked device or official Cloud API, with pairing, allowlists and access control.",
-      "version": "0.32.0",
+      "version": "0.33.0",
       "source": "./",
       "category": "channels"
     }

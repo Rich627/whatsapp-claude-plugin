@@ -2,7 +2,7 @@
   "name": "whatsapp-channel",
   "displayName": "WhatsApp Channel for Claude Code",
   "description": "WhatsApp channel for Claude Code \u2014 choose linked-device messaging or official Cloud API, with built-in access control.",
-  "version": "0.32.0",
+  "version": "0.33.0",
   "author": {
     "name": "Rich627"
   },
