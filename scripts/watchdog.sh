@@ -247,7 +247,16 @@ if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
 		last_alert=0
 		[ -f "$AUTH_ALERT_FILE" ] && last_alert=$(cat "$AUTH_ALERT_FILE" 2>/dev/null || echo 0)
 		if [ $((now - last_alert)) -ge $AUTH_ALERT_COOLDOWN_SECS ]; then
-			msg="WhatsApp agent on $(hostname -s) is auth-broken (API 401). SSH in and run /login: tmux attach -t $TMUX_SESSION"
+			msg="Claude Code on $(hostname -s) needs you to sign in again (API 401). WhatsApp replies are paused.
+
+1. Open Terminal on your computer and paste:
+ssh -t $(hostname -s) '$(command -v tmux) attach -t $TMUX_SESSION'
+
+2. In the Claude Code screen, type /login and press Enter. Follow the sign-in link.
+
+3. After signing in, tell Claude: Use catch_up to check for missed messages.
+
+4. Leave the agent running: press Ctrl+B, release, then press D to detach."
 			echo "[$(date -Iseconds)] AUTH-BROKEN: $msg"
 			if [ -x "$NOTIFY_HOOK" ]; then
 				"$NOTIFY_HOOK" "$msg" || echo "[$(date -Iseconds)] notify-hook failed (exit $?)"
