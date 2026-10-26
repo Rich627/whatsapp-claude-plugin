@@ -57,6 +57,12 @@ if (!isStaticMode()) {
   // latest.
   const CHANGELOG: { version: string; notes: string[] }[] = [
     {
+      version: "0.33.1",
+      notes: [
+        "Watchdog sign-in alerts now separate the Terminal command from Claude Code's /login step.",
+      ],
+    },
+    {
       version: "0.33.0",
       notes: [
         "list_groups now shows only allowlisted groups, the ones Claude can send to.",
